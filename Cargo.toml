@@ -1,0 +1,24 @@
+[package]
+name = "imageoptim"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-trait = "0.1.77"
+avif-decode = "0.2.2"
+base64 = "0.21.5"
+dssim = "3.2.4"
+image = { version = "0.24.7", features = ["webp-encoder", "avif-encoder"] }
+imagequant = { version = "4.2.2", default-features = false }
+lodepng = "3.9.2"
+mozjpeg = "0.10.5"
+reqwest = "0.11.23"
+rgb = "0.8.37"
+snafu = "0.8.0"
+substring = "1.4.5"
+
+[dev-dependencies]
+pretty_assertions = "1.4.0"
+tokio-test = "0.4.3"
