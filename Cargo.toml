@@ -1,5 +1,5 @@
 [package]
-name = "imageoptim"
+name = "imageoptimize"
 version = "0.1.0"
 edition = "2021"
 authors = ["Tree Xie <tree.xie@outlook.com>"]
@@ -7,8 +7,8 @@ categories = ["images"]
 keywords = ["image", "optimize"]
 description = "Optimize image of multi format"
 license = "Apache-2.0"
-homepage = "https://github.com/vicanso/imageoptim"
-repository = "https://github.com/vicanso/imageoptim"
+homepage = "https://github.com/vicanso/imageoptimize"
+repository = "https://github.com/vicanso/imageoptimize"
 exclude = [
     "assets/*",
     "test/*",
