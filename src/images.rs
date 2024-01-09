@@ -85,6 +85,8 @@ impl From<RgbaImage> for ImageInfo {
     }
 }
 
+/// Decode data from avif format, it supports rgb8,
+/// rgba8, rgb16 and rgba16.
 pub fn avif_decode(data: &[u8]) -> Result<DynamicImage> {
     let avif_result = Decoder::from_avif(data)
         .context(AvifDecodeSnafu {
@@ -198,6 +200,8 @@ impl ImageInfo {
 
         output_data
     }
+    /// Optimize image to png, the quality is min 0, max 100, which means best effort,
+    /// and never aborts the process.
     pub fn to_png(&self, quality: u8) -> Result<Vec<u8>> {
         let mut liq = imagequant::new();
         liq.set_quality(0, quality).context(ImageQuantSnafu {
@@ -234,6 +238,7 @@ impl ImageInfo {
 
         Ok(buf)
     }
+    /// Optimize image to webp, the quality is min 0, max 100, the max means lossless.
     pub fn to_webp(&self, quality: u8) -> Result<Vec<u8>> {
         let mut w = Vec::new();
 
@@ -255,6 +260,9 @@ impl ImageInfo {
 
         Ok(w)
     }
+    /// Optimize image to avif.
+    /// `speed` accepts a value in the range 0-10, where 0 is the slowest and 10 is the fastest.
+    /// `quality` accepts a value in the range 0-100, where 0 is the worst and 100 is the best.
     pub fn to_avif(&self, quality: u8, speed: u8) -> Result<Vec<u8>> {
         let mut w = Vec::new();
         let mut sp = speed;
@@ -275,6 +283,7 @@ impl ImageInfo {
 
         Ok(w)
     }
+    /// Optimize image to jpeg, the quality 60-80 are recommended.
     pub fn to_mozjpeg(&self, quality: u8) -> Result<Vec<u8>> {
         let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
         comp.set_size(self.width, self.height);

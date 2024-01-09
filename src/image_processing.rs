@@ -4,7 +4,6 @@ use base64::{engine::general_purpose, Engine as _};
 use dssim::Dssim;
 use image::imageops::{crop, grayscale, overlay, resize, FilterType};
 use image::{load, DynamicImage, ImageFormat, RgbaImage};
-
 use rgb::FromSlice;
 use snafu::{ensure, ResultExt, Snafu};
 use std::ffi::OsStr;
@@ -13,6 +12,7 @@ use std::io::Cursor;
 use std::io::Read;
 use std::time::Duration;
 use substring::Substring;
+use urlencoding::decode;
 
 pub const PROCESS_LOAD: &str = "load";
 pub const PROCESS_RESIZE: &str = "resize";
@@ -20,6 +20,7 @@ pub const PROCESS_OPTIM: &str = "optim";
 pub const PROCESS_CROP: &str = "crop";
 pub const PROCESS_GRAY: &str = "gray";
 pub const PROCESS_WATERMARK: &str = "watermark";
+pub const PROCESS_DIFF: &str = "diff";
 
 const IMAGE_TYPE_GIF: &str = "gif";
 const IMAGE_TYPE_PNG: &str = "png";
@@ -49,6 +50,110 @@ pub enum ImageProcessingError {
     Io { source: std::io::Error },
 }
 type Result<T, E = ImageProcessingError> = std::result::Result<T, E>;
+
+/// Run process image task.
+/// Load task: ["load", "url"]
+/// Resize task: ["resize", "width", "height"]
+/// Gray task: ["gray"]
+/// Optim task: ["optim", "webp", "quality", "speed"]
+/// Crop task: ["crop", "x", "y", "width", "height"]
+/// Watermark task: ["watermark", "url", "position", "margin left", "margin top"]
+/// Diff task: ["diff"]
+pub async fn run(tasks: Vec<Vec<String>>) -> Result<ProcessImage> {
+    let mut img = ProcessImage {
+        ..Default::default()
+    };
+    let he = ParamsInvalidSnafu {
+        message: "params is invalid",
+    };
+    for params in tasks {
+        if params.len() < 2 {
+            continue;
+        }
+        let sub_params = params[1..].to_vec();
+        let task = &params[0];
+        match task.as_str() {
+            PROCESS_LOAD => {
+                let data = &sub_params[0];
+                let mut ext = "";
+                if sub_params.len() >= 2 {
+                    ext = &sub_params[1];
+                }
+                img = LoaderProcess::new(data, ext).process(img).await?;
+                img.original = Some(img.di.to_rgba8().clone())
+            }
+            PROCESS_RESIZE => {
+                // 参数不符合
+                ensure!(sub_params.len() >= 2, he);
+                let width = sub_params[0].parse::<u32>().context(ParseIntSnafu {})?;
+                let height = sub_params[1].parse::<u32>().context(ParseIntSnafu {})?;
+                img = ResizeProcess::new(width, height).process(img).await?;
+            }
+            PROCESS_GRAY => {
+                img = GrayProcess::new().process(img).await?;
+            }
+            PROCESS_OPTIM => {
+                // 参数不符合
+                ensure!(sub_params.len() == 3, he);
+                let output_type = &sub_params[0];
+                let mut quality = 80;
+                if sub_params.len() > 1 {
+                    quality = sub_params[1].parse::<u8>().context(ParseIntSnafu {})?;
+                }
+
+                let mut speed = 3;
+                if sub_params.len() > 2 {
+                    speed = sub_params[2].parse::<u8>().context(ParseIntSnafu {})?;
+                }
+
+                img = OptimProcess::new(output_type, quality, speed)
+                    .process(img)
+                    .await?;
+            }
+            PROCESS_CROP => {
+                // 参数不符合
+                ensure!(sub_params.len() >= 4, he);
+                let x = sub_params[0].parse::<u32>().context(ParseIntSnafu {})?;
+                let y = sub_params[1].parse::<u32>().context(ParseIntSnafu {})?;
+                let width = sub_params[2].parse::<u32>().context(ParseIntSnafu {})?;
+                let height = sub_params[3].parse::<u32>().context(ParseIntSnafu {})?;
+                img = CropProcess::new(x, y, width, height).process(img).await?;
+            }
+            PROCESS_WATERMARK => {
+                // 参数不符合
+                ensure!(!sub_params.is_empty(), he);
+                let url = decode(sub_params[0].as_str())
+                    .context(FromUtfSnafu {})?
+                    .to_string();
+                let mut position = WatermarkPosition::RightBottom;
+                if sub_params.len() > 1 {
+                    position = (sub_params[1].as_str()).into();
+                }
+                let mut margin_left = 0;
+                if sub_params.len() > 2 {
+                    margin_left = sub_params[2].parse::<i64>().context(ParseIntSnafu {})?;
+                }
+                let mut margin_top = 0;
+                if sub_params.len() > 3 {
+                    margin_top = sub_params[3].parse::<i64>().context(ParseIntSnafu {})?;
+                }
+                let watermark = LoaderProcess::new(&url, "")
+                    .process(ProcessImage {
+                        ..Default::default()
+                    })
+                    .await?;
+
+                let pro = WatermarkProcess::new(watermark.di, position, margin_left, margin_top);
+                img = pro.process(img).await?;
+            }
+            PROCESS_DIFF => {
+                img.diff = img.get_diff();
+            }
+            _ => {}
+        }
+    }
+    Ok(img)
+}
 
 #[derive(Default, Clone)]
 pub struct ProcessImage {
@@ -132,7 +237,7 @@ pub trait Process {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage>;
 }
 
-// 数据加载处理
+/// Loader process loads the image data from http, file or base64.
 pub struct LoaderProcess {
     data: String,
     ext: String,
@@ -195,7 +300,7 @@ impl Process for LoaderProcess {
     }
 }
 
-// 尺寸调整处理
+/// Resize process resizes the image size.
 pub struct ResizeProcess {
     width: u32,
     height: u32,
@@ -232,6 +337,7 @@ impl Process for ResizeProcess {
     }
 }
 
+/// Gray process changes the image to gray mode.
 #[derive(Default)]
 pub struct GrayProcess {}
 
@@ -263,16 +369,6 @@ pub enum WatermarkPosition {
     RightBottom,
 }
 
-// impl From<Bitmap<RGBA8>> for ImageInfo {
-//     fn from(info: Bitmap<RGBA8>) -> Self {
-//         ImageInfo {
-//             buffer: info.buffer,
-//             width: info.width,
-//             height: info.height,
-//         }
-//     }
-// }
-
 impl From<&str> for WatermarkPosition {
     fn from(value: &str) -> Self {
         match value {
@@ -289,7 +385,7 @@ impl From<&str> for WatermarkPosition {
     }
 }
 
-// 水印处理
+/// Watermark process adds a watermark over the image.
 pub struct WatermarkProcess {
     watermark: DynamicImage,
     position: WatermarkPosition,
@@ -365,7 +461,7 @@ impl Process for WatermarkProcess {
     }
 }
 
-//  裁剪处理
+/// Crop process crops the image.
 pub struct CropProcess {
     x: u32,
     y: u32,
@@ -396,7 +492,7 @@ impl Process for CropProcess {
     }
 }
 
-// 压缩处理
+/// Optim process optimizes the image of multi format.
 pub struct OptimProcess {
     output_type: String,
     quality: u8,
