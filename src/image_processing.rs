@@ -67,7 +67,7 @@ pub async fn run(tasks: Vec<Vec<String>>) -> Result<ProcessImage> {
         message: "params is invalid",
     };
     for params in tasks {
-        if params.len() < 2 {
+        if params.is_empty() {
             continue;
         }
         let sub_params = params[1..].to_vec();
@@ -80,7 +80,7 @@ pub async fn run(tasks: Vec<Vec<String>>) -> Result<ProcessImage> {
                     ext = &sub_params[1];
                 }
                 img = LoaderProcess::new(data, ext).process(img).await?;
-                img.original = Some(img.di.to_rgba8().clone())
+                img.original = Some(img.di.to_rgba8())
             }
             PROCESS_RESIZE => {
                 // 参数不符合
@@ -210,7 +210,7 @@ impl ProcessImage {
             return -1.0;
         }
         // 已确保一定有数据
-        let original = self.original.clone().unwrap();
+        let original = self.original.as_ref().unwrap();
         // 如果宽高不一致，则不比对
         if original.width() != self.di.width() || original.height() != self.di.height() {
             return -1.0;
@@ -222,7 +222,7 @@ impl ProcessImage {
             .create_image_rgba(original.as_raw().as_rgba(), width, height)
             .unwrap();
         let gp2 = attr
-            .create_image_rgba(self.di.clone().to_rgba8().as_raw().as_rgba(), width, height)
+            .create_image_rgba(self.di.to_rgba8().as_raw().as_rgba(), width, height)
             .unwrap();
         let (diff, _) = attr.compare(&gp1, gp2);
         let value: f64 = diff.into();
@@ -251,7 +251,7 @@ impl LoaderProcess {
         }
     }
     async fn fetch_data(&self) -> Result<ProcessImage> {
-        let data = self.data.clone();
+        let data = &self.data;
         let mut ext = self.ext.clone();
         let from_http = data.starts_with("http");
         let file_prefix = "file://";
@@ -530,7 +530,7 @@ impl Process for OptimProcess {
 
         let data = match output_type.as_str() {
             IMAGE_TYPE_GIF => {
-                let c = Cursor::new(img.buffer.clone());
+                let c = Cursor::new(&img.buffer);
                 to_gif(c, 10).context(ImagesSnafu {})?
             }
             _ => {

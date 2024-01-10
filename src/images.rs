@@ -192,9 +192,7 @@ impl ImageInfo {
     fn get_rgb8(&self) -> Vec<RGB8> {
         let mut output_data: Vec<RGB8> = Vec::with_capacity(self.width * self.height);
 
-        let input = self.buffer.clone();
-
-        for ele in input {
+        for ele in &self.buffer {
             output_data.push(ele.rgb())
         }
 
