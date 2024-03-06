@@ -240,6 +240,7 @@ impl ImageInfo {
     pub fn to_webp(&self, quality: u8) -> Result<Vec<u8>> {
         let mut w = Vec::new();
 
+        // TODO 后续确认是否全部使用lossless
         let q = match quality {
             100 => webp::WebPQuality::lossless(),
             _ => webp::WebPQuality::lossy(quality),
