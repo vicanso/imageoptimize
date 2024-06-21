@@ -8,7 +8,7 @@ use rgb::{ComponentBytes, RGB8, RGBA8};
 use snafu::{ResultExt, Snafu};
 use std::{
     ffi::OsStr,
-    io::{BufRead, Read, Seek},
+    io::{BufRead, Seek},
 };
 
 #[derive(Debug, Snafu)]
@@ -162,7 +162,8 @@ pub fn load<R: BufRead + Seek>(r: R, ext: &str) -> Result<ImageInfo> {
     Ok(img.into())
 }
 
-pub fn to_gif<R: Read>(r: R, speed: u8) -> Result<Vec<u8>> {
+pub fn to_gif<R>(r: R, speed: u8) -> Result<Vec<u8>> 
+where R: std::io::BufRead, R: std::io::Seek{
     let decoder = gif::GifDecoder::new(r).context(ImageSnafu {
         category: "gif_decode",
     })?;
@@ -236,22 +237,18 @@ impl ImageInfo {
 
         Ok(buf)
     }
-    /// Optimize image to webp, the quality is min 0, max 100, the max means lossless.
-    pub fn to_webp(&self, quality: u8) -> Result<Vec<u8>> {
+    /// Optimize image to lossless webp.
+    pub fn to_webp(&self) -> Result<Vec<u8>> {
         let mut w = Vec::new();
 
-        // TODO 后续确认是否全部使用lossless
-        let q = match quality {
-            100 => webp::WebPQuality::lossless(),
-            _ => webp::WebPQuality::lossy(quality),
-        };
-        let img = webp::WebPEncoder::new_with_quality(&mut w, q);
+       
+        let img = webp::WebPEncoder::new_lossless(&mut w);
 
         img.encode(
             self.buffer.as_bytes(),
             self.width as u32,
             self.height as u32,
-            image::ColorType::Rgba8,
+            image::ColorType::Rgba8.into(),
         )
         .context(ImageSnafu {
             category: "webp_encode",
@@ -274,7 +271,7 @@ impl ImageInfo {
             self.buffer.as_bytes(),
             self.width as u32,
             self.height as u32,
-            image::ColorType::Rgba8,
+            image::ColorType::Rgba8.into(),
         )
         .context(ImageSnafu {
             category: "avif_encode",
@@ -322,8 +319,8 @@ mod tests {
     #[test]
     fn test_to_webp() {
         let img = load_image();
-        let result = img.to_webp(90).unwrap();
-        assert_eq!(result.len(), 2092);
+        let result = img.to_webp().unwrap();
+        assert_eq!(result.len(), 2764);
     }
     #[test]
     fn test_to_jpeg() {

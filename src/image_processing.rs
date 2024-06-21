@@ -523,10 +523,10 @@ impl Process for OptimProcess {
         let mut output_type = self.output_type.clone();
         // 如果未指定输出，则保持原有
         if output_type.is_empty() {
-            output_type = original_type.clone();
+            output_type.clone_from(&original_type);
         }
 
-        img.ext = output_type.clone();
+        img.ext.clone_from(&output_type);
 
         let data = match output_type.as_str() {
             IMAGE_TYPE_GIF => {
@@ -537,7 +537,7 @@ impl Process for OptimProcess {
                 match output_type.as_str() {
                     IMAGE_TYPE_PNG => info.to_png(quality).context(ImagesSnafu {})?,
                     IMAGE_TYPE_AVIF => info.to_avif(quality, speed).context(ImagesSnafu {})?,
-                    IMAGE_TYPE_WEBP => info.to_webp(quality).context(ImagesSnafu {})?,
+                    IMAGE_TYPE_WEBP => info.to_webp().context(ImagesSnafu {})?,
                     // 其它的全部使用jpeg
                     _ => {
                         img.ext = IMAGE_TYPE_JPEG.to_string();
@@ -668,10 +668,10 @@ mod tests {
         assert_eq!(result.buffer.len(), 2367);
 
         let result =
-            tokio_test::block_on(OptimProcess::new("webp", 70, 0).process(new_process_image()))
+            tokio_test::block_on(OptimProcess::new("webp", 0, 0).process(new_process_image()))
                 .unwrap();
         assert_eq!(result.ext, "webp");
-        assert_eq!(result.buffer.len(), 2094);
+        assert_eq!(result.buffer.len(), 2764);
 
         let result =
             tokio_test::block_on(OptimProcess::new("jpeg", 70, 0).process(new_process_image()))
