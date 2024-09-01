@@ -80,7 +80,6 @@ pub async fn run(tasks: Vec<Vec<String>>) -> Result<ProcessImage> {
                     ext = &sub_params[1];
                 }
                 img = LoaderProcess::new(data, ext).process(img).await?;
-                img.original = Some(img.di.to_rgba8())
             }
             PROCESS_RESIZE => {
                 // 参数不符合
@@ -178,10 +177,11 @@ impl ProcessImage {
         let di = load(Cursor::new(&data), format.unwrap()).context(ImageSnafu {})?;
         Ok(ProcessImage {
             original_size: data.len(),
+            original: Some(di.to_rgba8()),
             di,
             buffer: data,
+            diff: -1.0,
             ext: ext.to_string(),
-            ..Default::default()
         })
     }
     pub fn get_buffer(&self) -> Result<Vec<u8>> {
@@ -658,25 +658,32 @@ mod tests {
             tokio_test::block_on(OptimProcess::new("png", 70, 0).process(new_process_image()))
                 .unwrap();
         assert_eq!(result.ext, "png");
-        assert_ne!(result.get_diff(), 0.0_f64);
         assert_eq!(result.buffer.len(), 1483);
+        assert_ne!(result.get_diff(), 0.0_f64);
+        assert_ne!(result.get_diff(), -1.0_f64);
 
         let result =
             tokio_test::block_on(OptimProcess::new("avif", 70, 0).process(new_process_image()))
                 .unwrap();
         assert_eq!(result.ext, "avif");
         assert_eq!(result.buffer.len(), 2367);
+        assert_ne!(result.get_diff(), 0.0_f64);
+        assert_ne!(result.get_diff(), -1.0_f64);
+
 
         let result =
             tokio_test::block_on(OptimProcess::new("webp", 0, 0).process(new_process_image()))
                 .unwrap();
         assert_eq!(result.ext, "webp");
         assert_eq!(result.buffer.len(), 2764);
+        assert_eq!(result.get_diff(), 0.0);
 
         let result =
             tokio_test::block_on(OptimProcess::new("jpeg", 70, 0).process(new_process_image()))
                 .unwrap();
         assert_eq!(result.ext, "jpeg");
         assert_eq!(result.buffer.len(), 392);
+        assert_ne!(result.get_diff(), 0.0_f64);
+        assert_ne!(result.get_diff(), -1.0_f64);
     }
 }
