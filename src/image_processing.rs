@@ -1,7 +1,7 @@
 use super::images::{avif_decode, to_gif, ImageError, ImageInfo};
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
-use dssim::Dssim;
+use dssim_core::Dssim;
 use image::imageops::{crop, grayscale, overlay, resize, FilterType};
 use image::{load, DynamicImage, ImageFormat, RgbaImage};
 use rgb::FromSlice;
@@ -196,6 +196,9 @@ impl ProcessImage {
         } else {
             Ok(self.buffer.clone())
         }
+    }
+    pub fn get_size(&self) -> (u32, u32) {
+        (self.di.width(), self.di.height())
     }
     fn support_dssim(&self) -> bool {
         self.ext != IMAGE_TYPE_GIF
@@ -669,7 +672,6 @@ mod tests {
         assert_eq!(result.buffer.len(), 2367);
         assert_ne!(result.get_diff(), 0.0_f64);
         assert_ne!(result.get_diff(), -1.0_f64);
-
 
         let result =
             tokio_test::block_on(OptimProcess::new("webp", 0, 0).process(new_process_image()))
