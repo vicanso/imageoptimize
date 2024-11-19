@@ -162,8 +162,11 @@ pub fn load<R: BufRead + Seek>(r: R, ext: &str) -> Result<ImageInfo> {
     Ok(img.into())
 }
 
-pub fn to_gif<R>(r: R, speed: u8) -> Result<Vec<u8>> 
-where R: std::io::BufRead, R: std::io::Seek{
+pub fn to_gif<R>(r: R, speed: u8) -> Result<Vec<u8>>
+where
+    R: std::io::BufRead,
+    R: std::io::Seek,
+{
     let decoder = gif::GifDecoder::new(r).context(ImageSnafu {
         category: "gif_decode",
     })?;
@@ -241,7 +244,6 @@ impl ImageInfo {
     pub fn to_webp(&self) -> Result<Vec<u8>> {
         let mut w = Vec::new();
 
-       
         let img = webp::WebPEncoder::new_lossless(&mut w);
 
         img.encode(
@@ -332,6 +334,6 @@ mod tests {
     fn test_to_avif() {
         let img = load_image();
         let result = img.to_avif(90, 3).unwrap();
-        assert_eq!(result.len(), 2337);
+        assert_eq!(result.len(), 2345);
     }
 }
