@@ -1,6 +1,6 @@
 [package]
 name = "imageoptimize"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2021"
 authors = ["Tree Xie <tree.xie@outlook.com>"]
 categories = ["multimedia::images"]
@@ -15,15 +15,15 @@ readme = "./README.md"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-async-trait = "0.1.83"
+async-trait = "0.1.86"
 avif-decode = "1.0.1"
 base64 = "0.22.1"
-dssim-core = "3.2.10"
+dssim-core = "3.2.11"
 image = { version = "0.25.5", features = ["webp", "avif"] }
-imagequant = { version = "4.3.3", default-features = false }
-lodepng = "3.10.7"
-mozjpeg = "0.10.10"
-reqwest = "0.12.9"
+imagequant = { version = "4.3.4", default-features = false }
+lodepng = "3.11.0"
+mozjpeg = "0.10.13"
+reqwest = "0.12.12"
 rgb = "0.8.50"
 snafu = "0.8.5"
 substring = "1.4.5"
