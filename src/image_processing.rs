@@ -51,18 +51,8 @@ pub enum ImageProcessingError {
 }
 type Result<T, E = ImageProcessingError> = std::result::Result<T, E>;
 
-/// Run process image task.
-/// Load task: ["load", "url"]
-/// Resize task: ["resize", "width", "height"]
-/// Gray task: ["gray"]
-/// Optim task: ["optim", "webp", "quality", "speed"]
-/// Crop task: ["crop", "x", "y", "width", "height"]
-/// Watermark task: ["watermark", "url", "position", "margin left", "margin top"]
-/// Diff task: ["diff"]
-pub async fn run(tasks: Vec<Vec<String>>) -> Result<ProcessImage> {
-    let mut img = ProcessImage {
-        ..Default::default()
-    };
+pub async fn run_with_image(image: ProcessImage, tasks: Vec<Vec<String>>) -> Result<ProcessImage> {
+    let mut img = image;
     let he = ParamsInvalidSnafu {
         message: "params is invalid",
     };
@@ -152,6 +142,24 @@ pub async fn run(tasks: Vec<Vec<String>>) -> Result<ProcessImage> {
         }
     }
     Ok(img)
+}
+
+/// Run process image task.
+/// Load task: ["load", "url"]
+/// Resize task: ["resize", "width", "height"]
+/// Gray task: ["gray"]
+/// Optim task: ["optim", "webp", "quality", "speed"]
+/// Crop task: ["crop", "x", "y", "width", "height"]
+/// Watermark task: ["watermark", "url", "position", "margin left", "margin top"]
+/// Diff task: ["diff"]
+pub async fn run(tasks: Vec<Vec<String>>) -> Result<ProcessImage> {
+    run_with_image(
+        ProcessImage {
+            ..Default::default()
+        },
+        tasks,
+    )
+    .await
 }
 
 #[derive(Default, Clone)]
