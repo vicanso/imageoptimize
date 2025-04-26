@@ -174,15 +174,14 @@ pub struct ProcessImage {
 
 impl ProcessImage {
     pub fn new(data: Vec<u8>, ext: &str) -> Result<Self> {
-        let format = ImageFormat::from_extension(OsStr::new(ext));
-        ensure!(
-            format.is_some(),
-            ParamsInvalidSnafu {
-                message: "Image format is not support".to_string(),
-            }
-        );
-        // 已保证format不为空
-        let di = load(Cursor::new(&data), format.unwrap()).context(ImageSnafu {})?;
+        let format = image::guess_format(&data).or_else(|_| {
+            ImageFormat::from_extension(OsStr::new(ext)).ok_or(
+                ImageProcessingError::ParamsInvalid {
+                    message: "Image format is not supported".to_string(),
+                },
+            )
+        })?;
+        let di = load(Cursor::new(&data), format).context(ImageSnafu {})?;
         Ok(ProcessImage {
             original_size: data.len(),
             original: Some(di.to_rgba8()),
@@ -288,7 +287,7 @@ impl LoaderProcess {
         } else if from_file {
             let mut file =
                 File::open(data.substring(file_prefix.len(), data.len())).context(IoSnafu)?;
-            ext = data.split('.').last().unwrap_or_default().to_string();
+            ext = data.split('.').next_back().unwrap_or_default().to_string();
 
             let mut contents = vec![];
             file.read_to_end(&mut contents).context(IoSnafu)?;
