@@ -668,7 +668,7 @@ mod tests {
             tokio_test::block_on(OptimProcess::new("png", 70, 0).process(new_process_image()))
                 .unwrap();
         assert_eq!(result.ext, "png");
-        assert_eq!(result.buffer.len(), 1483);
+        assert_eq!(result.buffer.len(), 1463);
         assert_ne!(result.get_diff(), 0.0_f64);
         assert_ne!(result.get_diff(), -1.0_f64);
 

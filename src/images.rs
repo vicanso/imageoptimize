@@ -316,7 +316,7 @@ mod tests {
         let img = load_image();
         let result = img.to_png(90).unwrap();
         // 直接判断长度可能导致版本更新则需要重新修改测试
-        assert_eq!(result.len(), 1742);
+        assert_eq!(result.len(), 1665);
     }
     #[test]
     fn test_to_webp() {
