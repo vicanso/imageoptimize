@@ -21,6 +21,7 @@ use nu_ansi_term::Color::{LightCyan, LightGreen, LightRed, LightYellow};
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 use tokio::fs;
 
 #[derive(Debug, Snafu)]
@@ -72,6 +73,8 @@ enum ConvertFormat {
     PngAvif,
     #[value(name = "png-webp")]
     PngWebp,
+    #[value(name = "disable")]
+    Disable,
 }
 
 #[derive(Parser, Debug)]
@@ -220,6 +223,7 @@ async fn main() {
             ConvertFormat::JpegWebp => (IMAGE_JPEG, IMAGE_WEBP),
             ConvertFormat::PngAvif => (IMAGE_PNG, IMAGE_AVIF),
             ConvertFormat::PngWebp => (IMAGE_PNG, IMAGE_WEBP),
+            ConvertFormat::Disable => continue,
         };
         if let Some(targets) = convert_extensions.get_mut(source) {
             targets.push(target.to_string());
@@ -275,6 +279,7 @@ async fn main() {
                     targets.push(new_target);
                 }
             }
+            targets.push(target);
             for target in targets {
                 image_optimize_params.push(ImageOptimizeParams {
                     file: file.clone(),
@@ -290,7 +295,10 @@ async fn main() {
         png: args.png_quality,
         jpeg: args.jpeg_quality,
     };
+    let kb = 1024;
+    let mb = kb * 1024;
     for item in image_optimize_params.iter() {
+        let start = Instant::now();
         match optimize_image(item, qualities.clone()).await {
             Ok((size, original_size, diff)) => {
                 let diff_str = format!("{:.2}", diff);
@@ -299,12 +307,23 @@ async fn main() {
                 } else {
                     LightGreen.paint(diff_str)
                 };
+                let size_str = if size >= mb {
+                    format!("{}mb", size / mb)
+                } else if size >= kb {
+                    format!("{}kb", size / kb)
+                } else {
+                    format!("{}b", size)
+                };
                 let percent = size * 100 / original_size;
+                let duration = start.elapsed().as_millis();
+                let duration_str = if duration < 1000 {
+                    format!("{}ms", duration)
+                } else {
+                    format!("{}s", duration / 1000)
+                };
                 println!(
-                    "{}: {}kb {percent}%({})",
+                    "{}: {size_str} {percent}%({diff_text}) {duration_str}",
                     item.target.clone(),
-                    size / 1024,
-                    diff_text
                 );
             }
             Err(e) => {
