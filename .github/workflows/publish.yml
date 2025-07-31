@@ -24,6 +24,9 @@ jobs:
       - name: release
         run: |
           cargo build --release --target=aarch64-apple-darwin
+
+          ls -lh target/aarch64-apple-darwin/release
+
           mv target/aarch64-apple-darwin/release/imageoptimize ./imageoptimize
           tar -czvf imageoptimize-darwin-arm64.tar.gz imageoptimize
 
