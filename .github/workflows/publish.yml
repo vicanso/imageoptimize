@@ -23,15 +23,13 @@ jobs:
           rustup target add x86_64-apple-darwin
       - name: release
         run: |
-          cargo build --release --target=aarch64-apple-darwin
-
-          ls -lh target/aarch64-apple-darwin/release
+          cargo build --features=bin --release --target=aarch64-apple-darwin
 
           mv target/aarch64-apple-darwin/release/imageoptimize ./imageoptimize
           tar -czvf imageoptimize-darwin-arm64.tar.gz imageoptimize
 
         
-          cargo build --release --target=x86_64-apple-darwin
+          cargo build --features=bin --release --target=x86_64-apple-darwin
           mv target/x86_64-apple-darwin/release/imageoptimize ./imageoptimize
           tar -czvf imageoptimize-darwin-x86_64.tar.gz imageoptimize
 
@@ -52,7 +50,7 @@ jobs:
           options: -v ${{ github.workspace }}:/home/rust/src
           run: |
             apt-get update
-            make release
+            cargo build --features=bin --release 
             mv target/x86_64-unknown-linux-musl/release/imageoptimize ./imageoptimize
             curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-amd64_linux.tar.xz | tar --xz -xvf -
             ./upx-5.0.1-amd64_linux/upx imageoptimize
@@ -76,7 +74,7 @@ jobs:
           options: -v ${{ github.workspace }}:/home/rust/src
           run: |
             apt-get update
-            make release
+            cargo build --features=bin --release 
             mv target/aarch64-unknown-linux-musl/release/imageoptimize ./imageoptimize
             curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-arm64_linux.tar.xz | tar --xz -xvf -
             ./upx-5.0.1-arm64_linux/upx imageoptimize
