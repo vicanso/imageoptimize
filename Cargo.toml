@@ -1,6 +1,6 @@
 [package]
 name = "imageoptimize"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 authors = ["Tree Xie <tree.xie@outlook.com>"]
 categories = ["multimedia::images"]
@@ -31,22 +31,22 @@ default = []
 bin = ["clap", "tokio", "glob", "nu-ansi-term"]
 
 [dependencies]
-async-trait = "0.1.88"
+async-trait = "0.1.89"
 avif-decode = "1.0.1"
 base64 = "0.22.1"
-clap = { version = "4.5.41", features = ["derive"], optional = true }
+clap = { version = "4.5.45", features = ["derive"], optional = true }
 dssim-core = "3.2.11"
-glob = { version = "0.3.2", optional = true }
-image = { version = "0.25.6", features = ["webp", "avif"] }
+glob = { version = "0.3.3", optional = true }
+image = { version = "0.25.8", features = ["webp", "avif"] }
 imagequant = { version = "4.4.1", default-features = false }
 lodepng = "3.12.1"
 mozjpeg = "0.10.13"
 nu-ansi-term = { version = "0.50.1", optional = true }
-reqwest = "0.12.22"
+reqwest = "0.12.23"
 rgb = "0.8.52"
-snafu = "0.8.6"
+snafu = "0.8.9"
 substring = "1.4.5"
-tokio = { version = "1.47.0", features = [
+tokio = { version = "1.47.1", features = [
     "rt",
     "fs",
     "macros",
