@@ -1,6 +1,6 @@
 [package]
 name = "imageoptimize"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2021"
 authors = ["Tree Xie <tree.xie@outlook.com>"]
 categories = ["multimedia::images"]
