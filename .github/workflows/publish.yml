@@ -18,6 +18,7 @@ jobs:
           toolchain: 1.86.0
       - name: Install target
         run: |
+          brew install nasm
           rustup update
           rustup target add aarch64-apple-darwin
           rustup target add x86_64-apple-darwin
@@ -40,7 +41,7 @@ jobs:
           ./.github/workflows/upload_asset.sh ./imageoptimize-darwin-x86_64.tar.gz $GITHUB_TOKEN
 
   linux-musl-x86:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: release
@@ -64,7 +65,7 @@ jobs:
           ./.github/workflows/upload_asset.sh ./imageoptimize-linux-musl-x86_64.tar.gz $GITHUB_TOKEN
 
   linux-musl-aarch64:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: release

@@ -34,8 +34,8 @@ bin = ["clap", "tokio", "glob", "nu-ansi-term"]
 async-trait = "0.1.89"
 avif-decode = "1.0.1"
 base64 = "0.22.1"
-clap = { version = "4.5.45", features = ["derive"], optional = true }
-dssim-core = "3.2.11"
+clap = { version = "4.5.48", features = ["derive"], optional = true }
+dssim-core = "3.4.0"
 glob = { version = "0.3.3", optional = true }
 image = { version = "0.25.8", features = ["webp", "avif"] }
 imagequant = { version = "4.4.1", default-features = false }
