@@ -51,6 +51,68 @@ pub enum ImageProcessingError {
 }
 type Result<T, E = ImageProcessingError> = std::result::Result<T, E>;
 
+/// Run process image task.
+/// Load task: ["load", "url"]
+/// Resize task: ["resize", "width", "height"]
+/// Gray task: ["gray"]
+/// Optim task: ["optim", "webp", "quality", "speed"]
+/// Crop task: ["crop", "x", "y", "width", "height"]
+/// Watermark task: ["watermark", "url", "position", "margin left", "margin top"]
+/// Diff task: ["diff"]
+pub fn new_load_task(url: &str) -> Vec<String> {
+    vec![PROCESS_LOAD.to_string(), url.to_string()]
+}
+
+pub fn new_resize_task(width: u32, height: u32) -> Vec<String> {
+    vec![
+        PROCESS_RESIZE.to_string(),
+        width.to_string(),
+        height.to_string(),
+    ]
+}
+
+pub fn new_gray_task() -> Vec<String> {
+    vec![PROCESS_GRAY.to_string()]
+}
+
+pub fn new_optim_task(output_type: &str, qulity: u8, speed: u8) -> Vec<String> {
+    vec![
+        PROCESS_OPTIM.to_string(),
+        output_type.to_string(),
+        qulity.to_string(),
+        speed.to_string(),
+    ]
+}
+
+pub fn new_crop_task(x: u32, y: u32, width: u32, height: u32) -> Vec<String> {
+    vec![
+        PROCESS_CROP.to_string(),
+        x.to_string(),
+        y.to_string(),
+        width.to_string(),
+        height.to_string(),
+    ]
+}
+
+pub fn new_watermark_task(
+    url: &str,
+    postion: &str,
+    margin_left: u32,
+    margin_top: u32,
+) -> Vec<String> {
+    vec![
+        PROCESS_WATERMARK.to_string(),
+        url.to_string(),
+        postion.to_string(),
+        margin_left.to_string(),
+        margin_top.to_string(),
+    ]
+}
+
+pub fn new_diff_task() -> Vec<String> {
+    vec![PROCESS_DIFF.to_string()]
+}
+
 pub async fn run_with_image(image: ProcessImage, tasks: Vec<Vec<String>>) -> Result<ProcessImage> {
     let mut img = image;
     let he = ParamsInvalidSnafu {
@@ -144,14 +206,6 @@ pub async fn run_with_image(image: ProcessImage, tasks: Vec<Vec<String>>) -> Res
     Ok(img)
 }
 
-/// Run process image task.
-/// Load task: ["load", "url"]
-/// Resize task: ["resize", "width", "height"]
-/// Gray task: ["gray"]
-/// Optim task: ["optim", "webp", "quality", "speed"]
-/// Crop task: ["crop", "x", "y", "width", "height"]
-/// Watermark task: ["watermark", "url", "position", "margin left", "margin top"]
-/// Diff task: ["diff"]
 pub async fn run(tasks: Vec<Vec<String>>) -> Result<ProcessImage> {
     run_with_image(
         ProcessImage {

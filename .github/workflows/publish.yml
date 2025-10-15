@@ -34,11 +34,11 @@ jobs:
           mv target/x86_64-apple-darwin/release/imageoptimize ./imageoptimize
           tar -czvf imageoptimize-darwin-x86_64.tar.gz imageoptimize
 
+      # - name: Upload Assets
+      #     ls -lh imageoptimize*.gz
 
-          ls -lh imageoptimize*.gz
-
-          ./.github/workflows/upload_asset.sh ./imageoptimize-darwin-arm64.tar.gz $GITHUB_TOKEN
-          ./.github/workflows/upload_asset.sh ./imageoptimize-darwin-x86_64.tar.gz $GITHUB_TOKEN
+      #     ./.github/workflows/upload_asset.sh ./imageoptimize-darwin-arm64.tar.gz $GITHUB_TOKEN
+      #     ./.github/workflows/upload_asset.sh ./imageoptimize-darwin-x86_64.tar.gz $GITHUB_TOKEN
 
   linux-musl-x86:
     runs-on: ubuntu-24.04
@@ -56,13 +56,13 @@ jobs:
             curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-amd64_linux.tar.xz | tar --xz -xvf -
             ./upx-5.0.1-amd64_linux/upx imageoptimize
             ls -lh imageoptimize
-      - name: Upload Assets
-        run: |
-          tar -czvf imageoptimize-linux-musl-x86_64.tar.gz imageoptimize
+      # - name: Upload Assets
+      #   run: |
+      #     tar -czvf imageoptimize-linux-musl-x86_64.tar.gz imageoptimize
 
-          ls -lh imageoptimize*.gz
+      #     ls -lh imageoptimize*.gz
 
-          ./.github/workflows/upload_asset.sh ./imageoptimize-linux-musl-x86_64.tar.gz $GITHUB_TOKEN
+      #     ./.github/workflows/upload_asset.sh ./imageoptimize-linux-musl-x86_64.tar.gz $GITHUB_TOKEN
 
   linux-musl-aarch64:
     runs-on: ubuntu-24.04
@@ -80,13 +80,13 @@ jobs:
             curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-arm64_linux.tar.xz | tar --xz -xvf -
             ./upx-5.0.1-arm64_linux/upx imageoptimize
             ls -lh imageoptimize
-      - name: Upload Assets
-        run: |
-          tar -czvf imageoptimize-linux-musl-aarch64.tar.gz imageoptimize
+      # - name: Upload Assets
+      #   run: |
+      #     tar -czvf imageoptimize-linux-musl-aarch64.tar.gz imageoptimize
 
-          ls -lh imageoptimize*.gz
+      #     ls -lh imageoptimize*.gz
 
-          ./.github/workflows/upload_asset.sh ./imageoptimize-linux-musl-aarch64.tar.gz $GITHUB_TOKEN
+      #     ./.github/workflows/upload_asset.sh ./imageoptimize-linux-musl-aarch64.tar.gz $GITHUB_TOKEN
 
 
   windows:
@@ -141,7 +141,7 @@ jobs:
         shell: powershell
         run: |
           Compress-Archive -Path imageoptimize.exe -Destination imageoptimize-windows.exe.zip
-      - name: Upload asset
-        shell: bash
-        run: |
-          ./.github/workflows/upload_asset.sh ./imageoptimize-windows.exe.zip $GITHUB_TOKEN
+      # - name: Upload asset
+      #   shell: bash
+      #   run: |
+      #     ./.github/workflows/upload_asset.sh ./imageoptimize-windows.exe.zip $GITHUB_TOKEN
