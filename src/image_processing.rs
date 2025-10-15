@@ -84,7 +84,7 @@ pub fn new_optim_task(output_type: &str, qulity: u8, speed: u8) -> Vec<String> {
     ]
 }
 
-pub fn new_crop_task(x: u32, y: u32, width: u32, height: u32) -> Vec<String> {
+pub fn new_crop_task(x: u32, y: u32, width: i32, height: i32) -> Vec<String> {
     vec![
         PROCESS_CROP.to_string(),
         x.to_string(),
