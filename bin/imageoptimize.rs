@@ -20,9 +20,12 @@ use imageoptimize::{run, ImageProcessingError};
 use nu_ansi_term::Color::{LightCyan, LightGreen, LightRed, LightYellow};
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::fs;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 #[derive(Debug, Snafu)]
 enum Error {
@@ -121,6 +124,21 @@ struct Args {
     /// AVIF quality
     #[arg(long, default_value = "80")]
     avif_quality: u8,
+
+    /// WebP quality (0-99 lossy, >=100 lossless)
+    #[arg(long, default_value = "80")]
+    webp_quality: u8,
+
+    /// Number of parallel threads (default: number of logical CPUs)
+    #[arg(short, long)]
+    threads: Option<usize>,
+}
+
+fn relative(path: &str, base: &Path) -> String {
+    Path::new(path)
+        .strip_prefix(base)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 #[derive(Debug)]
@@ -140,7 +158,7 @@ struct ImageQualities {
 async fn optimize_image(
     item: &ImageOptimizeParams,
     qualities: ImageQualities,
-) -> Result<(usize, usize, f64)> {
+) -> Result<(usize, usize, f64, bool)> {
     let load_task = vec!["load".to_string(), format!("file://{}", &item.file)];
     let target = item.target.clone();
     let output_type = target.split('.').next_back().unwrap_or_default();
@@ -165,11 +183,12 @@ async fn optimize_image(
     if let Some(parent) = Path::new(&target).parent() {
         fs::create_dir_all(parent).await.context(CreateDirSnafu)?;
     }
+    let existed = fs::try_exists(&target).await.unwrap_or(false);
     let buf = img.get_buffer().context(OptimizeSnafu)?;
     let size = buf.len();
     fs::write(target, buf).await.context(WriteFileSnafu)?;
 
-    Ok((size, img.original_size, img.diff))
+    Ok((size, img.original_size, img.diff, existed))
 }
 
 #[tokio::main]
@@ -194,6 +213,8 @@ async fn main() {
         println!("imageoptimize: output path is empty");
         std::process::exit(1);
     }
+
+    let base = PathBuf::from(&output);
 
     //  glob patterns
     let formats = args
@@ -237,7 +258,10 @@ async fn main() {
         let pattern = format!("{source}/**/*.{ext}");
         println!(
             "{}",
-            format!("Searching pattern: {}", LightCyan.paint(pattern.clone()))
+            format!(
+                "Searching pattern: {}",
+                LightCyan.paint(relative(&pattern, &base))
+            )
         );
         let entries = match glob(&pattern) {
             Ok(entries) => entries,
@@ -291,22 +315,67 @@ async fn main() {
 
     let qualities = ImageQualities {
         avif: args.avif_quality,
-        webp: 0,
+        webp: args.webp_quality,
         png: args.png_quality,
         jpeg: args.jpeg_quality,
     };
-    let kb = 1024;
+
+    let kb: usize = 1024;
     let mb = kb * 1024;
-    for item in image_optimize_params.iter() {
-        let start = Instant::now();
-        match optimize_image(item, qualities.clone()).await {
-            Ok((size, original_size, diff)) => {
-                let diff_str = format!("{:.2}", diff);
-                let diff_text = if diff > 1.0 {
-                    LightYellow.paint(diff_str)
-                } else {
-                    LightGreen.paint(diff_str)
-                };
+
+    // Other columns: fixed upper bounds.
+    let pct_col  = 4.max("PCT".len());  // "100%" = 4
+    let diff_col = 6.max("DIFF".len()); // "(0.00)" = 6
+    let size_col = 5.max("SIZE".len()); // "999kb" ≤ 5
+    let dur_col  = 6.max("TIME".len()); // "1000ms" = 6
+
+    println!(
+        "{:>pct_col$}  {:>diff_col$}  {:>size_col$}  {:>dur_col$}  FILE",
+        "PCT", "DIFF", "SIZE", "TIME",
+    );
+    println!(
+        "{}  {}  {}  {}  ----",
+        "-".repeat(pct_col),
+        "-".repeat(diff_col),
+        "-".repeat(size_col),
+        "-".repeat(dur_col),
+    );
+
+    // Build group metadata before consuming image_optimize_params.
+    // expected: how many targets each source file has
+    // target_to_file: maps each target path back to its source file
+    let mut expected: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut target_to_file: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for item in &image_optimize_params {
+        *expected.entry(item.file.clone()).or_insert(0) += 1;
+        target_to_file.insert(item.target.clone(), item.file.clone());
+    }
+
+    // Spawn all tasks in parallel — no change from original behaviour.
+    let concurrency = args.threads.unwrap_or_else(num_cpus::get);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut join_set: JoinSet<(String, String, Instant, Result<(usize, usize, f64, bool)>)> =
+        JoinSet::new();
+    for item in image_optimize_params {
+        let qualities = qualities.clone();
+        let sem = semaphore.clone();
+        join_set.spawn(async move {
+            let _permit = sem.acquire_owned().await.unwrap();
+            let start = Instant::now();
+            let result = optimize_image(&item, qualities).await;
+            (item.target, item.file, start, result)
+        });
+    }
+
+    // Collect results into per-source buffers; flush immediately when a group is complete.
+    type TaskResult = (String, String, Instant, Result<(usize, usize, f64, bool)>);
+    let mut buffers: std::collections::HashMap<String, Vec<TaskResult>> =
+        std::collections::HashMap::new();
+
+    let print_row = |target: &str, _file: &str, start: Instant, res: Result<(usize, usize, f64, bool)>| {
+        match res {
+            Ok((size, original_size, diff, existed)) => {
                 let size_str = if size >= mb {
                     format!("{}mb", size / mb)
                 } else if size >= kb {
@@ -314,20 +383,44 @@ async fn main() {
                 } else {
                     format!("{}b", size)
                 };
-                let percent = size * 100 / original_size;
                 let duration = start.elapsed().as_millis();
                 let duration_str = if duration < 1000 {
                     format!("{}ms", duration)
                 } else {
-                    format!("{}s", duration / 1000)
+                    format!("{:.1}s", duration as f64 / 1000.0)
+                };
+                let diff_num = format!("{diff:>4.2}");
+                let diff_inner = if diff > 1.0 {
+                    LightYellow.paint(&diff_num).to_string()
+                } else {
+                    LightGreen.paint(&diff_num).to_string()
+                };
+                let percent = size * 100 / original_size;
+                let status = if existed {
+                    LightYellow.paint("(U)").to_string()
+                } else {
+                    LightGreen.paint("(N)").to_string()
                 };
                 println!(
-                    "{}: {size_str} {percent}%({diff_text}) {duration_str}",
-                    item.target.clone(),
+                    "{:>pct_col$}  ({diff_inner})  {:>size_col$}  {:>dur_col$}  {} {status}",
+                    format!("{percent}%"), size_str, duration_str, relative(target, &base),
                 );
             }
             Err(e) => {
-                println!("{}", LightRed.paint(format!("{}: {e:?}", &item.file)));
+                println!("{}", LightRed.paint(format!("{}: {e:?}", relative(target, &base))));
+            }
+        }
+    };
+
+    while let Some(task) = join_set.join_next().await {
+        let (target, file, start, result) = task.expect("task panicked");
+        let source = target_to_file[&target].clone();
+        buffers.entry(source.clone()).or_default().push((target, file, start, result));
+
+        // Flush immediately once all variants of this source file have arrived.
+        if buffers[&source].len() == expected[&source] {
+            for (t, f, s, r) in buffers.remove(&source).unwrap() {
+                print_row(&t, &f, s, r);
             }
         }
     }

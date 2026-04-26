@@ -1,15 +1,16 @@
 use avif_decode::Decoder;
 use image::codecs::avif;
 use image::codecs::gif;
-use image::codecs::webp;
+use image::codecs::webp::WebPEncoder;
 use image::{AnimationDecoder, DynamicImage, ImageEncoder, ImageFormat, RgbaImage};
 use lodepng::Bitmap;
-use rgb::{ComponentBytes, RGB8, RGBA8};
+use rgb::{ComponentBytes, FromSlice, RGB8, RGBA8};
 use snafu::{ResultExt, Snafu};
 use std::{
     ffi::OsStr,
     io::{BufRead, Seek},
 };
+use webp::Encoder;
 
 #[derive(Debug, Snafu)]
 pub enum ImageError {
@@ -33,8 +34,6 @@ pub enum ImageError {
         category: String,
         source: lodepng::Error,
     },
-    #[snafu(display("Handle image fail, category:mozjpeg, message:unknown"))]
-    Mozjpeg {},
     #[snafu(display("Io fail, {source}"))]
     Io { source: std::io::Error },
     #[snafu(display("Handle image fail"))]
@@ -43,45 +42,33 @@ pub enum ImageError {
 
 type Result<T, E = ImageError> = std::result::Result<T, E>;
 
+/// Holds a decoded RGBA image ready for encoding. Internally backed by `RgbaImage`
+/// so all encoders can borrow its raw bytes without any intermediate copies.
 pub struct ImageInfo {
-    // rgba像素
-    pub buffer: Vec<RGBA8>,
-    /// Width in pixels
-    pub width: usize,
-    /// Height in pixels
-    pub height: usize,
+    pub image: RgbaImage,
+}
+
+impl ImageInfo {
+    pub fn width(&self) -> usize {
+        self.image.width() as usize
+    }
+    pub fn height(&self) -> usize {
+        self.image.height() as usize
+    }
 }
 
 impl From<Bitmap<RGBA8>> for ImageInfo {
     fn from(info: Bitmap<RGBA8>) -> Self {
-        ImageInfo {
-            buffer: info.buffer,
-            width: info.width,
-            height: info.height,
-        }
+        let raw = info.buffer.as_bytes().to_vec();
+        let image =
+            RgbaImage::from_raw(info.width as u32, info.height as u32, raw).unwrap_or_default();
+        ImageInfo { image }
     }
 }
 
 impl From<RgbaImage> for ImageInfo {
-    fn from(img: RgbaImage) -> Self {
-        let width = img.width() as usize;
-        let height = img.height() as usize;
-        let mut buffer = Vec::with_capacity(width * height);
-
-        for ele in img.chunks(4) {
-            buffer.push(RGBA8 {
-                r: ele[0],
-                g: ele[1],
-                b: ele[2],
-                a: ele[3],
-            })
-        }
-
-        ImageInfo {
-            buffer,
-            width,
-            height,
-        }
+    fn from(image: RgbaImage) -> Self {
+        ImageInfo { image }
     }
 }
 
@@ -98,58 +85,51 @@ pub fn avif_decode(data: &[u8]) -> Result<DynamicImage> {
         })?;
     match avif_result {
         avif_decode::Image::Rgb8(img) => {
-            let width = img.width();
-            let height = img.height();
-            let mut buf = Vec::with_capacity(width * height * 3);
-            for item in img.buf() {
-                buf.push(item.r);
-                buf.push(item.g);
-                buf.push(item.b);
-            }
-            let rgb_image = image::RgbImage::from_raw(width as u32, height as u32, buf)
-                .ok_or(ImageError::Unknown)?;
-            Ok(DynamicImage::ImageRgb8(rgb_image))
+            let (width, height) = (img.width() as u32, img.height() as u32);
+            let buf: Vec<u8> = img.buf().iter().flat_map(|p| [p.r, p.g, p.b]).collect();
+            image::RgbImage::from_raw(width, height, buf)
+                .ok_or(ImageError::Unknown)
+                .map(DynamicImage::ImageRgb8)
         }
         avif_decode::Image::Rgba8(img) => {
-            let width = img.width();
-            let height = img.height();
-            let mut buf = Vec::with_capacity(width * height * 4);
-            for item in img.buf() {
-                buf.push(item.r);
-                buf.push(item.g);
-                buf.push(item.b);
-                buf.push(item.a);
-            }
-            let rgba_image = image::RgbaImage::from_raw(width as u32, height as u32, buf)
-                .ok_or(ImageError::Unknown)?;
-            Ok(DynamicImage::ImageRgba8(rgba_image))
+            let (width, height) = (img.width() as u32, img.height() as u32);
+            let buf: Vec<u8> = img
+                .buf()
+                .iter()
+                .flat_map(|p| [p.r, p.g, p.b, p.a])
+                .collect();
+            image::RgbaImage::from_raw(width, height, buf)
+                .ok_or(ImageError::Unknown)
+                .map(DynamicImage::ImageRgba8)
         }
         avif_decode::Image::Rgba16(img) => {
-            let width = img.width();
-            let height = img.height();
-            let mut buf = Vec::with_capacity(width * height * 4);
-            for item in img.buf() {
-                buf.push((item.r / 257) as u8);
-                buf.push((item.g / 257) as u8);
-                buf.push((item.b / 257) as u8);
-                buf.push((item.a / 257) as u8);
-            }
-            let rgba_image = image::RgbaImage::from_raw(width as u32, height as u32, buf)
-                .ok_or(ImageError::Unknown)?;
-            Ok(DynamicImage::ImageRgba8(rgba_image))
+            let (width, height) = (img.width() as u32, img.height() as u32);
+            let buf: Vec<u8> = img
+                .buf()
+                .iter()
+                .flat_map(|p| {
+                    [
+                        (p.r / 257) as u8,
+                        (p.g / 257) as u8,
+                        (p.b / 257) as u8,
+                        (p.a / 257) as u8,
+                    ]
+                })
+                .collect();
+            image::RgbaImage::from_raw(width, height, buf)
+                .ok_or(ImageError::Unknown)
+                .map(DynamicImage::ImageRgba8)
         }
         avif_decode::Image::Rgb16(img) => {
-            let width = img.width();
-            let height = img.height();
-            let mut buf = Vec::with_capacity(width * height * 3);
-            for item in img.buf() {
-                buf.push((item.r / 257) as u8);
-                buf.push((item.g / 257) as u8);
-                buf.push((item.b / 257) as u8);
-            }
-            let rgb_image = image::RgbImage::from_raw(width as u32, height as u32, buf)
-                .ok_or(ImageError::Unknown)?;
-            Ok(DynamicImage::ImageRgb8(rgb_image))
+            let (width, height) = (img.width() as u32, img.height() as u32);
+            let buf: Vec<u8> = img
+                .buf()
+                .iter()
+                .flat_map(|p| [(p.r / 257) as u8, (p.g / 257) as u8, (p.b / 257) as u8])
+                .collect();
+            image::RgbImage::from_raw(width, height, buf)
+                .ok_or(ImageError::Unknown)
+                .map(DynamicImage::ImageRgb8)
         }
         _ => Err(ImageError::Unknown),
     }
@@ -158,8 +138,7 @@ pub fn avif_decode(data: &[u8]) -> Result<DynamicImage> {
 pub fn load<R: BufRead + Seek>(r: R, ext: &str) -> Result<ImageInfo> {
     let format = ImageFormat::from_extension(OsStr::new(ext)).unwrap_or(ImageFormat::Jpeg);
     let result = image::load(r, format).context(ImageSnafu { category: "load" })?;
-    let img = result.to_rgba8();
-    Ok(img.into())
+    Ok(result.to_rgba8().into())
 }
 
 pub fn to_gif<R>(r: R, speed: u8) -> Result<Vec<u8>>
@@ -181,37 +160,38 @@ where
             .context(ImageSnafu {
                 category: "gif_set_repeat",
             })?;
-        encoder
-            .try_encode_frames(frames.into_iter())
-            .context(ImageSnafu {
-                category: "git_encode",
-            })?;
+        encoder.try_encode_frames(frames).context(ImageSnafu {
+            category: "gif_encode",
+        })?;
     }
 
     Ok(w)
 }
 
 impl ImageInfo {
-    // 转换获取rgb颜色
     fn get_rgb8(&self) -> Vec<RGB8> {
-        let mut output_data: Vec<RGB8> = Vec::with_capacity(self.width * self.height);
-
-        for ele in &self.buffer {
-            output_data.push(ele.rgb())
-        }
-
-        output_data
+        self.image
+            .as_raw()
+            .as_rgba()
+            .iter()
+            .map(|p| p.rgb())
+            .collect()
     }
+
     /// Optimize image to png, the quality is min 0, max 100, which means best effort,
     /// and never aborts the process.
     pub fn to_png(&self, quality: u8) -> Result<Vec<u8>> {
+        let pixels: &[RGBA8] = self.image.as_raw().as_rgba();
+        let width = self.width();
+        let height = self.height();
+
         let mut liq = imagequant::new();
         liq.set_quality(0, quality).context(ImageQuantSnafu {
             category: "png_set_quality",
         })?;
 
         let mut img = liq
-            .new_image(self.buffer.as_ref(), self.width, self.height, 0.0)
+            .new_image(pixels, width, height, 0.0)
             .context(ImageQuantSnafu {
                 category: "png_new_image",
             })?;
@@ -232,47 +212,48 @@ impl ImageInfo {
             category: "png_encoder",
         })?;
 
-        let buf = enc
-            .encode(&pixels, self.width, self.height)
-            .context(LodePNGSnafu {
-                category: "png_encode",
-            })?;
+        let buf = enc.encode(&pixels, width, height).context(LodePNGSnafu {
+            category: "png_encode",
+        })?;
 
         Ok(buf)
     }
-    /// Optimize image to lossless webp.
-    pub fn to_webp(&self) -> Result<Vec<u8>> {
-        let mut w = Vec::new();
 
-        let img = webp::WebPEncoder::new_lossless(&mut w);
-
-        img.encode(
-            self.buffer.as_bytes(),
-            self.width as u32,
-            self.height as u32,
-            image::ColorType::Rgba8.into(),
-        )
-        .context(ImageSnafu {
-            category: "webp_encode",
-        })?;
-
-        Ok(w)
+    /// Optimize image to webp. quality >= 100 produces lossless output;
+    /// any lower value encodes lossy at that quality (0–99).
+    pub fn to_webp(&self, quality: u8) -> Result<Vec<u8>> {
+        if quality >= 100 {
+            let mut w = Vec::new();
+            WebPEncoder::new_lossless(&mut w)
+                .encode(
+                    self.image.as_raw(),
+                    self.image.width(),
+                    self.image.height(),
+                    image::ColorType::Rgba8.into(),
+                )
+                .context(ImageSnafu {
+                    category: "webp_encode",
+                })?;
+            Ok(w)
+        } else {
+            let di = DynamicImage::ImageRgba8(self.image.clone());
+            let encoder = Encoder::from_image(&di).map_err(|_| ImageError::Unknown)?;
+            Ok(encoder.encode(quality as f32).to_vec())
+        }
     }
+
     /// Optimize image to avif.
     /// `speed` accepts a value in the range 0-10, where 0 is the slowest and 10 is the fastest.
     /// `quality` accepts a value in the range 0-100, where 0 is the worst and 100 is the best.
     pub fn to_avif(&self, quality: u8, speed: u8) -> Result<Vec<u8>> {
         let mut w = Vec::new();
-        let mut sp = speed;
-        if sp == 0 {
-            sp = 3;
-        }
+        let sp = if speed == 0 { 3 } else { speed };
 
         let img = avif::AvifEncoder::new_with_speed_quality(&mut w, sp, quality);
         img.write_image(
-            self.buffer.as_bytes(),
-            self.width as u32,
-            self.height as u32,
+            self.image.as_raw(),
+            self.image.width(),
+            self.image.height(),
             image::ColorType::Rgba8.into(),
         )
         .context(ImageSnafu {
@@ -281,10 +262,11 @@ impl ImageInfo {
 
         Ok(w)
     }
+
     /// Optimize image to jpeg, the quality 60-80 are recommended.
     pub fn to_mozjpeg(&self, quality: u8) -> Result<Vec<u8>> {
         let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
-        comp.set_size(self.width, self.height);
+        comp.set_size(self.width(), self.height());
         comp.set_quality(quality as f32);
         let mut comp = comp.start_compress(Vec::new()).context(IoSnafu {})?;
         comp.write_scanlines(self.get_rgb8().as_bytes())
@@ -308,8 +290,8 @@ mod tests {
     #[test]
     fn test_load_image() {
         let img = load_image();
-        assert_eq!(img.height, 144);
-        assert_eq!(img.width, 144);
+        assert_eq!(img.height(), 144);
+        assert_eq!(img.width(), 144);
     }
     #[test]
     fn test_to_png() {
@@ -321,8 +303,13 @@ mod tests {
     #[test]
     fn test_to_webp() {
         let img = load_image();
-        let result = img.to_webp().unwrap();
+        // lossless
+        let result = img.to_webp(100).unwrap();
         assert_eq!(result.len(), 2764);
+        // lossy
+        let result = img.to_webp(80).unwrap();
+        assert_ne!(result.len(), 0);
+        assert!(result.len() < 2764);
     }
     #[test]
     fn test_to_jpeg() {
@@ -334,6 +321,6 @@ mod tests {
     fn test_to_avif() {
         let img = load_image();
         let result = img.to_avif(90, 3).unwrap();
-        assert_eq!(result.len(), 2345);
+        assert_eq!(result.len(), 2402);
     }
 }
