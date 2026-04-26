@@ -13,15 +13,12 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.86.0
-      - name: Install target
-        run: |
-          brew install nasm
-          rustup update
-          rustup target add aarch64-apple-darwin
-          rustup target add x86_64-apple-darwin
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Install dependencies
+        run: brew install nasm
       - name: release
         run: |
           cargo build --features=bin --release --target=aarch64-apple-darwin
@@ -40,55 +37,37 @@ jobs:
       #     ./.github/workflows/upload_asset.sh ./imageoptimize-darwin-arm64.tar.gz $GITHUB_TOKEN
       #     ./.github/workflows/upload_asset.sh ./imageoptimize-darwin-x86_64.tar.gz $GITHUB_TOKEN
 
-  linux-musl-x86:
-    runs-on: ubuntu-24.04
+  linux-musl:
+    strategy:
+      matrix:
+        include:
+          - runs-on: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            artifact: imageoptimize-linux-musl-x86_64.tar.gz
+          - runs-on: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact: imageoptimize-linux-musl-aarch64.tar.gz
+    runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v4
-      - name: release
-        uses: addnab/docker-run-action@v3
+      - uses: dtolnay/rust-toolchain@master
         with:
-          image: messense/rust-musl-cross:x86_64-musl
-          options: -v ${{ github.workspace }}:/home/rust/src
-          run: |
-            apt-get update
-            apt-get install -y nasm
-            cargo build --features=bin --release
-            mv target/x86_64-unknown-linux-musl/release/imageoptimize ./imageoptimize
-            curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-amd64_linux.tar.xz | tar --xz -xvf -
-            ./upx-5.0.1-amd64_linux/upx imageoptimize
-            ls -lh imageoptimize
+          toolchain: 1.86.0
+          targets: ${{ matrix.target }}
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm musl-tools
+      - name: release
+        run: |
+          cargo build --features=bin --release --target=${{ matrix.target }}
+          mv target/${{ matrix.target }}/release/imageoptimize ./imageoptimize
+          tar -czvf ${{ matrix.artifact }} imageoptimize
+          ls -lh imageoptimize
       # - name: Upload Assets
       #   run: |
-      #     tar -czvf imageoptimize-linux-musl-x86_64.tar.gz imageoptimize
-
-      #     ls -lh imageoptimize*.gz
-
-      #     ./.github/workflows/upload_asset.sh ./imageoptimize-linux-musl-x86_64.tar.gz $GITHUB_TOKEN
-
-  linux-musl-aarch64:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: release
-        uses: addnab/docker-run-action@v3
-        with:
-          image: messense/rust-musl-cross:aarch64-musl
-          options: -v ${{ github.workspace }}:/home/rust/src
-          run: |
-            apt-get update
-            apt-get install -y nasm
-            cargo build --features=bin --release
-            mv target/aarch64-unknown-linux-musl/release/imageoptimize ./imageoptimize
-            curl -L https://github.com/upx/upx/releases/download/v5.0.1/upx-5.0.1-arm64_linux.tar.xz | tar --xz -xvf -
-            ./upx-5.0.1-arm64_linux/upx imageoptimize
-            ls -lh imageoptimize
-      # - name: Upload Assets
-      #   run: |
-      #     tar -czvf imageoptimize-linux-musl-aarch64.tar.gz imageoptimize
-
-      #     ls -lh imageoptimize*.gz
-
-      #     ./.github/workflows/upload_asset.sh ./imageoptimize-linux-musl-aarch64.tar.gz $GITHUB_TOKEN
+      #     ls -lh ${{ matrix.artifact }}
+      #     ./.github/workflows/upload_asset.sh ./${{ matrix.artifact }} $GITHUB_TOKEN
 
 
   windows:
@@ -137,7 +116,7 @@ jobs:
         shell: bash
         run: |
           cargo --version
-          cargo build --release 
+          cargo build --features=bin --release
           mv target/release/imageoptimize.exe ./imageoptimize.exe
       - name: Zip
         shell: powershell
