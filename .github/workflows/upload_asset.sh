@@ -6,7 +6,7 @@ if [ $# -lt 2 ]; then
     exit 1
 fi
 
-repo="vicanso/pingap"
+repo="vicanso/imageoptimize"
 file_path=$1
 bearer=$2
 
