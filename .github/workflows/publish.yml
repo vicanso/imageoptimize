@@ -58,9 +58,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm musl-tools
+          pip3 install ziglang
+          cargo install cargo-zigbuild --locked
       - name: release
         run: |
-          cargo build --features=bin --release --target=${{ matrix.target }}
+          cargo zigbuild --features=bin --release --target=${{ matrix.target }}
           mv target/${{ matrix.target }}/release/imageoptimize ./imageoptimize
           tar -czvf ${{ matrix.artifact }} imageoptimize
           ls -lh imageoptimize
