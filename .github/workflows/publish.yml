@@ -28,7 +28,7 @@ jobs:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
       - name: Install dependencies
-        run: brew install nasm
+        run: brew install yasm
       - name: release
         run: |
           cargo build --features=bin --release --target=${{ matrix.target }}
