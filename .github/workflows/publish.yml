@@ -35,10 +35,10 @@ jobs:
           mv target/${{ matrix.target }}/release/imageoptimize ./imageoptimize
           tar -czvf ${{ matrix.artifact }} imageoptimize
           ls -lh imageoptimize
-      # - name: Upload Assets
-      #   run: |
-      #     ls -lh ${{ matrix.artifact }}
-      #     ./.github/workflows/upload_asset.sh ./${{ matrix.artifact }} $GITHUB_TOKEN
+      - name: Upload Assets
+        run: |
+          ls -lh ${{ matrix.artifact }}
+          ./.github/workflows/upload_asset.sh ./${{ matrix.artifact }} $GITHUB_TOKEN
 
   linux-musl:
     strategy:
@@ -69,10 +69,10 @@ jobs:
           mv target/${{ matrix.target }}/release/imageoptimize ./imageoptimize
           tar -czvf ${{ matrix.artifact }} imageoptimize
           ls -lh imageoptimize
-      # - name: Upload Assets
-      #   run: |
-      #     ls -lh ${{ matrix.artifact }}
-      #     ./.github/workflows/upload_asset.sh ./${{ matrix.artifact }} $GITHUB_TOKEN
+      - name: Upload Assets
+        run: |
+          ls -lh ${{ matrix.artifact }}
+          ./.github/workflows/upload_asset.sh ./${{ matrix.artifact }} $GITHUB_TOKEN
 
 
   windows:
@@ -127,7 +127,8 @@ jobs:
         shell: powershell
         run: |
           Compress-Archive -Path imageoptimize.exe -Destination imageoptimize-windows.exe.zip
-      # - name: Upload asset
-      #   shell: bash
-      #   run: |
-      #     ./.github/workflows/upload_asset.sh ./imageoptimize-windows.exe.zip $GITHUB_TOKEN
+      - name: Upload Assets
+        shell: bash
+        run: |
+          ls -lh imageoptimize-windows.exe.zip
+          ./.github/workflows/upload_asset.sh ./imageoptimize-windows.exe.zip $GITHUB_TOKEN
