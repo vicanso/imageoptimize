@@ -4,13 +4,29 @@ Support multi process for image, such as: resize, gray, crop, watermark and opti
 
 ## Installation
 
+### Shell script (Linux / macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vicanso/imageoptimize/main/install.sh | bash
+```
+
+Install a specific version or to a custom directory:
+
+```bash
+# Specific version
+curl -fsSL https://raw.githubusercontent.com/vicanso/imageoptimize/main/install.sh | bash -s v0.4.3
+
+# Custom install directory
+curl -fsSL https://raw.githubusercontent.com/vicanso/imageoptimize/main/install.sh | INSTALL_DIR=~/.local/bin bash
+```
+
 ### Pre-built binary
 
 Download the archive for your platform from [GitHub Releases](https://github.com/vicanso/imageoptimize/releases), extract and place the binary in your `PATH`.
 
 | Platform | Archive |
 |----------|---------|
-| macOS Apple Silicon | `imageoptimize-darwin-arm64.tar.gz` |
+| macOS Apple Silicon | `imageoptimize-darwin-aarch64.tar.gz` |
 | macOS Intel | `imageoptimize-darwin-x86_64.tar.gz` |
 | Linux x86_64 (musl) | `imageoptimize-linux-musl-x86_64.tar.gz` |
 | Linux aarch64 (musl) | `imageoptimize-linux-musl-aarch64.tar.gz` |
