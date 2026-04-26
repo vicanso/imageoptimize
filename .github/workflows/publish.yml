@@ -10,32 +10,35 @@ env:
 
 jobs:
   macos:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: imageoptimize-darwin-aarch64.tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: imageoptimize-darwin-x86_64.tar.gz
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.target }}
       - name: Install dependencies
         run: brew install nasm
       - name: release
         run: |
-          cargo build --features=bin --release --target=aarch64-apple-darwin
-
-          mv target/aarch64-apple-darwin/release/imageoptimize ./imageoptimize
-          tar -czvf imageoptimize-darwin-arm64.tar.gz imageoptimize
-
-        
-          cargo build --features=bin --release --target=x86_64-apple-darwin
-          mv target/x86_64-apple-darwin/release/imageoptimize ./imageoptimize
-          tar -czvf imageoptimize-darwin-x86_64.tar.gz imageoptimize
-
+          cargo build --features=bin --release --target=${{ matrix.target }}
+          mv target/${{ matrix.target }}/release/imageoptimize ./imageoptimize
+          tar -czvf ${{ matrix.artifact }} imageoptimize
+          ls -lh imageoptimize
       # - name: Upload Assets
-      #     ls -lh imageoptimize*.gz
-
-      #     ./.github/workflows/upload_asset.sh ./imageoptimize-darwin-arm64.tar.gz $GITHUB_TOKEN
-      #     ./.github/workflows/upload_asset.sh ./imageoptimize-darwin-x86_64.tar.gz $GITHUB_TOKEN
+      #   run: |
+      #     ls -lh ${{ matrix.artifact }}
+      #     ./.github/workflows/upload_asset.sh ./${{ matrix.artifact }} $GITHUB_TOKEN
 
   linux-musl:
     strategy:
