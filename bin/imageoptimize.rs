@@ -158,7 +158,7 @@ struct ImageQualities {
 async fn optimize_image(
     item: &ImageOptimizeParams,
     qualities: ImageQualities,
-) -> Result<(usize, usize, f64, bool)> {
+) -> Result<(usize, usize, f64, bool, bool)> {
     let load_task = vec!["load".to_string(), format!("file://{}", &item.file)];
     let target = item.target.clone();
     let output_type = target.split('.').next_back().unwrap_or_default();
@@ -186,9 +186,30 @@ async fn optimize_image(
     let existed = fs::try_exists(&target).await.unwrap_or(false);
     let buf = img.get_buffer().context(OptimizeSnafu)?;
     let size = buf.len();
-    fs::write(target, buf).await.context(WriteFileSnafu)?;
 
-    Ok((size, img.original_size, img.diff, existed))
+    let src_ext = Path::new(&item.file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let same_format = src_ext == output_type;
+    if same_format && size >= img.original_size {
+        if item.file != item.target {
+            // Different output dir: copy the original so the output directory is complete.
+            let original = fs::read(&item.file).await.context(WriteFileSnafu)?;
+            fs::write(&target, original).await.context(WriteFileSnafu)?;
+        }
+        // skipped = true so the summary ignores this file.
+        return Ok((
+            img.original_size,
+            img.original_size,
+            img.diff,
+            existed,
+            true,
+        ));
+    }
+
+    fs::write(target, buf).await.context(WriteFileSnafu)?;
+    Ok((size, img.original_size, img.diff, existed, false))
 }
 
 #[tokio::main]
@@ -324,10 +345,10 @@ async fn main() {
     let mb = kb * 1024;
 
     // Other columns: fixed upper bounds.
-    let pct_col  = 4.max("PCT".len());  // "100%" = 4
+    let pct_col = 4.max("PCT".len()); // "100%" = 4
     let diff_col = 6.max("DIFF".len()); // "(0.00)" = 6
     let size_col = 5.max("SIZE".len()); // "999kb" ≤ 5
-    let dur_col  = 6.max("TIME".len()); // "1000ms" = 6
+    let dur_col = 6.max("TIME".len()); // "1000ms" = 6
 
     println!(
         "{:>pct_col$}  {:>diff_col$}  {:>size_col$}  {:>dur_col$}  FILE",
@@ -355,8 +376,12 @@ async fn main() {
     // Spawn all tasks in parallel — no change from original behaviour.
     let concurrency = args.threads.unwrap_or_else(num_cpus::get);
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut join_set: JoinSet<(String, String, Instant, Result<(usize, usize, f64, bool)>)> =
-        JoinSet::new();
+    let mut join_set: JoinSet<(
+        String,
+        String,
+        Instant,
+        Result<(usize, usize, f64, bool, bool)>,
+    )> = JoinSet::new();
     for item in image_optimize_params {
         let qualities = qualities.clone();
         let sem = semaphore.clone();
@@ -369,25 +394,45 @@ async fn main() {
     }
 
     // Collect results into per-source buffers; flush immediately when a group is complete.
-    type TaskResult = (String, String, Instant, Result<(usize, usize, f64, bool)>);
+    type TaskResult = (
+        String,
+        String,
+        Instant,
+        Result<(usize, usize, f64, bool, bool)>,
+    );
     let mut buffers: std::collections::HashMap<String, Vec<TaskResult>> =
         std::collections::HashMap::new();
 
-    let print_row = |target: &str, _file: &str, start: Instant, res: Result<(usize, usize, f64, bool)>| {
+    let print_row = |target: &str,
+                     _file: &str,
+                     start: Instant,
+                     res: Result<(usize, usize, f64, bool, bool)>| {
         match res {
-            Ok((size, original_size, diff, existed)) => {
+            Ok((size, original_size, diff, existed, skipped)) => {
+                let duration = start.elapsed().as_millis();
+                let duration_str = if duration < 1000 {
+                    format!("{}ms", duration)
+                } else {
+                    format!("{:.1}s", duration as f64 / 1000.0)
+                };
+                if skipped {
+                    println!(
+                        "{:>pct_col$}  {:>diff_col$}  {:>size_col$}  {:>dur_col$}  {} {}",
+                        LightYellow.paint("SKIP"),
+                        "",
+                        "",
+                        duration_str,
+                        relative(target, &base),
+                        LightYellow.paint("(-)"),
+                    );
+                    return;
+                }
                 let size_str = if size >= mb {
                     format!("{}mb", size / mb)
                 } else if size >= kb {
                     format!("{}kb", size / kb)
                 } else {
                     format!("{}b", size)
-                };
-                let duration = start.elapsed().as_millis();
-                let duration_str = if duration < 1000 {
-                    format!("{}ms", duration)
-                } else {
-                    format!("{:.1}s", duration as f64 / 1000.0)
                 };
                 let diff_num = format!("{diff:>4.2}");
                 let diff_inner = if diff > 1.0 {
@@ -403,25 +448,92 @@ async fn main() {
                 };
                 println!(
                     "{:>pct_col$}  ({diff_inner})  {:>size_col$}  {:>dur_col$}  {} {status}",
-                    format!("{percent}%"), size_str, duration_str, relative(target, &base),
+                    format!("{percent}%"),
+                    size_str,
+                    duration_str,
+                    relative(target, &base),
                 );
             }
             Err(e) => {
-                println!("{}", LightRed.paint(format!("{}: {e:?}", relative(target, &base))));
+                println!(
+                    "{}",
+                    LightRed.paint(format!("{}: {e:?}", relative(target, &base)))
+                );
             }
         }
     };
 
+    let mut summary_original: usize = 0;
+    let mut summary_optimized: usize = 0;
+    let mut summary_count: usize = 0;
+    let mut summary_skipped: usize = 0;
+
     while let Some(task) = join_set.join_next().await {
         let (target, file, start, result) = task.expect("task panicked");
         let source = target_to_file[&target].clone();
-        buffers.entry(source.clone()).or_default().push((target, file, start, result));
+        buffers
+            .entry(source.clone())
+            .or_default()
+            .push((target, file, start, result));
 
         // Flush immediately once all variants of this source file have arrived.
         if buffers[&source].len() == expected[&source] {
             for (t, f, s, r) in buffers.remove(&source).unwrap() {
+                let src_ext = Path::new(&f)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                let tgt_ext = Path::new(&t)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                if src_ext == tgt_ext {
+                    if let Ok((size, original_size, _, _, skipped)) = &r {
+                        if *skipped {
+                            summary_skipped += 1;
+                        } else {
+                            summary_original += original_size;
+                            summary_optimized += size;
+                            summary_count += 1;
+                        }
+                    }
+                }
                 print_row(&t, &f, s, r);
             }
         }
+    }
+
+    if summary_count > 0 || summary_skipped > 0 {
+        let format_size = |size: usize| {
+            if size >= mb {
+                format!("{:.1}mb", size as f64 / mb as f64)
+            } else if size >= kb {
+                format!("{:.1}kb", size as f64 / kb as f64)
+            } else {
+                format!("{}b", size)
+            }
+        };
+        let saved = summary_original.saturating_sub(summary_optimized);
+        let saved_pct = if summary_original > 0 {
+            saved * 100 / summary_original
+        } else {
+            0
+        };
+        let skipped_note = if summary_skipped > 0 {
+            format!(", {} unchanged", LightYellow.paint(format!("{summary_skipped}")))
+        } else {
+            String::new()
+        };
+        println!();
+        println!(
+            "{}",
+            LightCyan.paint(format!(
+                "Optimized {summary_count} file{}: {} → {}, saved {} ({saved_pct}%){skipped_note}",
+                if summary_count == 1 { "" } else { "s" },
+                format_size(summary_original),
+                format_size(summary_optimized),
+                LightGreen.paint(format_size(saved)),
+            ))
+        );
     }
 }

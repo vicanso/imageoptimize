@@ -104,7 +104,11 @@ imageoptimize /path/to/source --output /path/to/output \
 Each processed file prints a one-line summary:
 
 ```
-path/to/image.avif: 42kb 68%(0.12) 320ms
+ PCT    DIFF   SIZE    TIME  FILE
+----  ------  -----  ------  ----
+ 69%  (0.59)   12kb    2.8s  asset/image/line_mixin.webp (N)
+ 55%  (0.54)   10kb    2.8s  asset/image/line_mixin.avif (N)
+SKIP                   2.8s  asset/image/line_mixin.jpeg (-)
 ```
 
 Fields: output path · file size · size relative to original · dssim perceptual difference · elapsed time.
