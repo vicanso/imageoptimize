@@ -15,8 +15,8 @@
 // limitations under the License.
 
 use clap::{Parser, ValueEnum};
-use glob::glob;
-use imageoptimize::{run, ImageProcessingError};
+use glob::{glob, Pattern};
+use imageoptimize::{run, strip_exif_bytes, ImageProcessingError};
 use nu_ansi_term::Color::{LightCyan, LightGreen, LightRed, LightYellow};
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
@@ -40,6 +40,22 @@ enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+fn parse_resize(s: &str) -> std::result::Result<(u32, u32), String> {
+    let (ws, hs) = s
+        .split_once('x')
+        .ok_or_else(|| format!("expected WxH format (e.g. 1920x1080), got '{s}'"))?;
+    let w = ws
+        .parse::<u32>()
+        .map_err(|_| format!("invalid width '{ws}'"))?;
+    let h = hs
+        .parse::<u32>()
+        .map_err(|_| format!("invalid height '{hs}'"))?;
+    if w == 0 && h == 0 {
+        return Err("at least one of width or height must be non-zero".to_string());
+    }
+    Ok((w, h))
+}
 
 static IMAGE_JPEG: &str = "jpeg";
 static IMAGE_PNG: &str = "png";
@@ -132,6 +148,31 @@ struct Args {
     /// Number of parallel threads (default: number of logical CPUs)
     #[arg(short, long)]
     threads: Option<usize>,
+
+    /// Preview changes without writing any files
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Skip files smaller than this size (in KB)
+    #[arg(long)]
+    min_size: Option<u64>,
+
+    /// Exclude files matching these glob patterns (repeatable)
+    #[arg(long)]
+    exclude: Option<Vec<String>>,
+
+    /// Suppress per-file output; print only the final summary
+    #[arg(short = 'q', long)]
+    quiet: bool,
+
+    /// Resize images to fit within WxH before encoding (e.g. 1920x1080). Images smaller than
+    /// the given dimensions are left untouched. Use 0 to leave a dimension unconstrained.
+    #[arg(long, value_name = "WxH", value_parser = parse_resize)]
+    resize: Option<(u32, u32)>,
+
+    /// Strip EXIF metadata (including GPS location) from output files without re-encoding
+    #[arg(long)]
+    strip_exif: bool,
 }
 
 fn relative(path: &str, base: &Path) -> String {
@@ -158,6 +199,9 @@ struct ImageQualities {
 async fn optimize_image(
     item: &ImageOptimizeParams,
     qualities: ImageQualities,
+    dry_run: bool,
+    resize: Option<(u32, u32)>,
+    strip_exif: bool,
 ) -> Result<(usize, usize, f64, bool, bool)> {
     let load_task = vec!["load".to_string(), format!("file://{}", &item.file)];
     let target = item.target.clone();
@@ -176,13 +220,23 @@ async fn optimize_image(
     ];
     let diff_task = vec!["diff".to_string()];
 
-    let img = run(vec![load_task, optim_task, diff_task])
-        .await
-        .context(OptimizeSnafu)?;
-
-    if let Some(parent) = Path::new(&target).parent() {
-        fs::create_dir_all(parent).await.context(CreateDirSnafu)?;
+    let mut tasks = vec![load_task];
+    if let Some((max_w, max_h)) = resize {
+        tasks.push(vec![
+            "resize".to_string(),
+            max_w.to_string(),
+            max_h.to_string(),
+            "fit".to_string(),
+        ]);
     }
+    tasks.push(optim_task);
+    tasks.push(diff_task);
+    if strip_exif {
+        tasks.push(vec!["strip".to_string()]);
+    }
+
+    let img = run(tasks).await.context(OptimizeSnafu)?;
+
     let existed = fs::try_exists(&target).await.unwrap_or(false);
     let buf = img.get_buffer().context(OptimizeSnafu)?;
     let size = buf.len();
@@ -193,12 +247,20 @@ async fn optimize_image(
         .unwrap_or("");
     let same_format = src_ext == output_type;
     if same_format && size >= img.original_size {
-        if item.file != item.target {
-            // Different output dir: copy the original so the output directory is complete.
+        if !dry_run && item.file != item.target {
+            if let Some(parent) = Path::new(&target).parent() {
+                fs::create_dir_all(parent).await.context(CreateDirSnafu)?;
+            }
             let original = fs::read(&item.file).await.context(WriteFileSnafu)?;
-            fs::write(&target, original).await.context(WriteFileSnafu)?;
+            let bytes_to_write = if strip_exif {
+                strip_exif_bytes(original, src_ext)
+            } else {
+                original
+            };
+            fs::write(&target, bytes_to_write)
+                .await
+                .context(WriteFileSnafu)?;
         }
-        // skipped = true so the summary ignores this file.
         return Ok((
             img.original_size,
             img.original_size,
@@ -208,7 +270,12 @@ async fn optimize_image(
         ));
     }
 
-    fs::write(target, buf).await.context(WriteFileSnafu)?;
+    if !dry_run {
+        if let Some(parent) = Path::new(&target).parent() {
+            fs::create_dir_all(parent).await.context(CreateDirSnafu)?;
+        }
+        fs::write(&target, buf).await.context(WriteFileSnafu)?;
+    }
     Ok((size, img.original_size, img.diff, existed, false))
 }
 
@@ -234,6 +301,27 @@ async fn main() {
         println!("imageoptimize: output path is empty");
         std::process::exit(1);
     }
+
+    let dry_run = args.dry_run;
+    let quiet = args.quiet;
+    let resize = args.resize;
+    let strip_exif = args.strip_exif;
+    let min_size_bytes = args.min_size.map(|kb| kb * 1024);
+    let exclude_patterns: Vec<Pattern> = args
+        .exclude
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| match Pattern::new(p) {
+            Ok(pat) => Some(pat),
+            Err(e) => {
+                println!(
+                    "{}",
+                    LightRed.paint(format!("Invalid exclude pattern '{p}': {e}"))
+                );
+                None
+            }
+        })
+        .collect();
 
     let base = PathBuf::from(&output);
 
@@ -277,13 +365,15 @@ async fn main() {
     let mut image_optimize_params = vec![];
     for ext in extensions {
         let pattern = format!("{source}/**/*.{ext}");
-        println!(
-            "{}",
-            format!(
-                "Searching pattern: {}",
-                LightCyan.paint(relative(&pattern, &base))
-            )
-        );
+        if !quiet {
+            println!(
+                "{}",
+                format!(
+                    "Searching pattern: {}",
+                    LightCyan.paint(relative(&pattern, &base))
+                )
+            );
+        }
         let entries = match glob(&pattern) {
             Ok(entries) => entries,
             Err(e) => {
@@ -300,6 +390,22 @@ async fn main() {
                     continue;
                 }
             };
+            // min-size filter
+            if let Some(min_bytes) = min_size_bytes {
+                let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if file_size < min_bytes {
+                    continue;
+                }
+            }
+
+            // exclude filter
+            if !exclude_patterns.is_empty() {
+                let path_str = path.to_string_lossy();
+                if exclude_patterns.iter().any(|p| p.matches(&path_str)) {
+                    continue;
+                }
+            }
+
             let ext = path.extension().unwrap_or_default();
             let ext = ext.to_str().unwrap_or_default();
             let image_type = match ext {
@@ -344,24 +450,6 @@ async fn main() {
     let kb: usize = 1024;
     let mb = kb * 1024;
 
-    // Other columns: fixed upper bounds.
-    let pct_col = 4.max("PCT".len()); // "100%" = 4
-    let diff_col = 6.max("DIFF".len()); // "(0.00)" = 6
-    let size_col = 5.max("SIZE".len()); // "999kb" ≤ 5
-    let dur_col = 6.max("TIME".len()); // "1000ms" = 6
-
-    println!(
-        "{:>pct_col$}  {:>diff_col$}  {:>size_col$}  {:>dur_col$}  FILE",
-        "PCT", "DIFF", "SIZE", "TIME",
-    );
-    println!(
-        "{}  {}  {}  {}  ----",
-        "-".repeat(pct_col),
-        "-".repeat(diff_col),
-        "-".repeat(size_col),
-        "-".repeat(dur_col),
-    );
-
     // Build group metadata before consuming image_optimize_params.
     // expected: how many targets each source file has
     // target_to_file: maps each target path back to its source file
@@ -371,6 +459,42 @@ async fn main() {
     for item in &image_optimize_params {
         *expected.entry(item.file.clone()).or_insert(0) += 1;
         target_to_file.insert(item.target.clone(), item.file.clone());
+    }
+
+    let source_count = expected.len();
+    if source_count == 0 {
+        println!("{}", LightYellow.paint("No images found."));
+        return;
+    }
+    println!(
+        "Found {} image{}",
+        LightCyan.paint(format!("{source_count}")),
+        if source_count == 1 { "" } else { "s" },
+    );
+
+    if dry_run {
+        println!(
+            "{}",
+            LightYellow.paint("[DRY RUN] No files will be written.")
+        );
+    }
+    // Other columns: fixed upper bounds.
+    let pct_col = 4.max("PCT".len()); // "100%" = 4
+    let diff_col = 6.max("DIFF".len()); // "(0.00)" = 6
+    let size_col = 5.max("SIZE".len()); // "999kb" ≤ 5
+    let dur_col = 6.max("TIME".len()); // "1000ms" = 6
+    if !quiet {
+        println!(
+            "{:>pct_col$}  {:>diff_col$}  {:>size_col$}  {:>dur_col$}  FILE",
+            "PCT", "DIFF", "SIZE", "TIME",
+        );
+        println!(
+            "{}  {}  {}  {}  ----",
+            "-".repeat(pct_col),
+            "-".repeat(diff_col),
+            "-".repeat(size_col),
+            "-".repeat(dur_col),
+        );
     }
 
     // Spawn all tasks in parallel — no change from original behaviour.
@@ -388,7 +512,7 @@ async fn main() {
         join_set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
             let start = Instant::now();
-            let result = optimize_image(&item, qualities).await;
+            let result = optimize_image(&item, qualities, dry_run, resize, strip_exif).await;
             (item.target, item.file, start, result)
         });
     }
@@ -409,6 +533,9 @@ async fn main() {
                      res: Result<(usize, usize, f64, bool, bool)>| {
         match res {
             Ok((size, original_size, diff, existed, skipped)) => {
+                if quiet {
+                    return;
+                }
                 let duration = start.elapsed().as_millis();
                 let duration_str = if duration < 1000 {
                     format!("{}ms", duration)
@@ -467,6 +594,7 @@ async fn main() {
     let mut summary_optimized: usize = 0;
     let mut summary_count: usize = 0;
     let mut summary_skipped: usize = 0;
+    let mut summary_errors: usize = 0;
 
     while let Some(task) = join_set.join_next().await {
         let (target, file, start, result) = task.expect("task panicked");
@@ -488,14 +616,17 @@ async fn main() {
                     .and_then(|e| e.to_str())
                     .unwrap_or("");
                 if src_ext == tgt_ext {
-                    if let Ok((size, original_size, _, _, skipped)) = &r {
-                        if *skipped {
-                            summary_skipped += 1;
-                        } else {
-                            summary_original += original_size;
-                            summary_optimized += size;
-                            summary_count += 1;
+                    match &r {
+                        Ok((size, original_size, _, _, skipped)) => {
+                            if *skipped {
+                                summary_skipped += 1;
+                            } else {
+                                summary_original += original_size;
+                                summary_optimized += size;
+                                summary_count += 1;
+                            }
                         }
+                        Err(_) => summary_errors += 1,
                     }
                 }
                 print_row(&t, &f, s, r);
@@ -503,7 +634,7 @@ async fn main() {
         }
     }
 
-    if summary_count > 0 || summary_skipped > 0 {
+    if summary_count > 0 || summary_skipped > 0 || summary_errors > 0 {
         let format_size = |size: usize| {
             if size >= mb {
                 format!("{:.1}mb", size as f64 / mb as f64)
@@ -520,15 +651,28 @@ async fn main() {
             0
         };
         let skipped_note = if summary_skipped > 0 {
-            format!(", {} unchanged", LightYellow.paint(format!("{summary_skipped}")))
+            format!(
+                ", {} unchanged",
+                LightYellow.paint(format!("{summary_skipped}"))
+            )
+        } else {
+            String::new()
+        };
+        let error_note = if summary_errors > 0 {
+            format!(", {} failed", LightRed.paint(format!("{summary_errors}")))
         } else {
             String::new()
         };
         println!();
+        let verb = if dry_run {
+            "Would optimize"
+        } else {
+            "Optimized"
+        };
         println!(
             "{}",
             LightCyan.paint(format!(
-                "Optimized {summary_count} file{}: {} → {}, saved {} ({saved_pct}%){skipped_note}",
+                "{verb} {summary_count} file{}: {} → {}, saved {} ({saved_pct}%){skipped_note}{error_note}",
                 if summary_count == 1 { "" } else { "s" },
                 format_size(summary_original),
                 format_size(summary_optimized),
