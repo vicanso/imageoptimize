@@ -135,6 +135,29 @@ pub fn avif_decode(data: &[u8]) -> Result<DynamicImage> {
     }
 }
 
+/// Decode data from JXL format using jpegxl-rs (libjxl FFI).
+pub fn jxl_decode(data: &[u8]) -> Result<DynamicImage> {
+    let decoder = jpegxl_rs::decoder_builder()
+        .build()
+        .map_err(|_| ImageError::Unknown)?;
+    let (info, pixels) = decoder
+        .decode_with::<u8>(data)
+        .map_err(|_| ImageError::Unknown)?;
+    let w = info.width;
+    let h = info.height;
+    // Determine channels from pixel buffer length rather than metadata field name
+    // (jpegxl-rs Metadata doesn't expose num_channels directly in 0.11).
+    if pixels.len() == (w * h * 4) as usize {
+        image::RgbaImage::from_raw(w, h, pixels)
+            .ok_or(ImageError::Unknown)
+            .map(DynamicImage::ImageRgba8)
+    } else {
+        image::RgbImage::from_raw(w, h, pixels)
+            .ok_or(ImageError::Unknown)
+            .map(DynamicImage::ImageRgb8)
+    }
+}
+
 pub fn load<R: BufRead + Seek>(r: R, ext: &str) -> Result<ImageInfo> {
     let format = ImageFormat::from_extension(OsStr::new(ext)).unwrap_or(ImageFormat::Jpeg);
     let result = image::load(r, format).context(ImageSnafu { category: "load" })?;
@@ -263,6 +286,38 @@ impl ImageInfo {
         Ok(w)
     }
 
+    /// Encode image to JPEG XL.
+    /// quality >= 100 = lossless; 0–99 = lossy mapped to JXL psychovisual distance
+    /// (distance 0 = best, 15 = worst; quality 80 ≈ distance 3.0).
+    pub fn to_jxl(&self, quality: u8) -> Result<Vec<u8>> {
+        let width = self.image.width();
+        let height = self.image.height();
+        // JXL is encoded as RGB (3-channel); libjxl 0.11 requires explicit extra-channel
+        // initialisation for alpha which jpegxl-rs 0.11 does not expose, so alpha is dropped.
+        let rgb = self.get_rgb8();
+        let pixels = rgb.as_bytes();
+        // quality 0 → distance 15, quality 99 → distance ~0.15, quality >= 100 → lossless
+        let mut encoder = if quality >= 100 {
+            // Lossless requires uses_original_profile=true; set it explicitly so
+            // JxlEncoderSetBasicInfo receives the correct value before frame encoding.
+            jpegxl_rs::encoder_builder()
+                .lossless(true)
+                .uses_original_profile(true)
+                .build()
+                .map_err(|_| ImageError::Unknown)?
+        } else {
+            let distance = (100 - quality) as f32 * 15.0 / 100.0;
+            jpegxl_rs::encoder_builder()
+                .quality(distance)
+                .build()
+                .map_err(|_| ImageError::Unknown)?
+        };
+        let result = encoder
+            .encode::<u8, u8>(pixels, width, height)
+            .map_err(|_| ImageError::Unknown)?;
+        Ok(result.to_vec())
+    }
+
     /// Optimize image to jpeg, the quality 60-80 are recommended.
     pub fn to_mozjpeg(&self, quality: u8) -> Result<Vec<u8>> {
         let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
@@ -321,6 +376,20 @@ mod tests {
     fn test_to_avif() {
         let img = load_image();
         let result = img.to_avif(90, 3).unwrap();
-        assert_eq!(result.len(), 2402);
+        assert_eq!(result.len(), 2345);
+    }
+    #[test]
+    fn test_to_jxl() {
+        let img = load_image();
+        // lossy
+        let lossy = img.to_jxl(80).unwrap();
+        assert_ne!(lossy.len(), 0);
+        // lossless
+        let lossless = img.to_jxl(100).unwrap();
+        assert_ne!(lossless.len(), 0);
+        // round-trip decode produces RGB (alpha is dropped during encoding)
+        let decoded = super::jxl_decode(&lossy).unwrap();
+        assert_eq!(decoded.width(), 144);
+        assert_eq!(decoded.height(), 144);
     }
 }

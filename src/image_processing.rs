@@ -1,4 +1,4 @@
-use super::images::{avif_decode, to_gif, ImageError, ImageInfo};
+use super::images::{avif_decode, jxl_decode, to_gif, ImageError, ImageInfo};
 use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
 use dssim_core::Dssim;
@@ -45,6 +45,7 @@ const IMAGE_TYPE_PNG: &str = "png";
 const IMAGE_TYPE_AVIF: &str = "avif";
 const IMAGE_TYPE_WEBP: &str = "webp";
 const IMAGE_TYPE_JPEG: &str = "jpeg";
+const IMAGE_TYPE_JXL: &str = "jxl";
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -504,12 +505,16 @@ impl ProcessImage {
     }
 
     fn new_impl(data: Vec<u8>, ext: &str, keep_original: bool) -> Result<Self> {
-        let format = image::guess_format(&data).or_else(|_| {
-            ImageFormat::from_extension(ext).ok_or(ImageProcessingError::ParamsInvalid {
-                message: "Image format is not supported".to_string(),
-            })
-        })?;
-        let di = load(Cursor::new(&data), format).context(ImageSnafu {})?;
+        let di = if ext == IMAGE_TYPE_JXL {
+            jxl_decode(&data).context(ImagesSnafu {})?
+        } else {
+            let format = image::guess_format(&data).or_else(|_| {
+                ImageFormat::from_extension(ext).ok_or(ImageProcessingError::ParamsInvalid {
+                    message: "Image format is not supported".to_string(),
+                })
+            })?;
+            load(Cursor::new(&data), format).context(ImageSnafu {})?
+        };
         let orientation = get_exif_orientation(&data);
         let di = apply_orientation(di, orientation);
         let original_size = data.len();
@@ -1365,7 +1370,7 @@ impl Process for OptimProcess {
         // Resolve the actual output format (unknown types fall back to JPEG).
         let actual_ext = if matches!(
             output_type.as_str(),
-            IMAGE_TYPE_GIF | IMAGE_TYPE_PNG | IMAGE_TYPE_AVIF | IMAGE_TYPE_WEBP
+            IMAGE_TYPE_GIF | IMAGE_TYPE_PNG | IMAGE_TYPE_AVIF | IMAGE_TYPE_WEBP | IMAGE_TYPE_JXL
         ) {
             output_type
         } else {
@@ -1389,6 +1394,7 @@ impl Process for OptimProcess {
                 IMAGE_TYPE_PNG => info.to_png(quality).context(ImagesSnafu {})?,
                 IMAGE_TYPE_AVIF => info.to_avif(quality, speed).context(ImagesSnafu {})?,
                 IMAGE_TYPE_WEBP => info.to_webp(quality).context(ImagesSnafu {})?,
+                IMAGE_TYPE_JXL => info.to_jxl(quality).context(ImagesSnafu {})?,
                 _ => info.to_mozjpeg(quality).context(ImagesSnafu {})?,
             };
             Ok((encoded, info.image))
@@ -1407,8 +1413,12 @@ impl Process for OptimProcess {
             // lossy output. Skip when original is None (no diff task in pipeline) since
             // the round-trip — especially for AVIF — is expensive and serves no purpose.
             if img.support_dssim() && img.original.is_some() {
-                let result = if img.ext == IMAGE_TYPE_AVIF {
-                    avif_decode(&img.buffer).context(ImagesSnafu {})
+                let result = if matches!(img.ext.as_str(), IMAGE_TYPE_AVIF | IMAGE_TYPE_JXL) {
+                    if img.ext == IMAGE_TYPE_AVIF {
+                        avif_decode(&img.buffer).context(ImagesSnafu {})
+                    } else {
+                        jxl_decode(&img.buffer).context(ImagesSnafu {})
+                    }
                 } else {
                     let c = Cursor::new(&img.buffer);
                     let format = ImageFormat::from_extension(&img.ext).unwrap_or(ImageFormat::Jpeg);
@@ -2086,5 +2096,20 @@ mod tests {
         assert_eq!(result.buffer.len(), 392);
         assert_ne!(result.get_diff(), 0.0_f64);
         assert_ne!(result.get_diff(), -1.0_f64);
+
+        // lossy jxl
+        let result =
+            tokio_test::block_on(OptimProcess::new("jxl", 80, 0).process(new_process_image()))
+                .unwrap();
+        assert_eq!(result.ext, "jxl");
+        assert_ne!(result.buffer.len(), 0);
+        assert!(result.get_diff() >= 0.0);
+
+        // lossless jxl (alpha is dropped — lossless applies to RGB channels only)
+        let result =
+            tokio_test::block_on(OptimProcess::new("jxl", 100, 0).process(new_process_image()))
+                .unwrap();
+        assert_eq!(result.ext, "jxl");
+        assert_ne!(result.buffer.len(), 0);
     }
 }

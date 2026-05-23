@@ -215,7 +215,7 @@ let bytes = result.get_buffer()?;
 | `strip` | `new_strip_task()` | — | Strip EXIF metadata from the encoded buffer without re-encoding (JPEG, PNG, WebP) |
 | `padding` | `new_padding_task(w, h, color)` | width, height, hex color (`#rrggbb` / `#rrggbbaa`, default transparent) | Extend canvas, center image |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url, position, margin-left, margin-top | Overlay watermark |
-| `optim` | `new_optim_task(fmt, quality, speed)` | format (`jpeg`/`png`/`avif`/`webp`/`gif`), quality 0–100, speed | Encode & compress |
+| `optim` | `new_optim_task(fmt, quality, speed)` | format (`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`), quality 0–100, speed | Encode & compress |
 | `diff` | `new_diff_task()` | — | Compute DSSIM × 1000 score vs original; stored in `ProcessImage::diff` |
 
 **`optim` speed parameter:**
@@ -224,6 +224,7 @@ let bytes = result.get_buffer()?;
 |--------|--------|
 | `avif` | Encoder speed 0–10; lower = slower but smaller/better quality (default `0`) |
 | `gif`  | Frame delay in centiseconds between frames when re-encoding animated GIFs |
+| `jxl`  | Ignored (encoder effort is fixed) |
 | `jpeg` / `png` / `webp` | Ignored |
 
 Watermark positions: `leftTop`, `top`, `rightTop`, `left`, `center`, `right`, `leftBottom`, `bottom`, `rightBottom` (default).

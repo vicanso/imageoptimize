@@ -214,7 +214,7 @@ let bytes = result.get_buffer()?;
 | `strip` | `new_strip_task()` | — | 从编码后的缓冲区移除 EXIF 元数据，无需重新编码（支持 JPEG、PNG、WebP） |
 | `padding` | `new_padding_task(w, h, color)` | 宽度、高度、十六进制颜色（`#rrggbb` / `#rrggbbaa`，默认透明） | 扩展画布并居中图片 |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url、位置、左边距、上边距 | 叠加水印 |
-| `optim` | `new_optim_task(fmt, quality, speed)` | 格式（`jpeg`/`png`/`avif`/`webp`/`gif`）、质量 0–100、速度 | 编码并压缩 |
+| `optim` | `new_optim_task(fmt, quality, speed)` | 格式（`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`）、质量 0–100、速度 | 编码并压缩 |
 | `diff` | `new_diff_task()` | — | 计算 DSSIM × 1000 评分并存入 `ProcessImage::diff` |
 
 **`optim` speed 参数说明：**
@@ -223,6 +223,7 @@ let bytes = result.get_buffer()?;
 |------|------|
 | `avif` | 编码速度 0–10，值越小速度越慢但压缩率/质量越好（默认 `0`） |
 | `gif`  | 重新编码动态 GIF 时帧之间的延迟，单位为百分之一秒 |
+| `jxl`  | 忽略此参数（编码 effort 固定） |
 | `jpeg` / `png` / `webp` | 忽略此参数 |
 
 水印位置：`leftTop`、`top`、`rightTop`、`left`、`center`、`right`、`leftBottom`、`bottom`、`rightBottom`（默认）。
