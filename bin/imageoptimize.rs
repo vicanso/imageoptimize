@@ -173,6 +173,14 @@ struct Args {
     /// Strip EXIF metadata (including GPS location) from output files without re-encoding
     #[arg(long)]
     strip_exif: bool,
+
+    /// AVIF encoder speed (0 = slowest/best quality, 10 = fastest/lower quality)
+    #[arg(long, default_value = "4", value_name = "N")]
+    avif_speed: u8,
+
+    /// Skip images whose every output file is already newer than the source (only with --output)
+    #[arg(long)]
+    incremental: bool,
 }
 
 fn relative(path: &str, base: &Path) -> String {
@@ -191,6 +199,7 @@ struct ImageOptimizeParams {
 #[derive(Debug, Clone)]
 struct ImageQualities {
     avif: u8,
+    avif_speed: u8,
     webp: u8,
     png: u8,
     jpeg: u8,
@@ -212,11 +221,16 @@ async fn optimize_image(
         "png" => qualities.png,
         _ => qualities.jpeg,
     };
+    let speed = if output_type == "avif" {
+        qualities.avif_speed
+    } else {
+        0
+    };
     let optim_task = vec![
         "optim".to_string(),
         output_type.to_string(),
         quality.to_string(),
-        "0".to_string(),
+        speed.to_string(),
     ];
     let diff_task = vec!["diff".to_string()];
 
@@ -306,6 +320,7 @@ async fn main() {
     let quiet = args.quiet;
     let resize = args.resize;
     let strip_exif = args.strip_exif;
+    let incremental = args.incremental;
     let min_size_bytes = args.min_size.map(|kb| kb * 1024);
     let exclude_patterns: Vec<Pattern> = args
         .exclude
@@ -442,6 +457,7 @@ async fn main() {
 
     let qualities = ImageQualities {
         avif: args.avif_quality,
+        avif_speed: args.avif_speed,
         webp: args.webp_quality,
         png: args.png_quality,
         jpeg: args.jpeg_quality,
@@ -449,6 +465,40 @@ async fn main() {
 
     let kb: usize = 1024;
     let mb = kb * 1024;
+
+    // Total unique source images found (before incremental filter).
+    let total_source_count = image_optimize_params
+        .iter()
+        .map(|i| i.file.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+
+    if total_source_count == 0 {
+        println!("{}", LightYellow.paint("No images found."));
+        return;
+    }
+
+    // --incremental: drop targets whose output is already newer than the source.
+    let mut incremental_skipped = 0usize;
+    if incremental && source != output {
+        image_optimize_params.retain(|item| {
+            let src_mtime = std::fs::metadata(&item.file)
+                .and_then(|m| m.modified())
+                .ok();
+            let tgt_mtime = std::fs::metadata(&item.target)
+                .and_then(|m| m.modified())
+                .ok();
+            match (src_mtime, tgt_mtime) {
+                (Some(s), Some(t)) => t <= s,
+                _ => true,
+            }
+        });
+        let remaining: std::collections::HashSet<&str> = image_optimize_params
+            .iter()
+            .map(|i| i.file.as_str())
+            .collect();
+        incremental_skipped = total_source_count - remaining.len();
+    }
 
     // Build group metadata before consuming image_optimize_params.
     // expected: how many targets each source file has
@@ -461,16 +511,25 @@ async fn main() {
         target_to_file.insert(item.target.clone(), item.file.clone());
     }
 
+    let incremental_note = if incremental_skipped > 0 {
+        format!(
+            ", {} up-to-date",
+            LightYellow.paint(format!("{incremental_skipped}"))
+        )
+    } else {
+        String::new()
+    };
+    println!(
+        "Found {} image{}{}",
+        LightCyan.paint(format!("{total_source_count}")),
+        if total_source_count == 1 { "" } else { "s" },
+        incremental_note,
+    );
+
     let source_count = expected.len();
     if source_count == 0 {
-        println!("{}", LightYellow.paint("No images found."));
         return;
     }
-    println!(
-        "Found {} image{}",
-        LightCyan.paint(format!("{source_count}")),
-        if source_count == 1 { "" } else { "s" },
-    );
 
     if dry_run {
         println!(

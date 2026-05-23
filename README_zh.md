@@ -68,6 +68,8 @@ imageoptimize [OPTIONS] <SOURCE>
 | `-q, --quiet` | false | 仅输出最终汇总，不打印每个文件的处理结果 |
 | `--resize <WxH>` | — | 编码前将超出尺寸的图片缩放至指定范围内，小图不受影响（如 `1920x1080`、`1920x0`） |
 | `--strip-exif` | false | 从输出文件中移除 EXIF 元数据（含 GPS 定位），无需重新编码 |
+| `--avif-speed <N>` | 4 | AVIF 编码速度（0 = 最慢/最佳质量，10 = 最快/较低质量） |
+| `--incremental` | false | 跳过所有输出文件均比源文件新的图片（仅适用于 `--output` 模式） |
 
 ### 示例
 
@@ -203,6 +205,12 @@ let bytes = result.get_buffer()?;
 | `contrast` | `new_contrast_task(val)` | 浮点数，正值增强 / 负值减弱 | 调整对比度 |
 | `sharpen` | `new_sharpen_task(sigma, threshold)` | sigma（如 `1.0`）、threshold（如 `0`） | USM 锐化 |
 | `blur` | `new_blur_task(sigma)` | sigma（如 `2.0`） | 高斯模糊 |
+| `hue` | `new_hue_task(shift)` | 整数角度，自动环绕（如 `90`、`-45`） | 旋转每个像素的色调 |
+| `saturate` | `new_saturate_task(factor)` | 浮点数（0.0 = 灰度，1.0 = 不变，>1.0 = 增强） | 缩放每个像素的饱和度 |
+| `thumbnail` | `new_thumbnail_task(w, h)` | 宽度、高度 | 缩放至覆盖 `w×h`（填充模式）后居中裁剪；与 `fit` 不同，不会留黑边 |
+| `invert` | `new_invert_task()` | — | 反转 RGB 通道；alpha 通道保持不变 |
+| `opacity` | `new_opacity_task(factor)` | 浮点数（0.0 = 完全透明，1.0 = 不变） | 将每个像素的 alpha 值乘以 factor |
+| `gamma` | `new_gamma_task(gamma)` | 浮点数（1.0 = 不变，<1.0 = 增亮，>1.0 = 变暗） | Gamma 校正：`output = (input/255)^gamma × 255`；alpha 不受影响 |
 | `strip` | `new_strip_task()` | — | 从编码后的缓冲区移除 EXIF 元数据，无需重新编码（支持 JPEG、PNG、WebP） |
 | `padding` | `new_padding_task(w, h, color)` | 宽度、高度、十六进制颜色（`#rrggbb` / `#rrggbbaa`，默认透明） | 扩展画布并居中图片 |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url、位置、左边距、上边距 | 叠加水印 |

@@ -32,6 +32,12 @@ pub const PROCESS_SHARPEN: &str = "sharpen";
 pub const PROCESS_PADDING: &str = "padding";
 pub const PROCESS_BLUR: &str = "blur";
 pub const PROCESS_STRIP: &str = "strip";
+pub const PROCESS_HUE: &str = "hue";
+pub const PROCESS_SATURATE: &str = "saturate";
+pub const PROCESS_THUMBNAIL: &str = "thumbnail";
+pub const PROCESS_INVERT: &str = "invert";
+pub const PROCESS_OPACITY: &str = "opacity";
+pub const PROCESS_GAMMA: &str = "gamma";
 
 const IMAGE_TYPE_GIF: &str = "gif";
 const IMAGE_TYPE_PNG: &str = "png";
@@ -223,6 +229,41 @@ pub fn new_padding_task(width: u32, height: u32, color: &str) -> Vec<String> {
     ]
 }
 
+/// Rotate the hue of every pixel by `shift` degrees (-180..=180 or any integer; wraps around).
+pub fn new_hue_task(shift: i32) -> Vec<String> {
+    vec![PROCESS_HUE.to_string(), shift.to_string()]
+}
+
+/// Multiply the saturation of every pixel by `factor` (0.0 = grayscale, 1.0 = unchanged, >1.0 = boost).
+pub fn new_saturate_task(factor: f32) -> Vec<String> {
+    vec![PROCESS_SATURATE.to_string(), factor.to_string()]
+}
+
+/// Scale the image to cover `width × height` (fill mode), then center-crop to exactly that size.
+pub fn new_thumbnail_task(width: u32, height: u32) -> Vec<String> {
+    vec![
+        PROCESS_THUMBNAIL.to_string(),
+        width.to_string(),
+        height.to_string(),
+    ]
+}
+
+/// Invert RGB channels of every pixel; alpha is preserved.
+pub fn new_invert_task() -> Vec<String> {
+    vec![PROCESS_INVERT.to_string()]
+}
+
+/// Multiply every pixel's alpha by `factor` (0.0 = fully transparent, 1.0 = unchanged).
+pub fn new_opacity_task(factor: f32) -> Vec<String> {
+    vec![PROCESS_OPACITY.to_string(), factor.to_string()]
+}
+
+/// Apply gamma correction: `output = (input/255)^gamma * 255`; alpha is unaffected.
+/// gamma = 1.0 is a no-op; gamma < 1.0 brightens midtones; gamma > 1.0 darkens.
+pub fn new_gamma_task(gamma: f32) -> Vec<String> {
+    vec![PROCESS_GAMMA.to_string(), gamma.to_string()]
+}
+
 pub async fn run_with_image(
     mut image: ProcessImage,
     tasks: Vec<Vec<String>>,
@@ -230,6 +271,11 @@ pub async fn run_with_image(
     let he = ParamsInvalidSnafu {
         message: "params is invalid",
     };
+    let needs_diff = tasks.iter().any(|t| {
+        t.first()
+            .map(|s| s.as_str() == PROCESS_DIFF)
+            .unwrap_or(false)
+    });
     for params in tasks {
         if params.is_empty() {
             continue;
@@ -243,7 +289,9 @@ pub async fn run_with_image(
                 if sub_params.len() >= 2 {
                     ext = &sub_params[1];
                 }
-                image = LoaderProcess::new(data, ext).process(image).await?;
+                let mut loader = LoaderProcess::new(data, ext);
+                loader.keep_original = needs_diff;
+                image = loader.process(image).await?;
             }
             PROCESS_RESIZE => {
                 ensure!(sub_params.len() >= 2, he);
@@ -302,6 +350,43 @@ pub async fn run_with_image(
                     .and_then(|s| s.parse::<f32>().ok())
                     .unwrap_or(1.0);
                 image = BlurProcess::new(sigma).process(image).await?;
+            }
+            PROCESS_HUE => {
+                let shift = sub_params
+                    .first()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(0);
+                image = HueProcess::new(shift).process(image).await?;
+            }
+            PROCESS_SATURATE => {
+                let factor = sub_params
+                    .first()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(1.0);
+                image = SaturateProcess::new(factor).process(image).await?;
+            }
+            PROCESS_THUMBNAIL => {
+                ensure!(sub_params.len() >= 2, he);
+                let width = sub_params[0].parse::<u32>().context(ParseIntSnafu {})?;
+                let height = sub_params[1].parse::<u32>().context(ParseIntSnafu {})?;
+                image = ThumbnailProcess::new(width, height).process(image).await?;
+            }
+            PROCESS_INVERT => {
+                image = InvertProcess::new().process(image).await?;
+            }
+            PROCESS_OPACITY => {
+                let factor = sub_params
+                    .first()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(1.0);
+                image = OpacityProcess::new(factor).process(image).await?;
+            }
+            PROCESS_GAMMA => {
+                let gamma = sub_params
+                    .first()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(1.0);
+                image = GammaProcess::new(gamma).process(image).await?;
             }
             PROCESS_STRIP => {
                 image = StripProcess::new().process(image).await?;
@@ -362,6 +447,7 @@ pub async fn run_with_image(
             }
             PROCESS_DIFF => {
                 image.diff = image.get_diff();
+                image.original = None;
             }
             _ => {}
         }
@@ -413,6 +499,10 @@ pub struct ProcessImage {
 
 impl ProcessImage {
     pub fn new(data: Vec<u8>, ext: &str) -> Result<Self> {
+        Self::new_impl(data, ext, true)
+    }
+
+    fn new_impl(data: Vec<u8>, ext: &str, keep_original: bool) -> Result<Self> {
         let format = image::guess_format(&data).or_else(|_| {
             ImageFormat::from_extension(ext).ok_or(ImageProcessingError::ParamsInvalid {
                 message: "Image format is not supported".to_string(),
@@ -427,7 +517,11 @@ impl ProcessImage {
         let buffer = if orientation == 1 { data } else { vec![] };
         Ok(ProcessImage {
             original_size,
-            original: Some(di.to_rgba8()),
+            original: if keep_original {
+                Some(di.to_rgba8())
+            } else {
+                None
+            },
             di,
             buffer,
             diff: -1.0,
@@ -496,6 +590,7 @@ pub trait Process {
 pub struct LoaderProcess {
     data: String,
     ext: String,
+    pub keep_original: bool,
 }
 
 impl LoaderProcess {
@@ -503,6 +598,7 @@ impl LoaderProcess {
         LoaderProcess {
             data: data.to_string(),
             ext: ext.to_string(),
+            keep_original: true,
         }
     }
     async fn fetch_data(&self) -> Result<ProcessImage> {
@@ -534,7 +630,7 @@ impl LoaderProcess {
                 .decode(data.as_bytes())
                 .context(Base64DecodeSnafu {})?
         };
-        ProcessImage::new(original_data, &ext)
+        ProcessImage::new_impl(original_data, &ext, self.keep_original)
     }
 }
 
@@ -635,7 +731,8 @@ impl GrayProcess {
 impl Process for GrayProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
-        img.di = DynamicImage::ImageLuma8(grayscale(&img.di));
+        img.di =
+            DynamicImage::ImageRgba8(DynamicImage::ImageLuma8(grayscale(&img.di)).into_rgba8());
         img.buffer.clear();
         Ok(img)
     }
@@ -786,6 +883,244 @@ impl Process for StripProcess {
         }
         let buf = std::mem::take(&mut img.buffer);
         img.buffer = strip_exif_bytes(buf, &img.ext);
+        Ok(img)
+    }
+}
+
+fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let r = r as f32 / 255.0;
+    let g = g as f32 / 255.0;
+    let b = b as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let h = if delta < f32::EPSILON {
+        0.0
+    } else if (max - r).abs() < f32::EPSILON {
+        60.0 * (((g - b) / delta) % 6.0)
+    } else if (max - g).abs() < f32::EPSILON {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    let h = if h < 0.0 { h + 360.0 } else { h };
+    let s = if max < f32::EPSILON { 0.0 } else { delta / max };
+    (h, s, max)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let h = ((h % 360.0) + 360.0) % 360.0;
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    (
+        ((r + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+pub struct HueProcess {
+    shift: i32,
+}
+
+impl HueProcess {
+    pub fn new(shift: i32) -> Self {
+        HueProcess { shift }
+    }
+}
+
+impl Process for HueProcess {
+    async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
+        let mut img = pi;
+        let di = std::mem::take(&mut img.di);
+        let mut rgba = di.into_rgba8();
+        let shift = self.shift as f32;
+        for pixel in rgba.pixels_mut() {
+            let [r, g, b, a] = pixel.0;
+            let (h, s, v) = rgb_to_hsv(r, g, b);
+            let (nr, ng, nb) = hsv_to_rgb(h + shift, s, v);
+            *pixel = image::Rgba([nr, ng, nb, a]);
+        }
+        img.di = DynamicImage::ImageRgba8(rgba);
+        img.buffer.clear();
+        Ok(img)
+    }
+}
+
+pub struct SaturateProcess {
+    factor: f32,
+}
+
+impl SaturateProcess {
+    pub fn new(factor: f32) -> Self {
+        SaturateProcess { factor }
+    }
+}
+
+impl Process for SaturateProcess {
+    async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
+        let mut img = pi;
+        let di = std::mem::take(&mut img.di);
+        let mut rgba = di.into_rgba8();
+        let factor = self.factor.max(0.0);
+        for pixel in rgba.pixels_mut() {
+            let [r, g, b, a] = pixel.0;
+            let rf = r as f32;
+            let gf = g as f32;
+            let bf = b as f32;
+            let luma = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
+            pixel.0 = [
+                (luma + factor * (rf - luma)).clamp(0.0, 255.0) as u8,
+                (luma + factor * (gf - luma)).clamp(0.0, 255.0) as u8,
+                (luma + factor * (bf - luma)).clamp(0.0, 255.0) as u8,
+                a,
+            ];
+        }
+        img.di = DynamicImage::ImageRgba8(rgba);
+        img.buffer.clear();
+        Ok(img)
+    }
+}
+
+pub struct ThumbnailProcess {
+    width: u32,
+    height: u32,
+}
+
+impl ThumbnailProcess {
+    pub fn new(width: u32, height: u32) -> Self {
+        ThumbnailProcess { width, height }
+    }
+}
+
+impl Process for ThumbnailProcess {
+    async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
+        let mut img = pi;
+        if self.width == 0 || self.height == 0 {
+            return Ok(img);
+        }
+        let src_w = img.di.width();
+        let src_h = img.di.height();
+        let dst_w = self.width;
+        let dst_h = self.height;
+
+        // Crop source to target aspect ratio first, then resize to exact target size.
+        // Faster than resize-to-cover then crop: Lanczos3 works on dst_w×dst_h output
+        // pixels instead of the slightly larger scaled intermediate.
+        let scale = (dst_w as f64 / src_w as f64).max(dst_h as f64 / src_h as f64);
+        let crop_w = (dst_w as f64 / scale).round() as u32;
+        let crop_h = (dst_h as f64 / scale).round() as u32;
+        let crop_x = src_w.saturating_sub(crop_w) / 2;
+        let crop_y = src_h.saturating_sub(crop_h) / 2;
+
+        let source = if crop_w == src_w && crop_h == src_h {
+            std::mem::take(&mut img.di)
+        } else {
+            DynamicImage::ImageRgba8(crop(&mut img.di, crop_x, crop_y, crop_w, crop_h).to_image())
+        };
+        img.di = DynamicImage::ImageRgba8(resize(&source, dst_w, dst_h, FilterType::Lanczos3));
+        img.buffer.clear();
+        Ok(img)
+    }
+}
+
+#[derive(Default)]
+pub struct InvertProcess;
+
+impl InvertProcess {
+    pub fn new() -> Self {
+        InvertProcess
+    }
+}
+
+impl Process for InvertProcess {
+    async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
+        let mut img = pi;
+        let di = std::mem::take(&mut img.di);
+        let mut rgba = di.into_rgba8();
+        for pixel in rgba.pixels_mut() {
+            pixel.0[0] = 255 - pixel.0[0];
+            pixel.0[1] = 255 - pixel.0[1];
+            pixel.0[2] = 255 - pixel.0[2];
+        }
+        img.di = DynamicImage::ImageRgba8(rgba);
+        img.buffer.clear();
+        Ok(img)
+    }
+}
+
+pub struct OpacityProcess {
+    factor: f32,
+}
+
+impl OpacityProcess {
+    pub fn new(factor: f32) -> Self {
+        OpacityProcess {
+            factor: factor.clamp(0.0, 1.0),
+        }
+    }
+}
+
+impl Process for OpacityProcess {
+    async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
+        let mut img = pi;
+        let di = std::mem::take(&mut img.di);
+        let mut rgba = di.into_rgba8();
+        let factor = self.factor;
+        for pixel in rgba.pixels_mut() {
+            pixel.0[3] = ((pixel.0[3] as f32) * factor).round() as u8;
+        }
+        img.di = DynamicImage::ImageRgba8(rgba);
+        img.buffer.clear();
+        Ok(img)
+    }
+}
+
+pub struct GammaProcess {
+    gamma: f32,
+}
+
+impl GammaProcess {
+    pub fn new(gamma: f32) -> Self {
+        GammaProcess {
+            gamma: gamma.max(f32::EPSILON),
+        }
+    }
+}
+
+impl Process for GammaProcess {
+    async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
+        let mut img = pi;
+        let gamma = self.gamma;
+        let mut lut = [0u8; 256];
+        for (i, v) in lut.iter_mut().enumerate() {
+            *v = ((i as f32 / 255.0).powf(gamma) * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+        let di = std::mem::take(&mut img.di);
+        let mut rgba = di.into_rgba8();
+        for pixel in rgba.pixels_mut() {
+            pixel.0[0] = lut[pixel.0[0] as usize];
+            pixel.0[1] = lut[pixel.0[1] as usize];
+            pixel.0[2] = lut[pixel.0[2] as usize];
+        }
+        img.di = DynamicImage::ImageRgba8(rgba);
+        img.buffer.clear();
         Ok(img)
     }
 }
@@ -1013,21 +1348,45 @@ impl Process for OptimProcess {
         if output_type.is_empty() {
             output_type.clone_from(&original_type);
         }
-        img.ext.clone_from(&output_type);
 
-        let data = match output_type.as_str() {
-            IMAGE_TYPE_GIF => {
-                let c = Cursor::new(&img.buffer);
-                to_gif(c, speed).context(ImagesSnafu {})?
-            }
-            IMAGE_TYPE_PNG => info.to_png(quality).context(ImagesSnafu {})?,
-            IMAGE_TYPE_AVIF => info.to_avif(quality, speed).context(ImagesSnafu {})?,
-            IMAGE_TYPE_WEBP => info.to_webp(quality).context(ImagesSnafu {})?,
-            _ => {
-                img.ext = IMAGE_TYPE_JPEG.to_string();
-                info.to_mozjpeg(quality).context(ImagesSnafu {})?
-            }
+        // Resolve the actual output format (unknown types fall back to JPEG).
+        let actual_ext = if matches!(
+            output_type.as_str(),
+            IMAGE_TYPE_GIF | IMAGE_TYPE_PNG | IMAGE_TYPE_AVIF | IMAGE_TYPE_WEBP
+        ) {
+            output_type
+        } else {
+            IMAGE_TYPE_JPEG.to_string()
         };
+        img.ext.clone_from(&actual_ext);
+
+        // GIF encoding reads the original buffer; clone it so img.buffer is preserved
+        // for the fallback case where the optimised GIF is not smaller than the source.
+        let gif_buffer = if actual_ext == IMAGE_TYPE_GIF {
+            img.buffer.clone()
+        } else {
+            Vec::new()
+        };
+
+        // Closure returns (encoded_bytes, info.image) so the pixel data is available
+        // for restoring img.di after encoding.
+        let do_encode = move || -> Result<(Vec<u8>, RgbaImage)> {
+            let encoded = match actual_ext.as_str() {
+                IMAGE_TYPE_GIF => to_gif(Cursor::new(gif_buffer), speed).context(ImagesSnafu {})?,
+                IMAGE_TYPE_PNG => info.to_png(quality).context(ImagesSnafu {})?,
+                IMAGE_TYPE_AVIF => info.to_avif(quality, speed).context(ImagesSnafu {})?,
+                IMAGE_TYPE_WEBP => info.to_webp(quality).context(ImagesSnafu {})?,
+                _ => info.to_mozjpeg(quality).context(ImagesSnafu {})?,
+            };
+            Ok((encoded, info.image))
+        };
+
+        // In the CLI (multi-thread Tokio runtime) run encoding in a blocking context so
+        // async I/O for other concurrent tasks can proceed during CPU-heavy encoding.
+        #[cfg(feature = "bin")]
+        let (data, info_image) = tokio::task::block_in_place(do_encode)?;
+        #[cfg(not(feature = "bin"))]
+        let (data, info_image) = do_encode()?;
 
         if img.ext != original_type || data.len() < original_size || original_size == 0 {
             img.buffer = data;
@@ -1039,12 +1398,12 @@ impl Process for OptimProcess {
                     let format = ImageFormat::from_extension(&img.ext).unwrap_or(ImageFormat::Jpeg);
                     load(c, format).context(ImageSnafu {})
                 };
-                img.di = result.unwrap_or(DynamicImage::ImageRgba8(info.image));
+                img.di = result.unwrap_or(DynamicImage::ImageRgba8(info_image));
             } else {
-                img.di = DynamicImage::ImageRgba8(info.image);
+                img.di = DynamicImage::ImageRgba8(info_image);
             }
         } else {
-            img.di = DynamicImage::ImageRgba8(info.image);
+            img.di = DynamicImage::ImageRgba8(info_image);
         }
 
         Ok(img)
@@ -1054,9 +1413,10 @@ impl Process for OptimProcess {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlurProcess, BrightenProcess, ContrastProcess, CropProcess, FlipProcess, GrayProcess,
-        LoaderProcess, OptimProcess, PaddingProcess, ResizeProcess, RotateProcess, SharpenProcess,
-        StripProcess, WatermarkProcess,
+        BlurProcess, BrightenProcess, ContrastProcess, CropProcess, FlipProcess, GammaProcess,
+        GrayProcess, HueProcess, InvertProcess, LoaderProcess, OpacityProcess, OptimProcess,
+        PaddingProcess, ResizeProcess, RotateProcess, SaturateProcess, SharpenProcess,
+        StripProcess, ThumbnailProcess, WatermarkProcess,
     };
     use crate::image_processing::{Process, ProcessImage};
     use base64::{engine::general_purpose, Engine as _};
@@ -1432,6 +1792,239 @@ mod tests {
         let result = tokio_test::block_on(CropProcess::new(40, 40, 48, 48).process(p)).unwrap();
         assert_eq!(result.di.width(), 48);
         assert_eq!(result.di.height(), 48);
+    }
+
+    fn new_red_pixel() -> ProcessImage {
+        use image::{DynamicImage, Rgba, RgbaImage};
+        let mut img = RgbaImage::new(1, 1);
+        img.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        let di = DynamicImage::ImageRgba8(img);
+        ProcessImage {
+            original: Some(di.to_rgba8()),
+            di,
+            diff: -1.0,
+            original_size: 0,
+            buffer: vec![],
+            ext: "png".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_hue_process() {
+        // Dimensions are always preserved
+        let result = tokio_test::block_on(HueProcess::new(0).process(new_process_image())).unwrap();
+        assert_eq!(result.di.width(), 144);
+        assert_eq!(result.di.height(), 144);
+
+        // Pure red (H=0°) + 120° → pure green (H=120°)
+        let result = tokio_test::block_on(HueProcess::new(120).process(new_red_pixel())).unwrap();
+        let [r, g, b, a] = result.di.as_rgba8().unwrap().get_pixel(0, 0).0;
+        assert!(r < 5, "R should be ~0, got {r}");
+        assert!(g > 250, "G should be ~255, got {g}");
+        assert!(b < 5, "B should be ~0, got {b}");
+        assert_eq!(a, 255);
+
+        // Pure red + 240° → pure blue (H=240°)
+        let result = tokio_test::block_on(HueProcess::new(240).process(new_red_pixel())).unwrap();
+        let [r, g, b, _] = result.di.as_rgba8().unwrap().get_pixel(0, 0).0;
+        assert!(r < 5, "R should be ~0, got {r}");
+        assert!(g < 5, "G should be ~0, got {g}");
+        assert!(b > 250, "B should be ~255, got {b}");
+
+        // shift=0 is a no-op
+        let result = tokio_test::block_on(HueProcess::new(0).process(new_red_pixel())).unwrap();
+        assert_eq!(
+            result.di.as_rgba8().unwrap().get_pixel(0, 0).0,
+            [255, 0, 0, 255]
+        );
+
+        // Alpha is preserved even on transparent pixels
+        use image::{DynamicImage, Rgba, RgbaImage};
+        let mut img = RgbaImage::new(1, 1);
+        img.put_pixel(0, 0, Rgba([255, 0, 0, 128]));
+        let di = DynamicImage::ImageRgba8(img);
+        let pi = ProcessImage {
+            original: Some(di.to_rgba8()),
+            di,
+            diff: -1.0,
+            original_size: 0,
+            buffer: vec![],
+            ext: "png".to_string(),
+        };
+        let result = tokio_test::block_on(HueProcess::new(90).process(pi)).unwrap();
+        assert_eq!(result.di.as_rgba8().unwrap().get_pixel(0, 0).0[3], 128);
+    }
+
+    #[test]
+    fn test_saturate_process() {
+        // Dimensions are always preserved
+        let result =
+            tokio_test::block_on(SaturateProcess::new(1.0).process(new_process_image())).unwrap();
+        assert_eq!(result.di.width(), 144);
+        assert_eq!(result.di.height(), 144);
+
+        // factor=0.0: red → gray at its Rec.709 luma value (0.2126*255 ≈ 54, truncated)
+        let result =
+            tokio_test::block_on(SaturateProcess::new(0.0).process(new_red_pixel())).unwrap();
+        let [r, g, b, a] = result.di.as_rgba8().unwrap().get_pixel(0, 0).0;
+        assert_eq!([r, g, b], [54, 54, 54]);
+        assert_eq!(a, 255);
+
+        // factor=1.0: red stays red
+        let result =
+            tokio_test::block_on(SaturateProcess::new(1.0).process(new_red_pixel())).unwrap();
+        let [r, g, b, _] = result.di.as_rgba8().unwrap().get_pixel(0, 0).0;
+        assert!(r > 250 && g < 5 && b < 5);
+
+        // factor > 1.0 on already-saturated color: clamps to 1.0, red stays red
+        let result =
+            tokio_test::block_on(SaturateProcess::new(2.0).process(new_red_pixel())).unwrap();
+        let [r, g, b, _] = result.di.as_rgba8().unwrap().get_pixel(0, 0).0;
+        assert!(r > 250 && g < 5 && b < 5);
+    }
+
+    #[test]
+    fn test_thumbnail_process() {
+        // Same aspect ratio: 144×144 → 72×72
+        let result =
+            tokio_test::block_on(ThumbnailProcess::new(72, 72).process(new_process_image()))
+                .unwrap();
+        assert_eq!(result.di.width(), 72);
+        assert_eq!(result.di.height(), 72);
+
+        // Different aspect ratio: 144×144 → 72×36
+        let result =
+            tokio_test::block_on(ThumbnailProcess::new(72, 36).process(new_process_image()))
+                .unwrap();
+        assert_eq!(result.di.width(), 72);
+        assert_eq!(result.di.height(), 36);
+
+        // Larger than source: scales up to cover
+        let result =
+            tokio_test::block_on(ThumbnailProcess::new(200, 100).process(new_process_image()))
+                .unwrap();
+        assert_eq!(result.di.width(), 200);
+        assert_eq!(result.di.height(), 100);
+
+        // Zero dimension: no-op
+        let result =
+            tokio_test::block_on(ThumbnailProcess::new(0, 72).process(new_process_image()))
+                .unwrap();
+        assert_eq!(result.di.width(), 144);
+        assert_eq!(result.di.height(), 144);
+    }
+
+    #[test]
+    fn test_invert_process() {
+        // Dimensions preserved
+        let result =
+            tokio_test::block_on(InvertProcess::new().process(new_process_image())).unwrap();
+        assert_eq!(result.di.width(), 144);
+        assert_eq!(result.di.height(), 144);
+
+        // Inverting twice returns to original
+        let once = tokio_test::block_on(InvertProcess::new().process(new_process_image())).unwrap();
+        let twice = tokio_test::block_on(InvertProcess::new().process(once)).unwrap();
+        let orig = new_process_image();
+        assert_eq!(
+            twice.di.as_rgba8().unwrap().get_pixel(72, 72).0,
+            orig.di.as_rgba8().unwrap().get_pixel(72, 72).0
+        );
+
+        // Red [255,0,0,255] inverts RGB to [0,255,255,255]; alpha unchanged
+        let result = tokio_test::block_on(InvertProcess::new().process(new_red_pixel())).unwrap();
+        assert_eq!(
+            result.di.as_rgba8().unwrap().get_pixel(0, 0).0,
+            [0, 255, 255, 255]
+        );
+    }
+
+    #[test]
+    fn test_opacity_process() {
+        // Dimensions preserved
+        let result =
+            tokio_test::block_on(OpacityProcess::new(1.0).process(new_process_image())).unwrap();
+        assert_eq!(result.di.width(), 144);
+        assert_eq!(result.di.height(), 144);
+
+        // factor=1.0: alpha unchanged
+        let result =
+            tokio_test::block_on(OpacityProcess::new(1.0).process(new_red_pixel())).unwrap();
+        assert_eq!(result.di.as_rgba8().unwrap().get_pixel(0, 0).0[3], 255);
+
+        // factor=0.0: fully transparent
+        let result =
+            tokio_test::block_on(OpacityProcess::new(0.0).process(new_red_pixel())).unwrap();
+        assert_eq!(result.di.as_rgba8().unwrap().get_pixel(0, 0).0[3], 0);
+
+        // factor=0.5: alpha halved (255 * 0.5 = 127 or 128 depending on rounding)
+        let result =
+            tokio_test::block_on(OpacityProcess::new(0.5).process(new_red_pixel())).unwrap();
+        let a = result.di.as_rgba8().unwrap().get_pixel(0, 0).0[3];
+        assert!(a >= 127 && a <= 128);
+
+        // RGB channels are unaffected
+        let result =
+            tokio_test::block_on(OpacityProcess::new(0.0).process(new_red_pixel())).unwrap();
+        let [r, g, b, _] = result.di.as_rgba8().unwrap().get_pixel(0, 0).0;
+        assert_eq!([r, g, b], [255, 0, 0]);
+    }
+
+    #[test]
+    fn test_gamma_process() {
+        // Dimensions preserved
+        let result =
+            tokio_test::block_on(GammaProcess::new(1.0).process(new_process_image())).unwrap();
+        assert_eq!(result.di.width(), 144);
+        assert_eq!(result.di.height(), 144);
+
+        // gamma=1.0: each channel maps to itself (LUT is identity)
+        let result = tokio_test::block_on(GammaProcess::new(1.0).process(new_red_pixel())).unwrap();
+        assert_eq!(
+            result.di.as_rgba8().unwrap().get_pixel(0, 0).0,
+            [255, 0, 0, 255]
+        );
+
+        // gamma=2.0: darkens midtones; (128/255)^2 * 255 ≈ 64
+        let mid = {
+            use image::{DynamicImage, Rgba, RgbaImage};
+            let mut img = RgbaImage::new(1, 1);
+            img.put_pixel(0, 0, Rgba([128, 128, 128, 200]));
+            let di = DynamicImage::ImageRgba8(img);
+            ProcessImage {
+                original: Some(di.to_rgba8()),
+                di,
+                diff: -1.0,
+                original_size: 0,
+                buffer: vec![],
+                ext: "png".to_string(),
+            }
+        };
+        let result = tokio_test::block_on(GammaProcess::new(2.0).process(mid)).unwrap();
+        let [r, g, b, a] = result.di.as_rgba8().unwrap().get_pixel(0, 0).0;
+        assert!(r < 70, "gamma=2.0 should darken, got {r}");
+        assert_eq!(r, g);
+        assert_eq!(g, b);
+        assert_eq!(a, 200, "alpha must be unaffected");
+
+        // gamma=0.5: brightens midtones; sqrt(128/255)*255 ≈ 181
+        let mid2 = {
+            use image::{DynamicImage, Rgba, RgbaImage};
+            let mut img = RgbaImage::new(1, 1);
+            img.put_pixel(0, 0, Rgba([128, 128, 128, 255]));
+            let di = DynamicImage::ImageRgba8(img);
+            ProcessImage {
+                original: Some(di.to_rgba8()),
+                di,
+                diff: -1.0,
+                original_size: 0,
+                buffer: vec![],
+                ext: "png".to_string(),
+            }
+        };
+        let result = tokio_test::block_on(GammaProcess::new(0.5).process(mid2)).unwrap();
+        let r = result.di.as_rgba8().unwrap().get_pixel(0, 0).0[0];
+        assert!(r > 175, "gamma=0.5 should brighten, got {r}");
     }
 
     #[test]

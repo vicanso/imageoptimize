@@ -86,47 +86,47 @@ pub fn avif_decode(data: &[u8]) -> Result<DynamicImage> {
     match avif_result {
         avif_decode::Image::Rgb8(img) => {
             let (width, height) = (img.width() as u32, img.height() as u32);
-            let buf: Vec<u8> = img.buf().iter().flat_map(|p| [p.r, p.g, p.b]).collect();
+            let pixels = img.buf();
+            let mut buf = Vec::with_capacity(pixels.len() * 3);
+            buf.extend(pixels.iter().flat_map(|p| [p.r, p.g, p.b]));
             image::RgbImage::from_raw(width, height, buf)
                 .ok_or(ImageError::Unknown)
                 .map(DynamicImage::ImageRgb8)
         }
         avif_decode::Image::Rgba8(img) => {
             let (width, height) = (img.width() as u32, img.height() as u32);
-            let buf: Vec<u8> = img
-                .buf()
-                .iter()
-                .flat_map(|p| [p.r, p.g, p.b, p.a])
-                .collect();
+            let pixels = img.buf();
+            let mut buf = Vec::with_capacity(pixels.len() * 4);
+            buf.extend(pixels.iter().flat_map(|p| [p.r, p.g, p.b, p.a]));
             image::RgbaImage::from_raw(width, height, buf)
                 .ok_or(ImageError::Unknown)
                 .map(DynamicImage::ImageRgba8)
         }
         avif_decode::Image::Rgba16(img) => {
             let (width, height) = (img.width() as u32, img.height() as u32);
-            let buf: Vec<u8> = img
-                .buf()
-                .iter()
-                .flat_map(|p| {
-                    [
-                        (p.r / 257) as u8,
-                        (p.g / 257) as u8,
-                        (p.b / 257) as u8,
-                        (p.a / 257) as u8,
-                    ]
-                })
-                .collect();
+            let pixels = img.buf();
+            let mut buf = Vec::with_capacity(pixels.len() * 4);
+            buf.extend(pixels.iter().flat_map(|p| {
+                [
+                    (p.r / 257) as u8,
+                    (p.g / 257) as u8,
+                    (p.b / 257) as u8,
+                    (p.a / 257) as u8,
+                ]
+            }));
             image::RgbaImage::from_raw(width, height, buf)
                 .ok_or(ImageError::Unknown)
                 .map(DynamicImage::ImageRgba8)
         }
         avif_decode::Image::Rgb16(img) => {
             let (width, height) = (img.width() as u32, img.height() as u32);
-            let buf: Vec<u8> = img
-                .buf()
-                .iter()
-                .flat_map(|p| [(p.r / 257) as u8, (p.g / 257) as u8, (p.b / 257) as u8])
-                .collect();
+            let pixels = img.buf();
+            let mut buf = Vec::with_capacity(pixels.len() * 3);
+            buf.extend(
+                pixels
+                    .iter()
+                    .flat_map(|p| [(p.r / 257) as u8, (p.g / 257) as u8, (p.b / 257) as u8]),
+            );
             image::RgbImage::from_raw(width, height, buf)
                 .ok_or(ImageError::Unknown)
                 .map(DynamicImage::ImageRgb8)
@@ -236,8 +236,8 @@ impl ImageInfo {
                 })?;
             Ok(w)
         } else {
-            let di = DynamicImage::ImageRgba8(self.image.clone());
-            let encoder = Encoder::from_image(&di).map_err(|_| ImageError::Unknown)?;
+            let encoder =
+                Encoder::from_rgba(self.image.as_raw(), self.image.width(), self.image.height());
             Ok(encoder.encode(quality as f32).to_vec())
         }
     }

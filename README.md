@@ -69,6 +69,8 @@ imageoptimize [OPTIONS] <SOURCE>
 | `-q, --quiet` | false | Suppress per-file output; print only the final summary |
 | `--resize <WxH>` | — | Resize images to fit within WxH before encoding; smaller images are untouched (e.g. `1920x1080`, `1920x0`) |
 | `--strip-exif` | false | Strip EXIF metadata (including GPS) from output files without re-encoding |
+| `--avif-speed <N>` | 4 | AVIF encoder speed (0 = slowest/best quality, 10 = fastest/lower quality) |
+| `--incremental` | false | Skip images whose every output file is already newer than the source; only applies with `--output` |
 
 ### Examples
 
@@ -204,6 +206,12 @@ let bytes = result.get_buffer()?;
 | `contrast` | `new_contrast_task(val)` | float, positive increases / negative decreases | Adjust contrast |
 | `sharpen` | `new_sharpen_task(sigma, threshold)` | sigma (e.g. `1.0`), threshold (e.g. `0`) | USM sharpening |
 | `blur` | `new_blur_task(sigma)` | sigma (e.g. `2.0`) | Gaussian blur |
+| `hue` | `new_hue_task(shift)` | integer degrees, wraps around (e.g. `90`, `-45`) | Rotate hue of every pixel |
+| `saturate` | `new_saturate_task(factor)` | float (0.0 = grayscale, 1.0 = unchanged, >1.0 = boost) | Scale saturation of every pixel |
+| `thumbnail` | `new_thumbnail_task(w, h)` | width, height | Scale to cover `w×h` (fill mode) then center-crop; unlike `fit` this never letterboxes |
+| `invert` | `new_invert_task()` | — | Invert RGB channels; alpha is preserved |
+| `opacity` | `new_opacity_task(factor)` | float (0.0 = transparent, 1.0 = unchanged) | Multiply every pixel's alpha by factor |
+| `gamma` | `new_gamma_task(gamma)` | float (1.0 = unchanged, <1.0 = brighten, >1.0 = darken) | Gamma correction: `output = (input/255)^gamma × 255`; alpha unaffected |
 | `strip` | `new_strip_task()` | — | Strip EXIF metadata from the encoded buffer without re-encoding (JPEG, PNG, WebP) |
 | `padding` | `new_padding_task(w, h, color)` | width, height, hex color (`#rrggbb` / `#rrggbbaa`, default transparent) | Extend canvas, center image |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url, position, margin-left, margin-top | Overlay watermark |
