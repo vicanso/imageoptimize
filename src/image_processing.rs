@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::io::Cursor;
 use std::sync::OnceLock;
 use std::time::Duration;
+use rayon::prelude::*;
 use urlencoding::decode;
 
 pub const PROCESS_LOAD: &str = "load";
@@ -949,12 +950,16 @@ impl Process for HueProcess {
         let di = std::mem::take(&mut img.di);
         let mut rgba = di.into_rgba8();
         let shift = self.shift as f32;
-        for pixel in rgba.pixels_mut() {
-            let [r, g, b, a] = pixel.0;
-            let (h, s, v) = rgb_to_hsv(r, g, b);
-            let (nr, ng, nb) = hsv_to_rgb(h + shift, s, v);
-            *pixel = image::Rgba([nr, ng, nb, a]);
-        }
+        rgba.as_flat_samples_mut()
+            .as_mut_slice()
+            .par_chunks_mut(4)
+            .for_each(|p| {
+                let (h, s, v) = rgb_to_hsv(p[0], p[1], p[2]);
+                let (nr, ng, nb) = hsv_to_rgb(h + shift, s, v);
+                p[0] = nr;
+                p[1] = ng;
+                p[2] = nb;
+            });
         img.di = DynamicImage::ImageRgba8(rgba);
         img.buffer.clear();
         Ok(img)
@@ -977,19 +982,18 @@ impl Process for SaturateProcess {
         let di = std::mem::take(&mut img.di);
         let mut rgba = di.into_rgba8();
         let factor = self.factor.max(0.0);
-        for pixel in rgba.pixels_mut() {
-            let [r, g, b, a] = pixel.0;
-            let rf = r as f32;
-            let gf = g as f32;
-            let bf = b as f32;
-            let luma = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
-            pixel.0 = [
-                (luma + factor * (rf - luma)).clamp(0.0, 255.0) as u8,
-                (luma + factor * (gf - luma)).clamp(0.0, 255.0) as u8,
-                (luma + factor * (bf - luma)).clamp(0.0, 255.0) as u8,
-                a,
-            ];
-        }
+        rgba.as_flat_samples_mut()
+            .as_mut_slice()
+            .par_chunks_mut(4)
+            .for_each(|p| {
+                let rf = p[0] as f32;
+                let gf = p[1] as f32;
+                let bf = p[2] as f32;
+                let luma = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
+                p[0] = (luma + factor * (rf - luma)).clamp(0.0, 255.0) as u8;
+                p[1] = (luma + factor * (gf - luma)).clamp(0.0, 255.0) as u8;
+                p[2] = (luma + factor * (bf - luma)).clamp(0.0, 255.0) as u8;
+            });
         img.di = DynamicImage::ImageRgba8(rgba);
         img.buffer.clear();
         Ok(img)
@@ -1052,11 +1056,14 @@ impl Process for InvertProcess {
         let mut img = pi;
         let di = std::mem::take(&mut img.di);
         let mut rgba = di.into_rgba8();
-        for pixel in rgba.pixels_mut() {
-            pixel.0[0] = 255 - pixel.0[0];
-            pixel.0[1] = 255 - pixel.0[1];
-            pixel.0[2] = 255 - pixel.0[2];
-        }
+        rgba.as_flat_samples_mut()
+            .as_mut_slice()
+            .par_chunks_mut(4)
+            .for_each(|p| {
+                p[0] = 255 - p[0];
+                p[1] = 255 - p[1];
+                p[2] = 255 - p[2];
+            });
         img.di = DynamicImage::ImageRgba8(rgba);
         img.buffer.clear();
         Ok(img)
@@ -1081,9 +1088,12 @@ impl Process for OpacityProcess {
         let di = std::mem::take(&mut img.di);
         let mut rgba = di.into_rgba8();
         let factor = self.factor;
-        for pixel in rgba.pixels_mut() {
-            pixel.0[3] = ((pixel.0[3] as f32) * factor).round() as u8;
-        }
+        rgba.as_flat_samples_mut()
+            .as_mut_slice()
+            .par_chunks_mut(4)
+            .for_each(|p| {
+                p[3] = (p[3] as f32 * factor).round() as u8;
+            });
         img.di = DynamicImage::ImageRgba8(rgba);
         img.buffer.clear();
         Ok(img)
@@ -1114,11 +1124,14 @@ impl Process for GammaProcess {
         }
         let di = std::mem::take(&mut img.di);
         let mut rgba = di.into_rgba8();
-        for pixel in rgba.pixels_mut() {
-            pixel.0[0] = lut[pixel.0[0] as usize];
-            pixel.0[1] = lut[pixel.0[1] as usize];
-            pixel.0[2] = lut[pixel.0[2] as usize];
-        }
+        rgba.as_flat_samples_mut()
+            .as_mut_slice()
+            .par_chunks_mut(4)
+            .for_each(|p| {
+                p[0] = lut[p[0] as usize];
+                p[1] = lut[p[1] as usize];
+                p[2] = lut[p[2] as usize];
+            });
         img.di = DynamicImage::ImageRgba8(rgba);
         img.buffer.clear();
         Ok(img)
@@ -1390,7 +1403,10 @@ impl Process for OptimProcess {
 
         if img.ext != original_type || data.len() < original_size || original_size == 0 {
             img.buffer = data;
-            if img.support_dssim() {
+            // Re-decode the encoded buffer so subsequent diff comparison sees the actual
+            // lossy output. Skip when original is None (no diff task in pipeline) since
+            // the round-trip — especially for AVIF — is expensive and serves no purpose.
+            if img.support_dssim() && img.original.is_some() {
                 let result = if img.ext == IMAGE_TYPE_AVIF {
                     avif_decode(&img.buffer).context(ImagesSnafu {})
                 } else {
