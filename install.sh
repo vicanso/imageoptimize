@@ -33,7 +33,7 @@ esac
 if [ "$OS" = "darwin" ]; then
   ARTIFACT="imageoptimize-darwin-${ARCH}.tar.gz"
 else
-  ARTIFACT="imageoptimize-linux-musl-${ARCH}.tar.gz"
+  ARTIFACT="imageoptimize-linux-${ARCH}.tar.gz"
 fi
 
 # Build download URL
