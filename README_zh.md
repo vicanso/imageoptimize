@@ -30,8 +30,8 @@ curl -fsSL https://raw.githubusercontent.com/vicanso/imageoptimize/main/install.
 |------|--------|
 | macOS Apple Silicon | `imageoptimize-darwin-aarch64.tar.gz` |
 | macOS Intel | `imageoptimize-darwin-x86_64.tar.gz` |
-| Linux x86_64 (musl) | `imageoptimize-linux-musl-x86_64.tar.gz` |
-| Linux aarch64 (musl) | `imageoptimize-linux-musl-aarch64.tar.gz` |
+| Linux x86_64 | `imageoptimize-linux-x86_64.tar.gz` |
+| Linux aarch64 | `imageoptimize-linux-aarch64.tar.gz` |
 | Windows x86_64 | `imageoptimize-windows.exe.zip` |
 
 ### 从源码构建

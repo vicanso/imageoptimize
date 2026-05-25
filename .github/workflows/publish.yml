@@ -2,7 +2,7 @@ name: "publish"
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
-    # branches: ["main"]
+    branches: ["main"]
 
 env:
   GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -40,16 +40,16 @@ jobs:
           ls -lh ${{ matrix.artifact }}
           ./.github/workflows/upload_asset.sh ./${{ matrix.artifact }} $GITHUB_TOKEN
 
-  linux-musl:
+  linux:
     strategy:
       matrix:
         include:
           - runs-on: ubuntu-22.04
-            target: x86_64-unknown-linux-musl
-            artifact: imageoptimize-linux-musl-x86_64.tar.gz
+            target: x86_64-unknown-linux-gnu
+            artifact: imageoptimize-linux-x86_64.tar.gz
           - runs-on: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-musl
-            artifact: imageoptimize-linux-musl-aarch64.tar.gz
+            target: aarch64-unknown-linux-gnu
+            artifact: imageoptimize-linux-aarch64.tar.gz
     runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v4
@@ -60,12 +60,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm musl-tools
-          pip3 install ziglang
-          cargo install cargo-zigbuild --locked
+          sudo apt-get install -y nasm
       - name: release
         run: |
-          cargo zigbuild --features=bin --release --target=${{ matrix.target }}
+          cargo build --features=bin --release --target=${{ matrix.target }}
           mv target/${{ matrix.target }}/release/imageoptimize ./imageoptimize
           tar -czvf ${{ matrix.artifact }} imageoptimize
           ls -lh imageoptimize
@@ -73,7 +71,6 @@ jobs:
         run: |
           ls -lh ${{ matrix.artifact }}
           ./.github/workflows/upload_asset.sh ./${{ matrix.artifact }} $GITHUB_TOKEN
-
 
   windows:
     runs-on: windows-latest
