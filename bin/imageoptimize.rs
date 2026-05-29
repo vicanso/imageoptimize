@@ -16,7 +16,7 @@
 
 use clap::{Parser, ValueEnum};
 use glob::{glob, Pattern};
-use imageoptimize::{run, strip_exif_bytes, ImageProcessingError};
+use imageoptimize::{run_with_image, strip_exif_bytes, ImageProcessingError, ProcessImage};
 use nu_ansi_term::Color::{LightCyan, LightGreen, LightRed, LightYellow};
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
@@ -55,6 +55,41 @@ fn parse_resize(s: &str) -> std::result::Result<(u32, u32), String> {
         return Err("at least one of width or height must be non-zero".to_string());
     }
     Ok((w, h))
+}
+
+fn parse_widths(s: &str) -> std::result::Result<Vec<u32>, String> {
+    let mut widths = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let w = part
+            .parse::<u32>()
+            .map_err(|_| format!("invalid width '{part}'"))?;
+        if w == 0 {
+            return Err("widths must be greater than 0".to_string());
+        }
+        widths.push(w);
+    }
+    if widths.is_empty() {
+        return Err("expected at least one width, e.g. 320,640,1280".to_string());
+    }
+    widths.sort_unstable();
+    widths.dedup();
+    Ok(widths)
+}
+
+/// Insert the width into a target path via the pattern (`{name}`, `{w}`, `{ext}`).
+fn srcset_path(target: &str, pattern: &str, width: u32) -> String {
+    let p = Path::new(target);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let name = pattern
+        .replace("{name}", stem)
+        .replace("{w}", &width.to_string())
+        .replace("{ext}", ext);
+    p.with_file_name(name).to_string_lossy().into_owned()
 }
 
 static IMAGE_JPEG: &str = "jpeg";
@@ -181,6 +216,25 @@ struct Args {
     /// Skip images whose every output file is already newer than the source (only with --output)
     #[arg(long)]
     incremental: bool,
+
+    /// Skip the DSSIM diff metric. Avoids re-decoding AVIF/JXL output just to score it,
+    /// noticeably faster for those formats. The DIFF column is left blank.
+    #[arg(long)]
+    no_diff: bool,
+
+    /// Generate one output per width for responsive images (srcset). Comma-separated,
+    /// e.g. 320,640,1280. Widths >= the source width are skipped (no upscaling).
+    /// When set, --resize is ignored.
+    #[arg(long, value_name = "W1,W2,...")]
+    widths: Option<String>,
+
+    /// Filename pattern for width variants: {name} = stem, {w} = width, {ext} = extension
+    #[arg(long, default_value = "{name}-{w}w.{ext}")]
+    srcset_pattern: String,
+
+    /// Print a ready-to-paste responsive <source srcset> snippet per source (with --widths)
+    #[arg(long)]
+    emit_html: bool,
 }
 
 fn relative(path: &str, base: &Path) -> String {
@@ -205,15 +259,52 @@ struct ImageQualities {
     jpeg: u8,
 }
 
-async fn optimize_image(
-    item: &ImageOptimizeParams,
-    qualities: ImageQualities,
+/// Per-encode behaviour flags. `is_variant` marks a resized srcset derivative, which
+/// always writes its output rather than falling back to keeping the original.
+#[derive(Debug, Clone, Copy)]
+struct EncodeFlags {
     dry_run: bool,
-    resize: Option<(u32, u32)>,
     strip_exif: bool,
+    no_diff: bool,
+    is_variant: bool,
+}
+
+/// Decode and EXIF-orient a source file exactly once, applying the optional resize.
+/// The returned `ProcessImage` keeps the original RGBA snapshot so each output format
+/// can compute its own diff, and is cloned per target instead of re-decoding the source.
+async fn load_base(file: &str, resize: Option<(u32, u32)>) -> Result<ProcessImage> {
+    let bytes = fs::read(file).await.context(WriteFileSnafu)?;
+    let ext = Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    // ProcessImage::new keeps the original snapshot (needed for the per-target diff).
+    let base =
+        tokio::task::block_in_place(|| ProcessImage::new(bytes, ext)).context(OptimizeSnafu)?;
+    match resize {
+        Some((max_w, max_h)) => run_with_image(
+            base,
+            vec![vec![
+                "resize".to_string(),
+                max_w.to_string(),
+                max_h.to_string(),
+                "fit".to_string(),
+            ]],
+        )
+        .await
+        .context(OptimizeSnafu),
+        None => Ok(base),
+    }
+}
+
+/// Encode an already-decoded `base` image to a single target format and write it out.
+async fn encode_target(
+    base: ProcessImage,
+    file: &str,
+    target: &str,
+    qualities: &ImageQualities,
+    flags: EncodeFlags,
 ) -> Result<(usize, usize, f64, bool, bool)> {
-    let load_task = vec!["load".to_string(), format!("file://{}", &item.file)];
-    let target = item.target.clone();
     let output_type = target.split('.').next_back().unwrap_or_default();
     let quality = match output_type {
         "avif" => qualities.avif,
@@ -226,52 +317,44 @@ async fn optimize_image(
     } else {
         0
     };
-    let optim_task = vec![
+    let mut tasks = vec![vec![
         "optim".to_string(),
         output_type.to_string(),
         quality.to_string(),
         speed.to_string(),
-    ];
-    let diff_task = vec!["diff".to_string()];
-
-    let mut tasks = vec![load_task];
-    if let Some((max_w, max_h)) = resize {
-        tasks.push(vec![
-            "resize".to_string(),
-            max_w.to_string(),
-            max_h.to_string(),
-            "fit".to_string(),
-        ]);
+    ]];
+    if !flags.no_diff {
+        tasks.push(vec!["diff".to_string()]);
     }
-    tasks.push(optim_task);
-    tasks.push(diff_task);
-    if strip_exif {
+    if flags.strip_exif {
         tasks.push(vec!["strip".to_string()]);
     }
 
-    let img = run(tasks).await.context(OptimizeSnafu)?;
+    let img = run_with_image(base, tasks).await.context(OptimizeSnafu)?;
 
-    let existed = fs::try_exists(&target).await.unwrap_or(false);
+    let existed = fs::try_exists(target).await.unwrap_or(false);
     let buf = img.get_buffer().context(OptimizeSnafu)?;
     let size = buf.len();
 
-    let src_ext = Path::new(&item.file)
+    let src_ext = Path::new(file)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
+    // A width variant is a distinct derivative, never a replacement for the source,
+    // so it always writes its encoded output (never falls back to the original).
     let same_format = src_ext == output_type;
-    if same_format && size >= img.original_size {
-        if !dry_run && item.file != item.target {
-            if let Some(parent) = Path::new(&target).parent() {
+    if !flags.is_variant && same_format && size >= img.original_size {
+        if !flags.dry_run && file != target {
+            if let Some(parent) = Path::new(target).parent() {
                 fs::create_dir_all(parent).await.context(CreateDirSnafu)?;
             }
-            let original = fs::read(&item.file).await.context(WriteFileSnafu)?;
-            let bytes_to_write = if strip_exif {
+            let original = fs::read(file).await.context(WriteFileSnafu)?;
+            let bytes_to_write = if flags.strip_exif {
                 strip_exif_bytes(original, src_ext)
             } else {
                 original
             };
-            fs::write(&target, bytes_to_write)
+            fs::write(target, bytes_to_write)
                 .await
                 .context(WriteFileSnafu)?;
         }
@@ -284,11 +367,11 @@ async fn optimize_image(
         ));
     }
 
-    if !dry_run {
-        if let Some(parent) = Path::new(&target).parent() {
+    if !flags.dry_run {
+        if let Some(parent) = Path::new(target).parent() {
             fs::create_dir_all(parent).await.context(CreateDirSnafu)?;
         }
-        fs::write(&target, buf).await.context(WriteFileSnafu)?;
+        fs::write(target, buf).await.context(WriteFileSnafu)?;
     }
     Ok((size, img.original_size, img.diff, existed, false))
 }
@@ -321,6 +404,20 @@ async fn main() {
     let resize = args.resize;
     let strip_exif = args.strip_exif;
     let incremental = args.incremental;
+    let no_diff = args.no_diff;
+    let widths = match args.widths.as_deref() {
+        Some(s) => match parse_widths(s) {
+            Ok(w) => w,
+            Err(e) => {
+                println!("imageoptimize: --widths {e}");
+                std::process::exit(1);
+            }
+        },
+        None => Vec::new(),
+    };
+    let srcset_mode = !widths.is_empty();
+    let srcset_pattern = args.srcset_pattern.clone();
+    let emit_html = args.emit_html;
     let min_size_bytes = args.min_size.map(|kb| kb * 1024);
     let exclude_patterns: Vec<Pattern> = args
         .exclude
@@ -500,15 +597,12 @@ async fn main() {
         incremental_skipped = total_source_count - remaining.len();
     }
 
-    // Build group metadata before consuming image_optimize_params.
-    // expected: how many targets each source file has
-    // target_to_file: maps each target path back to its source file
-    let mut expected: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut target_to_file: std::collections::HashMap<String, String> =
+    // Group every output target under its source file so each source is decoded once
+    // and reused across all its output formats.
+    let mut grouped: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    for item in &image_optimize_params {
-        *expected.entry(item.file.clone()).or_insert(0) += 1;
-        target_to_file.insert(item.target.clone(), item.file.clone());
+    for item in image_optimize_params {
+        grouped.entry(item.file).or_default().push(item.target);
     }
 
     let incremental_note = if incremental_skipped > 0 {
@@ -526,8 +620,7 @@ async fn main() {
         incremental_note,
     );
 
-    let source_count = expected.len();
-    if source_count == 0 {
+    if grouped.is_empty() {
         return;
     }
 
@@ -556,46 +649,146 @@ async fn main() {
         );
     }
 
-    // Spawn all tasks in parallel — no change from original behaviour.
+    // One task per source file: decode once, then encode each output. `width` is set
+    // for srcset variants (None in normal mode). Each task returns all its outcomes.
+    type TargetOutcome = (
+        String,
+        Option<u32>,
+        u128,
+        Result<(usize, usize, f64, bool, bool)>,
+    );
     let concurrency = args.threads.unwrap_or_else(num_cpus::get);
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut join_set: JoinSet<(
-        String,
-        String,
-        Instant,
-        Result<(usize, usize, f64, bool, bool)>,
-    )> = JoinSet::new();
-    for item in image_optimize_params {
+    let normal_flags = EncodeFlags {
+        dry_run,
+        strip_exif,
+        no_diff,
+        is_variant: false,
+    };
+    let variant_flags = EncodeFlags {
+        is_variant: true,
+        ..normal_flags
+    };
+    let mut join_set: JoinSet<(String, Vec<TargetOutcome>)> = JoinSet::new();
+    for (file, targets) in grouped {
         let qualities = qualities.clone();
         let sem = semaphore.clone();
+        let widths = widths.clone();
+        let srcset_pattern = srcset_pattern.clone();
         join_set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            let start = Instant::now();
-            let result = optimize_image(&item, qualities, dry_run, resize, strip_exif).await;
-            (item.target, item.file, start, result)
+            let mut outcomes: Vec<TargetOutcome> = Vec::new();
+
+            if widths.is_empty() {
+                // Normal mode: decode + resize once, encode each target format.
+                match load_base(&file, resize).await {
+                    Ok(base) => {
+                        let mut base = Some(base);
+                        let last = targets.len().saturating_sub(1);
+                        for (i, target) in targets.iter().enumerate() {
+                            // Move the decoded image into the final encode; clone for the rest.
+                            let b = if i == last {
+                                base.take().unwrap()
+                            } else {
+                                base.as_ref().unwrap().clone()
+                            };
+                            let start = Instant::now();
+                            let res =
+                                encode_target(b, &file, target, &qualities, normal_flags).await;
+                            outcomes.push((target.clone(), None, start.elapsed().as_millis(), res));
+                        }
+                    }
+                    Err(e) => {
+                        let message = format!("{e}");
+                        for target in targets {
+                            outcomes.push((
+                                target,
+                                None,
+                                0,
+                                Err(Error::Common {
+                                    message: message.clone(),
+                                }),
+                            ));
+                        }
+                    }
+                }
+            } else {
+                // srcset mode: decode once (no resize here), then width × format.
+                match load_base(&file, None).await {
+                    Ok(base) => {
+                        let src_w = base.get_size().0;
+                        for &w in &widths {
+                            if w >= src_w {
+                                continue; // never upscale
+                            }
+                            // Resize the decoded image to this width once, reused for all formats.
+                            let resized = match run_with_image(
+                                base.clone(),
+                                vec![vec!["resize".to_string(), w.to_string(), "0".to_string()]],
+                            )
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    let message = format!("{e}");
+                                    for target in &targets {
+                                        let path = srcset_path(target, &srcset_pattern, w);
+                                        outcomes.push((
+                                            path,
+                                            Some(w),
+                                            0,
+                                            Err(Error::Common {
+                                                message: message.clone(),
+                                            }),
+                                        ));
+                                    }
+                                    continue;
+                                }
+                            };
+                            let mut resized = Some(resized);
+                            let last = targets.len().saturating_sub(1);
+                            for (i, target) in targets.iter().enumerate() {
+                                let b = if i == last {
+                                    resized.take().unwrap()
+                                } else {
+                                    resized.as_ref().unwrap().clone()
+                                };
+                                let path = srcset_path(target, &srcset_pattern, w);
+                                let start = Instant::now();
+                                let res =
+                                    encode_target(b, &file, &path, &qualities, variant_flags).await;
+                                outcomes.push((path, Some(w), start.elapsed().as_millis(), res));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let message = format!("{e}");
+                        for target in &targets {
+                            for &w in &widths {
+                                let path = srcset_path(target, &srcset_pattern, w);
+                                outcomes.push((
+                                    path,
+                                    Some(w),
+                                    0,
+                                    Err(Error::Common {
+                                        message: message.clone(),
+                                    }),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            (file, outcomes)
         });
     }
 
-    // Collect results into per-source buffers; flush immediately when a group is complete.
-    type TaskResult = (
-        String,
-        String,
-        Instant,
-        Result<(usize, usize, f64, bool, bool)>,
-    );
-    let mut buffers: std::collections::HashMap<String, Vec<TaskResult>> =
-        std::collections::HashMap::new();
-
-    let print_row = |target: &str,
-                     _file: &str,
-                     start: Instant,
-                     res: Result<(usize, usize, f64, bool, bool)>| {
+    let print_row = |target: &str, duration: u128, res: Result<(usize, usize, f64, bool, bool)>| {
         match res {
             Ok((size, original_size, diff, existed, skipped)) => {
                 if quiet {
                     return;
                 }
-                let duration = start.elapsed().as_millis();
                 let duration_str = if duration < 1000 {
                     format!("{}ms", duration)
                 } else {
@@ -620,11 +813,16 @@ async fn main() {
                 } else {
                     format!("{}b", size)
                 };
-                let diff_num = format!("{diff:>4.2}");
-                let diff_inner = if diff > 1.0 {
-                    LightYellow.paint(&diff_num).to_string()
+                // diff < 0 means "not computed" (--no-diff, after a resize, or GIF).
+                let diff_inner = if diff < 0.0 {
+                    format!("{:>4}", "—")
                 } else {
-                    LightGreen.paint(&diff_num).to_string()
+                    let diff_num = format!("{diff:>4.2}");
+                    if diff > 1.0 {
+                        LightYellow.paint(&diff_num).to_string()
+                    } else {
+                        LightGreen.paint(&diff_num).to_string()
+                    }
                 };
                 let percent = size * 100 / original_size;
                 let status = if existed {
@@ -654,55 +852,121 @@ async fn main() {
     let mut summary_count: usize = 0;
     let mut summary_skipped: usize = 0;
     let mut summary_errors: usize = 0;
+    let mut summary_variants: usize = 0;
+    let mut summary_variant_bytes: usize = 0;
+    // For --emit-html: source file -> (relative variant path, width, ext).
+    let mut html: std::collections::BTreeMap<String, Vec<(String, u32, String)>> =
+        std::collections::BTreeMap::new();
 
     while let Some(task) = join_set.join_next().await {
-        let (target, file, start, result) = task.expect("task panicked");
-        let source = target_to_file[&target].clone();
-        buffers
-            .entry(source.clone())
-            .or_default()
-            .push((target, file, start, result));
-
-        // Flush immediately once all variants of this source file have arrived.
-        if buffers[&source].len() == expected[&source] {
-            for (t, f, s, r) in buffers.remove(&source).unwrap() {
-                let src_ext = Path::new(&f)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                let tgt_ext = Path::new(&t)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                if src_ext == tgt_ext {
-                    match &r {
-                        Ok((size, original_size, _, _, skipped)) => {
-                            if *skipped {
-                                summary_skipped += 1;
-                            } else {
-                                summary_original += original_size;
-                                summary_optimized += size;
-                                summary_count += 1;
+        let (file, outcomes) = task.expect("task panicked");
+        let src_ext = Path::new(&file)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        for (target, width, duration, result) in outcomes {
+            let tgt_ext = Path::new(&target)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_string();
+            match width {
+                // Normal mode: only count same-format optimisation toward the savings
+                // summary; avif/webp conversions are reported per row but not summed.
+                None => {
+                    if src_ext == tgt_ext {
+                        match &result {
+                            Ok((size, original_size, _, _, skipped)) => {
+                                if *skipped {
+                                    summary_skipped += 1;
+                                } else {
+                                    summary_original += original_size;
+                                    summary_optimized += size;
+                                    summary_count += 1;
+                                }
                             }
+                            Err(_) => summary_errors += 1,
                         }
-                        Err(_) => summary_errors += 1,
                     }
                 }
-                print_row(&t, &f, s, r);
+                // srcset variant: a derivative output, tallied separately from "saved".
+                Some(w) => match &result {
+                    Ok((size, _, _, _, _)) => {
+                        summary_variants += 1;
+                        summary_variant_bytes += size;
+                        if emit_html {
+                            html.entry(file.clone()).or_default().push((
+                                relative(&target, &base),
+                                w,
+                                tgt_ext.clone(),
+                            ));
+                        }
+                    }
+                    Err(_) => summary_errors += 1,
+                },
             }
+            print_row(&target, duration, result);
         }
     }
 
-    if summary_count > 0 || summary_skipped > 0 || summary_errors > 0 {
-        let format_size = |size: usize| {
-            if size >= mb {
-                format!("{:.1}mb", size as f64 / mb as f64)
-            } else if size >= kb {
-                format!("{:.1}kb", size as f64 / kb as f64)
+    let format_size = |size: usize| {
+        if size >= mb {
+            format!("{:.1}mb", size as f64 / mb as f64)
+        } else if size >= kb {
+            format!("{:.1}kb", size as f64 / kb as f64)
+        } else {
+            format!("{}b", size)
+        }
+    };
+    let error_note = if summary_errors > 0 {
+        format!(", {} failed", LightRed.paint(format!("{summary_errors}")))
+    } else {
+        String::new()
+    };
+
+    if srcset_mode {
+        if summary_variants > 0 || summary_errors > 0 {
+            println!();
+            let verb = if dry_run {
+                "Would generate"
             } else {
-                format!("{}b", size)
+                "Generated"
+            };
+            println!(
+                "{}",
+                LightCyan.paint(format!(
+                    "{verb} {summary_variants} variant{} ({} total){error_note}",
+                    if summary_variants == 1 { "" } else { "s" },
+                    format_size(summary_variant_bytes),
+                ))
+            );
+        }
+
+        // One <source> srcset line per format, per source.
+        if emit_html && !html.is_empty() {
+            println!();
+            for (file, variants) in html {
+                println!(
+                    "{}",
+                    LightCyan.paint(format!("<!-- {} -->", relative(&file, &base)))
+                );
+                let mut by_ext: std::collections::BTreeMap<String, Vec<(String, u32)>> =
+                    std::collections::BTreeMap::new();
+                for (path, w, ext) in variants {
+                    by_ext.entry(ext).or_default().push((path, w));
+                }
+                for (ext, mut list) in by_ext {
+                    list.sort_by_key(|(_, w)| *w);
+                    let srcset = list
+                        .iter()
+                        .map(|(p, w)| format!("{p} {w}w"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("  <source type=\"image/{ext}\" srcset=\"{srcset}\">");
+                }
             }
-        };
+        }
+    } else if summary_count > 0 || summary_skipped > 0 || summary_errors > 0 {
         let saved = summary_original.saturating_sub(summary_optimized);
         let saved_pct = if summary_original > 0 {
             saved * 100 / summary_original
@@ -714,11 +978,6 @@ async fn main() {
                 ", {} unchanged",
                 LightYellow.paint(format!("{summary_skipped}"))
             )
-        } else {
-            String::new()
-        };
-        let error_note = if summary_errors > 0 {
-            format!(", {} failed", LightRed.paint(format!("{summary_errors}")))
         } else {
             String::new()
         };

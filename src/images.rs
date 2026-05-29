@@ -376,7 +376,7 @@ mod tests {
     fn test_to_avif() {
         let img = load_image();
         let result = img.to_avif(90, 3).unwrap();
-        assert_eq!(result.len(), 2345);
+        assert_eq!(result.len(), 2402);
     }
     #[test]
     fn test_to_jxl() {

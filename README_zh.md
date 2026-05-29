@@ -70,6 +70,10 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--strip-exif` | false | 从输出文件中移除 EXIF 元数据（含 GPS 定位），无需重新编码 |
 | `--avif-speed <N>` | 4 | AVIF 编码速度（0 = 最慢/最佳质量，10 = 最快/较低质量） |
 | `--incremental` | false | 跳过所有输出文件均比源文件新的图片（仅适用于 `--output` 模式） |
+| `--no-diff` | false | 跳过 DSSIM 评分；避免为算分而二次解码 AVIF/JXL（DIFF 列显示 `—`） |
+| `--widths <W1,W2,...>` | — | 为响应式 `srcset` 按宽度各生成一份输出（如 `320,640,1280`）。宽度 ≥ 源宽的会被跳过（不放大）；设置后忽略 `--resize` |
+| `--srcset-pattern <PAT>` | `{name}-{w}w.{ext}` | 宽度变体的文件名模板（`{name}` = 主名，`{w}` = 宽度，`{ext}` = 扩展名） |
+| `--emit-html` | false | 为每个源图打印可直接粘贴的 `<source srcset>` 片段（需配合 `--widths`） |
 
 ### 示例
 
@@ -137,6 +141,22 @@ imageoptimize /path/to/source --output /path/to/output --resize 1920x1080
 ```
 
 使用 `0` 表示该方向不限制（如 `--resize 1920x0` 仅限制宽度）。
+
+**响应式图片（srcset）** — 为每个源图按多个宽度各生成一份（每种输出格式都生成），并打印 HTML 片段：
+
+```bash
+imageoptimize /path/to/source --output /path/to/output --widths 320,640,1280 --emit-html
+```
+
+生成如 `photo-320w.avif`、`photo-640w.avif`……（大于源宽的尺寸会被跳过）。`--emit-html` 输出的片段可直接放进 `<picture>` 元素：
+
+```html
+<picture>
+  <source type="image/avif" srcset="photo-320w.avif 320w, photo-640w.avif 640w, photo-1280w.avif 1280w">
+  <source type="image/webp" srcset="photo-320w.webp 320w, photo-640w.webp 640w, photo-1280w.webp 1280w">
+  <img src="photo-1280w.jpeg" sizes="(max-width: 640px) 100vw, 640px" alt="">
+</picture>
+```
 
 ### 输出格式
 
@@ -208,9 +228,13 @@ let bytes = result.get_buffer()?;
 | `hue` | `new_hue_task(shift)` | 整数角度，自动环绕（如 `90`、`-45`） | 旋转每个像素的色调 |
 | `saturate` | `new_saturate_task(factor)` | 浮点数（0.0 = 灰度，1.0 = 不变，>1.0 = 增强） | 缩放每个像素的饱和度 |
 | `thumbnail` | `new_thumbnail_task(w, h)` | 宽度、高度 | 缩放至覆盖 `w×h`（填充模式）后居中裁剪；与 `fit` 不同，不会留黑边 |
+| `thumbnail`（智能） | `new_smart_thumbnail_task(w, h)` | 宽度、高度 | 与 `thumbnail` 相同，但内容感知：裁剪窗口滑向细节最丰富的区域（亮度梯度能量 + 中心偏置），而非死板居中 |
 | `invert` | `new_invert_task()` | — | 反转 RGB 通道；alpha 通道保持不变 |
 | `opacity` | `new_opacity_task(factor)` | 浮点数（0.0 = 完全透明，1.0 = 不变） | 将每个像素的 alpha 值乘以 factor |
 | `gamma` | `new_gamma_task(gamma)` | 浮点数（1.0 = 不变，<1.0 = 增亮，>1.0 = 变暗） | Gamma 校正：`output = (input/255)^gamma × 255`；alpha 不受影响 |
+| `background` | `new_background_task(color)` | 十六进制颜色（`#rrggbb` / `#rrggbbaa`，留空 = 不透明白色） | 将图片叠加到纯色背景上以拍平透明度；在编码为 JPEG/JXL 前使用，避免透明区域变黑 |
+| `normalize` | `new_normalize_task(per_channel)` | 布尔值（`true` = 每通道 RGB，`false` = 亮度通道） | 自动对比度：将直方图拉伸至完整的 0–255 范围 |
+| `trim` | `new_trim_task(tolerance)` | 容差 0–255（与左上角参考色的最大单通道 RGBA 差值） | 自动裁剪四周纯色边框 |
 | `strip` | `new_strip_task()` | — | 从编码后的缓冲区移除 EXIF 元数据，无需重新编码（支持 JPEG、PNG、WebP） |
 | `padding` | `new_padding_task(w, h, color)` | 宽度、高度、十六进制颜色（`#rrggbb` / `#rrggbbaa`，默认透明） | 扩展画布并居中图片 |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url、位置、左边距、上边距 | 叠加水印 |

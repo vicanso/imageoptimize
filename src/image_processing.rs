@@ -39,6 +39,9 @@ pub const PROCESS_THUMBNAIL: &str = "thumbnail";
 pub const PROCESS_INVERT: &str = "invert";
 pub const PROCESS_OPACITY: &str = "opacity";
 pub const PROCESS_GAMMA: &str = "gamma";
+pub const PROCESS_BACKGROUND: &str = "background";
+pub const PROCESS_NORMALIZE: &str = "normalize";
+pub const PROCESS_TRIM: &str = "trim";
 
 const IMAGE_TYPE_GIF: &str = "gif";
 const IMAGE_TYPE_PNG: &str = "png";
@@ -250,6 +253,18 @@ pub fn new_thumbnail_task(width: u32, height: u32) -> Vec<String> {
     ]
 }
 
+/// Like `new_thumbnail_task`, but content-aware: instead of center-cropping, the crop
+/// window slides to the region with the most detail (luminance-gradient energy) with a
+/// mild center bias. Keeps the subject in frame for off-center compositions.
+pub fn new_smart_thumbnail_task(width: u32, height: u32) -> Vec<String> {
+    vec![
+        PROCESS_THUMBNAIL.to_string(),
+        width.to_string(),
+        height.to_string(),
+        "smart".to_string(),
+    ]
+}
+
 /// Invert RGB channels of every pixel; alpha is preserved.
 pub fn new_invert_task() -> Vec<String> {
     vec![PROCESS_INVERT.to_string()]
@@ -264,6 +279,31 @@ pub fn new_opacity_task(factor: f32) -> Vec<String> {
 /// gamma = 1.0 is a no-op; gamma < 1.0 brightens midtones; gamma > 1.0 darkens.
 pub fn new_gamma_task(gamma: f32) -> Vec<String> {
     vec![PROCESS_GAMMA.to_string(), gamma.to_string()]
+}
+
+/// Composite the image over a solid background color, flattening transparency.
+/// `color` is a hex string (`#rrggbb` or `#rrggbbaa`); an empty string defaults to
+/// opaque white. Useful before encoding to a format without alpha (JPEG/JXL) so
+/// transparent areas take the background color instead of turning black.
+pub fn new_background_task(color: &str) -> Vec<String> {
+    vec![PROCESS_BACKGROUND.to_string(), color.to_string()]
+}
+
+/// Stretch the histogram so the darkest/brightest pixels map to 0/255 (auto-contrast).
+/// `per_channel` true normalizes R/G/B independently (maximizes contrast but may shift
+/// color balance); false derives a single mapping from luminance, preserving color.
+pub fn new_normalize_task(per_channel: bool) -> Vec<String> {
+    vec![
+        PROCESS_NORMALIZE.to_string(),
+        if per_channel { "rgb" } else { "luma" }.to_string(),
+    ]
+}
+
+/// Auto-crop a uniform border. The top-left pixel is the reference color; outer rows
+/// and columns whose pixels are all within `tolerance` (max per-channel RGBA
+/// difference) of it are removed. A fully uniform image is left unchanged.
+pub fn new_trim_task(tolerance: u8) -> Vec<String> {
+    vec![PROCESS_TRIM.to_string(), tolerance.to_string()]
 }
 
 pub async fn run_with_image(
@@ -371,7 +411,13 @@ pub async fn run_with_image(
                 ensure!(sub_params.len() >= 2, he);
                 let width = sub_params[0].parse::<u32>().context(ParseIntSnafu {})?;
                 let height = sub_params[1].parse::<u32>().context(ParseIntSnafu {})?;
-                image = ThumbnailProcess::new(width, height).process(image).await?;
+                let smart = sub_params.get(2).map(|s| s == "smart").unwrap_or(false);
+                let proc = if smart {
+                    ThumbnailProcess::new_smart(width, height)
+                } else {
+                    ThumbnailProcess::new(width, height)
+                };
+                image = proc.process(image).await?;
             }
             PROCESS_INVERT => {
                 image = InvertProcess::new().process(image).await?;
@@ -389,6 +435,21 @@ pub async fn run_with_image(
                     .and_then(|s| s.parse::<f32>().ok())
                     .unwrap_or(1.0);
                 image = GammaProcess::new(gamma).process(image).await?;
+            }
+            PROCESS_BACKGROUND => {
+                let color = sub_params.first().map(|s| s.as_str()).unwrap_or("");
+                image = BackgroundProcess::new(color).process(image).await?;
+            }
+            PROCESS_NORMALIZE => {
+                let per_channel = sub_params.first().map(|s| s != "luma").unwrap_or(true);
+                image = NormalizeProcess::new(per_channel).process(image).await?;
+            }
+            PROCESS_TRIM => {
+                let tolerance = sub_params
+                    .first()
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(0);
+                image = TrimProcess::new(tolerance).process(image).await?;
             }
             PROCESS_STRIP => {
                 image = StripProcess::new().process(image).await?;
@@ -881,7 +942,11 @@ impl Process for SharpenProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
         let di = std::mem::take(&mut img.di);
-        img.di = DynamicImage::ImageRgba8(parallel_unsharpen(di.into_rgba8(), self.sigma, self.threshold));
+        img.di = DynamicImage::ImageRgba8(parallel_unsharpen(
+            di.into_rgba8(),
+            self.sigma,
+            self.threshold,
+        ));
         img.buffer.clear();
         Ok(img)
     }
@@ -1137,14 +1202,145 @@ impl Process for SaturateProcess {
     }
 }
 
+/// Return the window start (length `win`) that maximizes summed energy × center bias.
+fn best_window(energy: &[f32], win: usize) -> usize {
+    let n = energy.len();
+    if win >= n {
+        return 0;
+    }
+    let mut prefix = vec![0f32; n + 1];
+    for i in 0..n {
+        prefix[i + 1] = prefix[i] + energy[i];
+    }
+    if prefix[n] <= f32::EPSILON {
+        return (n - win) / 2; // flat energy: fall back to center
+    }
+    let img_center = n as f32 / 2.0;
+    let max_dist = (n - win) as f32 / 2.0;
+    let mut best = 0usize;
+    let mut best_score = f32::MIN;
+    for start in 0..=(n - win) {
+        let e = prefix[start + win] - prefix[start];
+        let win_center = start as f32 + win as f32 / 2.0;
+        // Mild bias toward windows centered near the image center.
+        let bias = if max_dist > 0.0 {
+            1.0 - 0.3 * ((win_center - img_center).abs() / max_dist)
+        } else {
+            1.0
+        };
+        let score = e * bias;
+        if score > best_score {
+            best_score = score;
+            best = start;
+        }
+    }
+    best
+}
+
+/// Pick a content-aware crop offset (top-left) for a `crop_w × crop_h` window using a
+/// luminance-gradient energy map plus a mild center bias. Cover-cropping leaves slack on
+/// only one axis, so just that axis is searched; the other is centered. Energy is measured
+/// on a downscaled copy for speed, and the chosen offset is mapped back to full resolution.
+fn smart_crop_offset(di: &DynamicImage, crop_w: u32, crop_h: u32) -> (u32, u32) {
+    let src_w = di.width();
+    let src_h = di.height();
+    let slack_x = src_w.saturating_sub(crop_w);
+    let slack_y = src_h.saturating_sub(crop_h);
+    if slack_x == 0 && slack_y == 0 {
+        return (0, 0);
+    }
+
+    let max_side = src_w.max(src_h);
+    let target = 256u32;
+    let (sw, sh) = if max_side <= target {
+        (src_w, src_h)
+    } else {
+        let s = target as f32 / max_side as f32;
+        (
+            ((src_w as f32 * s).round() as u32).max(1),
+            ((src_h as f32 * s).round() as u32).max(1),
+        )
+    };
+    let small = if sw == src_w && sh == src_h {
+        di.to_rgba8()
+    } else {
+        resize(di, sw, sh, FilterType::Triangle)
+    };
+    let raw = small.as_raw();
+    let swu = sw as usize;
+    let shu = sh as usize;
+
+    let luma: Vec<f32> = (0..swu * shu)
+        .map(|i| {
+            let p = &raw[i * 4..i * 4 + 3];
+            0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32
+        })
+        .collect();
+
+    // |dL/dx| + |dL/dy| with replicated borders (central difference).
+    let energy_at = |x: usize, y: usize| -> f32 {
+        let xm = x.saturating_sub(1);
+        let xp = (x + 1).min(swu - 1);
+        let ym = y.saturating_sub(1);
+        let yp = (y + 1).min(shu - 1);
+        let gx = (luma[y * swu + xp] - luma[y * swu + xm]).abs();
+        let gy = (luma[yp * swu + x] - luma[ym * swu + x]).abs();
+        gx + gy
+    };
+
+    if slack_x >= slack_y {
+        // Horizontal slide; vertical centered.
+        let mut col = vec![0f32; swu];
+        for y in 0..shu {
+            for (x, c) in col.iter_mut().enumerate() {
+                *c += energy_at(x, y);
+            }
+        }
+        let ratio = sw as f32 / src_w as f32;
+        let win = ((crop_w as f32 * ratio).round() as usize).clamp(1, swu.saturating_sub(1).max(1));
+        let start = best_window(&col, win);
+        let x_full = ((start as f32 / ratio).round() as u32).min(slack_x);
+        (x_full, slack_y / 2)
+    } else {
+        // Vertical slide; horizontal centered.
+        let mut row = vec![0f32; shu];
+        for (y, r) in row.iter_mut().enumerate() {
+            let mut acc = 0f32;
+            for x in 0..swu {
+                acc += energy_at(x, y);
+            }
+            *r = acc;
+        }
+        let ratio = sh as f32 / src_h as f32;
+        let win = ((crop_h as f32 * ratio).round() as usize).clamp(1, shu.saturating_sub(1).max(1));
+        let start = best_window(&row, win);
+        let y_full = ((start as f32 / ratio).round() as u32).min(slack_y);
+        (slack_x / 2, y_full)
+    }
+}
+
 pub struct ThumbnailProcess {
     width: u32,
     height: u32,
+    smart: bool,
 }
 
 impl ThumbnailProcess {
     pub fn new(width: u32, height: u32) -> Self {
-        ThumbnailProcess { width, height }
+        ThumbnailProcess {
+            width,
+            height,
+            smart: false,
+        }
+    }
+    /// Content-aware variant: the crop window is placed over the highest-energy region
+    /// (with a center bias) instead of being centered.
+    pub fn new_smart(width: u32, height: u32) -> Self {
+        ThumbnailProcess {
+            width,
+            height,
+            smart: true,
+        }
     }
 }
 
@@ -1165,8 +1361,14 @@ impl Process for ThumbnailProcess {
         let scale = (dst_w as f64 / src_w as f64).max(dst_h as f64 / src_h as f64);
         let crop_w = (dst_w as f64 / scale).round() as u32;
         let crop_h = (dst_h as f64 / scale).round() as u32;
-        let crop_x = src_w.saturating_sub(crop_w) / 2;
-        let crop_y = src_h.saturating_sub(crop_h) / 2;
+        let (crop_x, crop_y) = if self.smart {
+            smart_crop_offset(&img.di, crop_w, crop_h)
+        } else {
+            (
+                src_w.saturating_sub(crop_w) / 2,
+                src_h.saturating_sub(crop_h) / 2,
+            )
+        };
 
         let source = if crop_w == src_w && crop_h == src_h {
             std::mem::take(&mut img.di)
@@ -1287,6 +1489,243 @@ fn parse_hex_color(color: &str) -> image::Rgba<u8> {
             parse(&hex[6..8]),
         ]),
         _ => image::Rgba([0, 0, 0, 0]),
+    }
+}
+
+/// Background process flattens transparency by compositing the image over a solid
+/// background color (the standard "source over" operator with straight alpha).
+pub struct BackgroundProcess {
+    color: image::Rgba<u8>,
+}
+
+impl BackgroundProcess {
+    /// `color` is a hex string (`#rrggbb` / `#rrggbbaa`); empty defaults to opaque white.
+    pub fn new(color: &str) -> Self {
+        let color = if color.is_empty() {
+            image::Rgba([255, 255, 255, 255])
+        } else {
+            parse_hex_color(color)
+        };
+        BackgroundProcess { color }
+    }
+}
+
+impl Process for BackgroundProcess {
+    async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
+        let mut img = pi;
+        let [bg_r, bg_g, bg_b, bg_a] = self.color.0;
+        let bg_af = bg_a as f32 / 255.0;
+        let di = std::mem::take(&mut img.di);
+        let mut rgba = di.into_rgba8();
+        rgba.as_flat_samples_mut()
+            .as_mut_slice()
+            .par_chunks_mut(4)
+            .for_each(|p| {
+                // Fully opaque source pixels are unchanged by compositing.
+                if p[3] == 255 {
+                    return;
+                }
+                let sa = p[3] as f32 / 255.0;
+                let out_a = sa + bg_af * (1.0 - sa);
+                if out_a <= f32::EPSILON {
+                    p[0] = 0;
+                    p[1] = 0;
+                    p[2] = 0;
+                    p[3] = 0;
+                    return;
+                }
+                let blend = |s: u8, b: u8| -> u8 {
+                    ((s as f32 * sa + b as f32 * bg_af * (1.0 - sa)) / out_a)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
+                p[0] = blend(p[0], bg_r);
+                p[1] = blend(p[1], bg_g);
+                p[2] = blend(p[2], bg_b);
+                p[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+            });
+        img.di = DynamicImage::ImageRgba8(rgba);
+        img.buffer.clear();
+        Ok(img)
+    }
+}
+
+/// Build a 256-entry lookup table that linearly maps `[lo, hi]` onto `[0, 255]`.
+/// A degenerate or inverted range yields an identity table (no-op).
+fn build_stretch_lut(lo: f32, hi: f32) -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    if hi <= lo {
+        for (i, v) in lut.iter_mut().enumerate() {
+            *v = i as u8;
+        }
+        return lut;
+    }
+    let scale = 255.0 / (hi - lo);
+    for (i, v) in lut.iter_mut().enumerate() {
+        *v = ((i as f32 - lo) * scale).round().clamp(0.0, 255.0) as u8;
+    }
+    lut
+}
+
+/// Normalize process stretches the histogram to the full 0..=255 range (auto-contrast).
+pub struct NormalizeProcess {
+    per_channel: bool,
+}
+
+impl NormalizeProcess {
+    pub fn new(per_channel: bool) -> Self {
+        NormalizeProcess { per_channel }
+    }
+}
+
+impl Process for NormalizeProcess {
+    async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
+        let mut img = pi;
+        let di = std::mem::take(&mut img.di);
+        let mut rgba = di.into_rgba8();
+
+        // Pass 1: measure the input range from opaque pixels only, so transparent
+        // padding (often RGB 0) doesn't drag the range down. Build per-channel LUTs.
+        let luts: [[u8; 256]; 3] = if self.per_channel {
+            let (mins, maxs) = rgba
+                .as_raw()
+                .par_chunks(4)
+                .filter(|p| p[3] > 0)
+                .fold(
+                    || ([255u8; 3], [0u8; 3]),
+                    |(mut mn, mut mx), p| {
+                        for c in 0..3 {
+                            mn[c] = mn[c].min(p[c]);
+                            mx[c] = mx[c].max(p[c]);
+                        }
+                        (mn, mx)
+                    },
+                )
+                .reduce(
+                    || ([255u8; 3], [0u8; 3]),
+                    |(mut amn, mut amx), (bmn, bmx)| {
+                        for c in 0..3 {
+                            amn[c] = amn[c].min(bmn[c]);
+                            amx[c] = amx[c].max(bmx[c]);
+                        }
+                        (amn, amx)
+                    },
+                );
+            [
+                build_stretch_lut(mins[0] as f32, maxs[0] as f32),
+                build_stretch_lut(mins[1] as f32, maxs[1] as f32),
+                build_stretch_lut(mins[2] as f32, maxs[2] as f32),
+            ]
+        } else {
+            let (lo, hi) = rgba
+                .as_raw()
+                .par_chunks(4)
+                .filter(|p| p[3] > 0)
+                .fold(
+                    || (255.0f32, 0.0f32),
+                    |(mn, mx), p| {
+                        let l = 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
+                        (mn.min(l), mx.max(l))
+                    },
+                )
+                .reduce(
+                    || (255.0f32, 0.0f32),
+                    |(amn, amx), (bmn, bmx)| (amn.min(bmn), amx.max(bmx)),
+                );
+            let lut = build_stretch_lut(lo, hi);
+            [lut, lut, lut]
+        };
+
+        // Pass 2: apply the LUTs in parallel; alpha is untouched.
+        rgba.as_flat_samples_mut()
+            .as_mut_slice()
+            .par_chunks_mut(4)
+            .for_each(|p| {
+                p[0] = luts[0][p[0] as usize];
+                p[1] = luts[1][p[1] as usize];
+                p[2] = luts[2][p[2] as usize];
+            });
+        img.di = DynamicImage::ImageRgba8(rgba);
+        img.buffer.clear();
+        Ok(img)
+    }
+}
+
+/// Trim process auto-crops a uniform border matching the top-left reference pixel.
+pub struct TrimProcess {
+    tolerance: u8,
+}
+
+impl TrimProcess {
+    pub fn new(tolerance: u8) -> Self {
+        TrimProcess { tolerance }
+    }
+}
+
+impl Process for TrimProcess {
+    async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
+        let mut img = pi;
+        let (w, h) = (img.di.width(), img.di.height());
+        if w == 0 || h == 0 {
+            return Ok(img);
+        }
+        let di = std::mem::take(&mut img.di);
+        let rgba = di.into_rgba8();
+        let raw = rgba.as_raw();
+        let reference = [raw[0], raw[1], raw[2], raw[3]];
+        let tol = self.tolerance as i32;
+        let wu = w as usize;
+
+        let is_border = |px: &[u8]| -> bool {
+            (px[0] as i32 - reference[0] as i32).abs() <= tol
+                && (px[1] as i32 - reference[1] as i32).abs() <= tol
+                && (px[2] as i32 - reference[2] as i32).abs() <= tol
+                && (px[3] as i32 - reference[3] as i32).abs() <= tol
+        };
+
+        // For each row, the first/last x holding a non-border pixel (None = all border).
+        let rows: Vec<Option<(u32, u32)>> = (0..h as usize)
+            .into_par_iter()
+            .map(|y| {
+                let mut lo: Option<u32> = None;
+                let mut hi = 0u32;
+                for x in 0..wu {
+                    let idx = (y * wu + x) * 4;
+                    if !is_border(&raw[idx..idx + 4]) {
+                        if lo.is_none() {
+                            lo = Some(x as u32);
+                        }
+                        hi = x as u32;
+                    }
+                }
+                lo.map(|l| (l, hi))
+            })
+            .collect();
+
+        let Some(min_y) = rows.iter().position(|r| r.is_some()) else {
+            // Entire image matches the border color: nothing to trim.
+            img.di = DynamicImage::ImageRgba8(rgba);
+            return Ok(img);
+        };
+        let max_y = rows.iter().rposition(|r| r.is_some()).unwrap();
+        let min_x = rows.iter().filter_map(|r| r.map(|(l, _)| l)).min().unwrap();
+        let max_x = rows
+            .iter()
+            .filter_map(|r| r.map(|(_, hx)| hx))
+            .max()
+            .unwrap();
+
+        let crop_w = max_x - min_x + 1;
+        let crop_h = (max_y - min_y) as u32 + 1;
+        if crop_w == w && crop_h == h {
+            img.di = DynamicImage::ImageRgba8(rgba);
+            return Ok(img);
+        }
+        let mut di = DynamicImage::ImageRgba8(rgba);
+        let cropped = crop(&mut di, min_x, min_y as u32, crop_w, crop_h).to_image();
+        img.di = DynamicImage::ImageRgba8(cropped);
+        img.buffer.clear();
+        Ok(img)
     }
 }
 
@@ -1571,10 +2010,11 @@ impl Process for OptimProcess {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlurProcess, BrightenProcess, ContrastProcess, CropProcess, FlipProcess, GammaProcess,
-        GrayProcess, HueProcess, InvertProcess, LoaderProcess, OpacityProcess, OptimProcess,
-        PaddingProcess, ResizeProcess, RotateProcess, SaturateProcess, SharpenProcess,
-        StripProcess, ThumbnailProcess, WatermarkProcess,
+        BackgroundProcess, BlurProcess, BrightenProcess, ContrastProcess, CropProcess, FlipProcess,
+        GammaProcess, GrayProcess, HueProcess, InvertProcess, LoaderProcess, NormalizeProcess,
+        OpacityProcess, OptimProcess, PaddingProcess, ResizeProcess, RotateProcess,
+        SaturateProcess, SharpenProcess, StripProcess, ThumbnailProcess, TrimProcess,
+        WatermarkProcess,
     };
     use crate::image_processing::{Process, ProcessImage};
     use base64::{engine::general_purpose, Engine as _};
@@ -1701,6 +2141,82 @@ mod tests {
         let result = tokio_test::block_on(GrayProcess::new().process(p)).unwrap();
         assert_eq!(result.di.width(), 144);
         assert_eq!(result.di.height(), 144);
+    }
+
+    #[test]
+    fn test_background_process() {
+        // The rust logo has a transparent background; locate one transparent pixel.
+        let orig = new_process_image();
+        let orig_rgba = orig.di.as_rgba8().unwrap();
+        let transparent = orig_rgba.pixels().find(|p| p.0[3] == 0).map(|p| p.0);
+
+        let result =
+            tokio_test::block_on(BackgroundProcess::new("#ff0000").process(new_process_image()))
+                .unwrap();
+        assert_eq!(result.di.width(), 144);
+        assert_eq!(result.di.height(), 144);
+
+        // Flattening onto an opaque background makes every pixel fully opaque.
+        let rgba = result.di.as_rgba8().unwrap();
+        assert!(rgba.pixels().all(|p| p.0[3] == 255));
+
+        // A formerly transparent pixel takes the exact background color.
+        if transparent.is_some() {
+            let p = rgba.pixels().find(|p| p.0 == [255, 0, 0, 255]).map(|p| p.0);
+            assert_eq!(p, Some([255, 0, 0, 255]));
+        }
+
+        // Empty color defaults to opaque white.
+        let white =
+            tokio_test::block_on(BackgroundProcess::new("").process(new_process_image())).unwrap();
+        assert!(white.di.as_rgba8().unwrap().pixels().all(|p| p.0[3] == 255));
+    }
+
+    #[test]
+    fn test_build_stretch_lut() {
+        // Maps [50, 200] onto [0, 255].
+        let lut = super::build_stretch_lut(50.0, 200.0);
+        assert_eq!(lut[50], 0);
+        assert_eq!(lut[200], 255);
+        assert_eq!(lut[125], 128); // (125-50)*255/150 = 127.5 → 128
+        assert_eq!(lut[0], 0); // clamps below
+        assert_eq!(lut[255], 255); // clamps above
+                                   // Degenerate range is an identity map (no-op).
+        let id = super::build_stretch_lut(10.0, 10.0);
+        assert_eq!(id[0], 0);
+        assert_eq!(id[123], 123);
+        assert_eq!(id[255], 255);
+    }
+
+    #[test]
+    fn test_normalize_process() {
+        // Dimensions are preserved in both modes.
+        let rgb =
+            tokio_test::block_on(NormalizeProcess::new(true).process(new_process_image())).unwrap();
+        assert_eq!(rgb.di.width(), 144);
+        assert_eq!(rgb.di.height(), 144);
+
+        let luma = tokio_test::block_on(NormalizeProcess::new(false).process(new_process_image()))
+            .unwrap();
+        assert_eq!(luma.di.width(), 144);
+        assert_eq!(luma.di.height(), 144);
+    }
+
+    #[test]
+    fn test_trim_process() {
+        // Pad the logo with a transparent border (200×200), then trim it back off.
+        let padded = tokio_test::block_on(
+            PaddingProcess::new(200, 200, "#00000000").process(new_process_image()),
+        )
+        .unwrap();
+        assert_eq!(padded.di.width(), 200);
+        assert_eq!(padded.di.height(), 200);
+
+        let trimmed = tokio_test::block_on(TrimProcess::new(0).process(padded)).unwrap();
+        // The transparent border is removed, shrinking the canvas below 200 on both axes.
+        assert!(trimmed.di.width() < 200);
+        assert!(trimmed.di.height() < 200);
+        assert!(trimmed.di.width() > 0 && trimmed.di.height() > 0);
     }
 
     #[test]
@@ -2063,6 +2579,48 @@ mod tests {
                 .unwrap();
         assert_eq!(result.di.width(), 144);
         assert_eq!(result.di.height(), 144);
+    }
+
+    #[test]
+    fn test_smart_crop_offset() {
+        use image::{DynamicImage, Rgba, RgbaImage};
+
+        // 100×40, flat black except high-frequency stripes in x ∈ [70, 90).
+        let mut img = RgbaImage::from_pixel(100, 40, Rgba([0, 0, 0, 255]));
+        for y in 0..40 {
+            for x in 70..90 {
+                let v = if x % 2 == 0 { 255 } else { 0 };
+                img.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        let di = DynamicImage::ImageRgba8(img);
+
+        // Crop 40×40: horizontal slack 60, vertical slack 0. The window should slide
+        // right toward the stripes rather than centering (center offset would be 30).
+        let (cx, cy) = super::smart_crop_offset(&di, 40, 40);
+        assert_eq!(cy, 0);
+        assert!(
+            cx > 30,
+            "expected the crop to favor the detailed right side, got {cx}"
+        );
+
+        // Flat image: no energy anywhere → fall back to the centered offset.
+        let flat =
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(100, 40, Rgba([10, 10, 10, 255])));
+        assert_eq!(super::smart_crop_offset(&flat, 40, 40), (30, 0));
+
+        // No slack on either axis → (0, 0).
+        assert_eq!(super::smart_crop_offset(&di, 100, 40), (0, 0));
+    }
+
+    #[test]
+    fn test_smart_thumbnail_process() {
+        // Smart mode preserves the exact target dimensions, like the centered variant.
+        let result =
+            tokio_test::block_on(ThumbnailProcess::new_smart(144, 72).process(new_process_image()))
+                .unwrap();
+        assert_eq!(result.di.width(), 144);
+        assert_eq!(result.di.height(), 72);
     }
 
     #[test]

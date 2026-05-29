@@ -71,6 +71,10 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--strip-exif` | false | Strip EXIF metadata (including GPS) from output files without re-encoding |
 | `--avif-speed <N>` | 4 | AVIF encoder speed (0 = slowest/best quality, 10 = fastest/lower quality) |
 | `--incremental` | false | Skip images whose every output file is already newer than the source; only applies with `--output` |
+| `--no-diff` | false | Skip the DSSIM diff metric; avoids re-decoding AVIF/JXL output just to score it (DIFF column shows `—`) |
+| `--widths <W1,W2,...>` | — | Generate one output per width for responsive `srcset` (e.g. `320,640,1280`). Widths ≥ the source width are skipped (no upscaling); `--resize` is ignored when set |
+| `--srcset-pattern <PAT>` | `{name}-{w}w.{ext}` | Filename pattern for width variants (`{name}` = stem, `{w}` = width, `{ext}` = extension) |
+| `--emit-html` | false | Print a ready-to-paste `<source srcset>` snippet per source (with `--widths`) |
 
 ### Examples
 
@@ -138,6 +142,22 @@ imageoptimize /path/to/source --output /path/to/output --resize 1920x1080
 ```
 
 Use `0` to leave one dimension unconstrained (e.g. `--resize 1920x0` limits width only).
+
+**Responsive images (srcset)** — generate multiple widths per source, each in every output format, and print the HTML snippet:
+
+```bash
+imageoptimize /path/to/source --output /path/to/output --widths 320,640,1280 --emit-html
+```
+
+Produces e.g. `photo-320w.avif`, `photo-640w.avif`, … (widths larger than the source are skipped). The `--emit-html` snippet is ready to drop into a `<picture>` element:
+
+```html
+<picture>
+  <source type="image/avif" srcset="photo-320w.avif 320w, photo-640w.avif 640w, photo-1280w.avif 1280w">
+  <source type="image/webp" srcset="photo-320w.webp 320w, photo-640w.webp 640w, photo-1280w.webp 1280w">
+  <img src="photo-1280w.jpeg" sizes="(max-width: 640px) 100vw, 640px" alt="">
+</picture>
+```
 
 ### Output
 
@@ -209,9 +229,13 @@ let bytes = result.get_buffer()?;
 | `hue` | `new_hue_task(shift)` | integer degrees, wraps around (e.g. `90`, `-45`) | Rotate hue of every pixel |
 | `saturate` | `new_saturate_task(factor)` | float (0.0 = grayscale, 1.0 = unchanged, >1.0 = boost) | Scale saturation of every pixel |
 | `thumbnail` | `new_thumbnail_task(w, h)` | width, height | Scale to cover `w×h` (fill mode) then center-crop; unlike `fit` this never letterboxes |
+| `thumbnail` (smart) | `new_smart_thumbnail_task(w, h)` | width, height | Like `thumbnail`, but content-aware: the crop slides to the highest-detail region (luminance-gradient energy + center bias) instead of centering |
 | `invert` | `new_invert_task()` | — | Invert RGB channels; alpha is preserved |
 | `opacity` | `new_opacity_task(factor)` | float (0.0 = transparent, 1.0 = unchanged) | Multiply every pixel's alpha by factor |
 | `gamma` | `new_gamma_task(gamma)` | float (1.0 = unchanged, <1.0 = brighten, >1.0 = darken) | Gamma correction: `output = (input/255)^gamma × 255`; alpha unaffected |
+| `background` | `new_background_task(color)` | hex color (`#rrggbb` / `#rrggbbaa`, empty = opaque white) | Flatten transparency by compositing over a solid background; use before encoding to JPEG/JXL so transparent areas don't turn black |
+| `normalize` | `new_normalize_task(per_channel)` | bool (`true` = per-channel RGB, `false` = luminance) | Auto-contrast: stretch the histogram to the full 0–255 range |
+| `trim` | `new_trim_task(tolerance)` | tolerance 0–255 (max per-channel RGBA difference from the top-left reference color) | Auto-crop a uniform border |
 | `strip` | `new_strip_task()` | — | Strip EXIF metadata from the encoded buffer without re-encoding (JPEG, PNG, WebP) |
 | `padding` | `new_padding_task(w, h, color)` | width, height, hex color (`#rrggbb` / `#rrggbbaa`, default transparent) | Extend canvas, center image |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url, position, margin-left, margin-top | Overlay watermark |
