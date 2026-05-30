@@ -8,7 +8,7 @@ use fast_image_resize::{FilterType as FirFilter, PixelType, ResizeAlg, ResizeOpt
 use image::imageops::{
     crop, flip_horizontal, flip_vertical, overlay, rotate180, rotate270, rotate90,
 };
-use image::{load, DynamicImage, ImageFormat, RgbaImage};
+use image::{load, DynamicImage, ImageFormat, RgbImage, RgbaImage};
 use img_parts::ImageEXIF;
 use rayon::prelude::*;
 use rgb::FromSlice;
@@ -646,6 +646,122 @@ fn fir_resize(src: RgbaImage, dst_w: u32, dst_h: u32, filter: FirFilter) -> Rgba
         .expect("fir output buffer matches dimensions")
 }
 
+/// Layout-preserving SIMD resize: an RGB8 image stays RGB8 (no alpha channel
+/// materialised), RGBA8 stays RGBA8 (alpha premultiplied during scaling), and any other
+/// variant is normalised to RGBA8.
+fn fir_resize_dynamic(di: DynamicImage, dst_w: u32, dst_h: u32, filter: FirFilter) -> DynamicImage {
+    match di {
+        DynamicImage::ImageRgb8(img) => {
+            let (sw, sh) = (img.width(), img.height());
+            let src = FirImage::from_vec_u8(sw, sh, img.into_raw(), PixelType::U8x3)
+                .expect("rgb8 buffer matches U8x3 dimensions");
+            let mut dst = FirImage::new(dst_w, dst_h, PixelType::U8x3);
+            Resizer::new()
+                .resize(
+                    &src,
+                    &mut dst,
+                    &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(filter)),
+                )
+                .expect("source and destination are both U8x3");
+            DynamicImage::ImageRgb8(
+                RgbImage::from_raw(dst_w, dst_h, dst.into_vec())
+                    .expect("fir output buffer matches dimensions"),
+            )
+        }
+        DynamicImage::ImageRgba8(img) => {
+            DynamicImage::ImageRgba8(fir_resize(img, dst_w, dst_h, filter))
+        }
+        other => DynamicImage::ImageRgba8(fir_resize(other.into_rgba8(), dst_w, dst_h, filter)),
+    }
+}
+
+/// Apply an in-place per-pixel RGB transform, preserving the image's channel layout:
+/// RGB8 stays RGB8, RGBA8 keeps its (untouched) alpha, and other variants normalise to
+/// RGBA8. The closure always receives the 3 RGB bytes, so fully opaque images avoid
+/// carrying — and iterating over — a 4th channel.
+fn map_rgb(di: DynamicImage, f: impl Fn(&mut [u8]) + Sync) -> DynamicImage {
+    match di {
+        DynamicImage::ImageRgb8(mut img) => {
+            img.as_flat_samples_mut()
+                .as_mut_slice()
+                .par_chunks_mut(3)
+                .for_each(&f);
+            DynamicImage::ImageRgb8(img)
+        }
+        DynamicImage::ImageRgba8(mut img) => {
+            img.as_flat_samples_mut()
+                .as_mut_slice()
+                .par_chunks_mut(4)
+                .for_each(|p| f(&mut p[..3]));
+            DynamicImage::ImageRgba8(img)
+        }
+        other => {
+            let mut img = other.into_rgba8();
+            img.as_flat_samples_mut()
+                .as_mut_slice()
+                .par_chunks_mut(4)
+                .for_each(|p| f(&mut p[..3]));
+            DynamicImage::ImageRgba8(img)
+        }
+    }
+}
+
+/// Borrow the raw pixel bytes and per-pixel stride (3 for RGB8, 4 for RGBA8) without
+/// copying. Returns `None` for variants that are neither RGB8 nor RGBA8.
+fn pixel_bytes(di: &DynamicImage) -> Option<(&[u8], usize)> {
+    match di {
+        DynamicImage::ImageRgb8(img) => Some((img.as_raw(), 3)),
+        DynamicImage::ImageRgba8(img) => Some((img.as_raw(), 4)),
+        _ => None,
+    }
+}
+
+/// Per-channel (R, G, B) min/max over pixels that are not fully transparent. With `stride`
+/// 3 (RGB) every pixel counts; with `stride` 4 (RGBA) pixels with alpha 0 are skipped.
+fn channel_extents(bytes: &[u8], stride: usize) -> ([u8; 3], [u8; 3]) {
+    bytes
+        .par_chunks(stride)
+        .filter(|p| stride < 4 || p[3] > 0)
+        .fold(
+            || ([255u8; 3], [0u8; 3]),
+            |(mut mn, mut mx), p| {
+                for c in 0..3 {
+                    mn[c] = mn[c].min(p[c]);
+                    mx[c] = mx[c].max(p[c]);
+                }
+                (mn, mx)
+            },
+        )
+        .reduce(
+            || ([255u8; 3], [0u8; 3]),
+            |(mut amn, mut amx), (bmn, bmx)| {
+                for c in 0..3 {
+                    amn[c] = amn[c].min(bmn[c]);
+                    amx[c] = amx[c].max(bmx[c]);
+                }
+                (amn, amx)
+            },
+        )
+}
+
+/// Luminance min/max over pixels that are not fully transparent (see [`channel_extents`]).
+fn luma_extents(bytes: &[u8], stride: usize) -> (f32, f32) {
+    bytes
+        .par_chunks(stride)
+        .filter(|p| stride < 4 || p[3] > 0)
+        .fold(
+            || (255.0f32, 0.0f32),
+            |(mn, mx), p| {
+                let l = 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
+                (mn.min(l), mx.max(l))
+            },
+        )
+        .reduce(
+            || (255.0f32, 0.0f32),
+            |(amn, amx), (bmn, bmx)| (amn.min(bmn), amx.max(bmx)),
+        )
+}
+
 #[derive(Default, Clone)]
 pub struct ProcessImage {
     original: Option<RgbaImage>,
@@ -910,14 +1026,13 @@ impl Process for ResizeProcess {
             (w, h)
         };
 
-        let result = fir_resize(
-            std::mem::take(&mut img.di).into_rgba8(),
+        img.di = fir_resize_dynamic(
+            std::mem::take(&mut img.di),
             new_w,
             new_h,
             FirFilter::Lanczos3,
         );
         img.buffer.clear();
-        img.di = DynamicImage::ImageRgba8(result);
         Ok(img)
     }
 }
@@ -935,19 +1050,12 @@ impl GrayProcess {
 impl Process for GrayProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
-        let di = std::mem::take(&mut img.di);
-        let mut rgba = di.into_rgba8();
-        rgba.as_flat_samples_mut()
-            .as_mut_slice()
-            .par_chunks_mut(4)
-            .for_each(|p| {
-                let luma =
-                    (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32) as u8;
-                p[0] = luma;
-                p[1] = luma;
-                p[2] = luma;
-            });
-        img.di = DynamicImage::ImageRgba8(rgba);
+        img.di = map_rgb(std::mem::take(&mut img.di), |p| {
+            let luma = (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32) as u8;
+            p[0] = luma;
+            p[1] = luma;
+            p[2] = luma;
+        });
         img.buffer.clear();
         Ok(img)
     }
@@ -1018,17 +1126,11 @@ impl Process for BrightenProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
         let value = self.value;
-        let di = std::mem::take(&mut img.di);
-        let mut rgba = di.into_rgba8();
-        rgba.as_flat_samples_mut()
-            .as_mut_slice()
-            .par_chunks_mut(4)
-            .for_each(|p| {
-                p[0] = (p[0] as i32 + value).clamp(0, 255) as u8;
-                p[1] = (p[1] as i32 + value).clamp(0, 255) as u8;
-                p[2] = (p[2] as i32 + value).clamp(0, 255) as u8;
-            });
-        img.di = DynamicImage::ImageRgba8(rgba);
+        img.di = map_rgb(std::mem::take(&mut img.di), |p| {
+            p[0] = (p[0] as i32 + value).clamp(0, 255) as u8;
+            p[1] = (p[1] as i32 + value).clamp(0, 255) as u8;
+            p[2] = (p[2] as i32 + value).clamp(0, 255) as u8;
+        });
         img.buffer.clear();
         Ok(img)
     }
@@ -1048,17 +1150,11 @@ impl Process for ContrastProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
         let factor = (128.0 + self.value) / 128.0;
-        let di = std::mem::take(&mut img.di);
-        let mut rgba = di.into_rgba8();
-        rgba.as_flat_samples_mut()
-            .as_mut_slice()
-            .par_chunks_mut(4)
-            .for_each(|p| {
-                p[0] = ((p[0] as f32 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
-                p[1] = ((p[1] as f32 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
-                p[2] = ((p[2] as f32 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
-            });
-        img.di = DynamicImage::ImageRgba8(rgba);
+        img.di = map_rgb(std::mem::take(&mut img.di), |p| {
+            p[0] = ((p[0] as f32 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
+            p[1] = ((p[1] as f32 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
+            p[2] = ((p[2] as f32 - 128.0) * factor + 128.0).clamp(0.0, 255.0) as u8;
+        });
         img.buffer.clear();
         Ok(img)
     }
@@ -1286,20 +1382,14 @@ impl HueProcess {
 impl Process for HueProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
-        let di = std::mem::take(&mut img.di);
-        let mut rgba = di.into_rgba8();
         let shift = self.shift as f32;
-        rgba.as_flat_samples_mut()
-            .as_mut_slice()
-            .par_chunks_mut(4)
-            .for_each(|p| {
-                let (h, s, v) = rgb_to_hsv(p[0], p[1], p[2]);
-                let (nr, ng, nb) = hsv_to_rgb(h + shift, s, v);
-                p[0] = nr;
-                p[1] = ng;
-                p[2] = nb;
-            });
-        img.di = DynamicImage::ImageRgba8(rgba);
+        img.di = map_rgb(std::mem::take(&mut img.di), |p| {
+            let (h, s, v) = rgb_to_hsv(p[0], p[1], p[2]);
+            let (nr, ng, nb) = hsv_to_rgb(h + shift, s, v);
+            p[0] = nr;
+            p[1] = ng;
+            p[2] = nb;
+        });
         img.buffer.clear();
         Ok(img)
     }
@@ -1318,22 +1408,16 @@ impl SaturateProcess {
 impl Process for SaturateProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
-        let di = std::mem::take(&mut img.di);
-        let mut rgba = di.into_rgba8();
         let factor = self.factor.max(0.0);
-        rgba.as_flat_samples_mut()
-            .as_mut_slice()
-            .par_chunks_mut(4)
-            .for_each(|p| {
-                let rf = p[0] as f32;
-                let gf = p[1] as f32;
-                let bf = p[2] as f32;
-                let luma = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
-                p[0] = (luma + factor * (rf - luma)).clamp(0.0, 255.0) as u8;
-                p[1] = (luma + factor * (gf - luma)).clamp(0.0, 255.0) as u8;
-                p[2] = (luma + factor * (bf - luma)).clamp(0.0, 255.0) as u8;
-            });
-        img.di = DynamicImage::ImageRgba8(rgba);
+        img.di = map_rgb(std::mem::take(&mut img.di), |p| {
+            let rf = p[0] as f32;
+            let gf = p[1] as f32;
+            let bf = p[2] as f32;
+            let luma = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
+            p[0] = (luma + factor * (rf - luma)).clamp(0.0, 255.0) as u8;
+            p[1] = (luma + factor * (gf - luma)).clamp(0.0, 255.0) as u8;
+            p[2] = (luma + factor * (bf - luma)).clamp(0.0, 255.0) as u8;
+        });
         img.buffer.clear();
         Ok(img)
     }
@@ -1535,17 +1619,11 @@ impl InvertProcess {
 impl Process for InvertProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
-        let di = std::mem::take(&mut img.di);
-        let mut rgba = di.into_rgba8();
-        rgba.as_flat_samples_mut()
-            .as_mut_slice()
-            .par_chunks_mut(4)
-            .for_each(|p| {
-                p[0] = 255 - p[0];
-                p[1] = 255 - p[1];
-                p[2] = 255 - p[2];
-            });
-        img.di = DynamicImage::ImageRgba8(rgba);
+        img.di = map_rgb(std::mem::take(&mut img.di), |p| {
+            p[0] = 255 - p[0];
+            p[1] = 255 - p[1];
+            p[2] = 255 - p[2];
+        });
         img.buffer.clear();
         Ok(img)
     }
@@ -1603,17 +1681,11 @@ impl Process for GammaProcess {
                 .round()
                 .clamp(0.0, 255.0) as u8;
         }
-        let di = std::mem::take(&mut img.di);
-        let mut rgba = di.into_rgba8();
-        rgba.as_flat_samples_mut()
-            .as_mut_slice()
-            .par_chunks_mut(4)
-            .for_each(|p| {
-                p[0] = lut[p[0] as usize];
-                p[1] = lut[p[1] as usize];
-                p[2] = lut[p[2] as usize];
-            });
-        img.di = DynamicImage::ImageRgba8(rgba);
+        img.di = map_rgb(std::mem::take(&mut img.di), |p| {
+            p[0] = lut[p[0] as usize];
+            p[1] = lut[p[1] as usize];
+            p[2] = lut[p[2] as usize];
+        });
         img.buffer.clear();
         Ok(img)
     }
@@ -1723,71 +1795,34 @@ impl NormalizeProcess {
 impl Process for NormalizeProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
-        let di = std::mem::take(&mut img.di);
-        let mut rgba = di.into_rgba8();
+        let mut di = std::mem::take(&mut img.di);
+        // Read directly from RGB8/RGBA8; rare other variants normalise to RGBA8 first.
+        if pixel_bytes(&di).is_none() {
+            di = DynamicImage::ImageRgba8(di.into_rgba8());
+        }
+        let (bytes, stride) = pixel_bytes(&di).expect("normalised to RGB8 or RGBA8 above");
 
         // Pass 1: measure the input range from opaque pixels only, so transparent
         // padding (often RGB 0) doesn't drag the range down. Build per-channel LUTs.
         let luts: [[u8; 256]; 3] = if self.per_channel {
-            let (mins, maxs) = rgba
-                .as_raw()
-                .par_chunks(4)
-                .filter(|p| p[3] > 0)
-                .fold(
-                    || ([255u8; 3], [0u8; 3]),
-                    |(mut mn, mut mx), p| {
-                        for c in 0..3 {
-                            mn[c] = mn[c].min(p[c]);
-                            mx[c] = mx[c].max(p[c]);
-                        }
-                        (mn, mx)
-                    },
-                )
-                .reduce(
-                    || ([255u8; 3], [0u8; 3]),
-                    |(mut amn, mut amx), (bmn, bmx)| {
-                        for c in 0..3 {
-                            amn[c] = amn[c].min(bmn[c]);
-                            amx[c] = amx[c].max(bmx[c]);
-                        }
-                        (amn, amx)
-                    },
-                );
+            let (mins, maxs) = channel_extents(bytes, stride);
             [
                 build_stretch_lut(mins[0] as f32, maxs[0] as f32),
                 build_stretch_lut(mins[1] as f32, maxs[1] as f32),
                 build_stretch_lut(mins[2] as f32, maxs[2] as f32),
             ]
         } else {
-            let (lo, hi) = rgba
-                .as_raw()
-                .par_chunks(4)
-                .filter(|p| p[3] > 0)
-                .fold(
-                    || (255.0f32, 0.0f32),
-                    |(mn, mx), p| {
-                        let l = 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
-                        (mn.min(l), mx.max(l))
-                    },
-                )
-                .reduce(
-                    || (255.0f32, 0.0f32),
-                    |(amn, amx), (bmn, bmx)| (amn.min(bmn), amx.max(bmx)),
-                );
+            let (lo, hi) = luma_extents(bytes, stride);
             let lut = build_stretch_lut(lo, hi);
             [lut, lut, lut]
         };
 
-        // Pass 2: apply the LUTs in parallel; alpha is untouched.
-        rgba.as_flat_samples_mut()
-            .as_mut_slice()
-            .par_chunks_mut(4)
-            .for_each(|p| {
-                p[0] = luts[0][p[0] as usize];
-                p[1] = luts[1][p[1] as usize];
-                p[2] = luts[2][p[2] as usize];
-            });
-        img.di = DynamicImage::ImageRgba8(rgba);
+        // Pass 2: apply the LUTs in parallel, preserving the channel layout; alpha untouched.
+        img.di = map_rgb(di, |p| {
+            p[0] = luts[0][p[0] as usize];
+            p[1] = luts[1][p[1] as usize];
+            p[2] = luts[2][p[2] as usize];
+        });
         img.buffer.clear();
         Ok(img)
     }
@@ -3181,5 +3216,46 @@ mod tests {
         // None within target → lowest diff (best fidelity) wins.
         let win = pick_candidate(vec![mk("webp", 50, 5.0), mk("avif", 200, 2.0)], 1.0);
         assert_eq!(win.ext, "avif");
+    }
+
+    #[test]
+    fn test_opaque_rgb_fast_path() {
+        use image::DynamicImage;
+        // A fully opaque RGB8 image stays RGB8 through point ops and resize — no alpha
+        // channel is materialised, so the buffer stays 25% smaller.
+        let rgb = || {
+            let img = image::RgbImage::from_fn(6, 4, |x, y| {
+                image::Rgb([(x * 40) as u8, (y * 50) as u8, 90])
+            });
+            ProcessImage {
+                di: DynamicImage::ImageRgb8(img),
+                ..Default::default()
+            }
+        };
+        let is_rgb = |pi: &ProcessImage| matches!(pi.di, DynamicImage::ImageRgb8(_));
+
+        assert!(is_rgb(
+            &tokio_test::block_on(BrightenProcess::new(20).process(rgb())).unwrap()
+        ));
+        assert!(is_rgb(
+            &tokio_test::block_on(GrayProcess::new().process(rgb())).unwrap()
+        ));
+        assert!(is_rgb(
+            &tokio_test::block_on(GammaProcess::new(1.5).process(rgb())).unwrap()
+        ));
+        assert!(is_rgb(
+            &tokio_test::block_on(InvertProcess::new().process(rgb())).unwrap()
+        ));
+        assert!(is_rgb(
+            &tokio_test::block_on(NormalizeProcess::new(true).process(rgb())).unwrap()
+        ));
+        let resized = tokio_test::block_on(ResizeProcess::new(3, 2).process(rgb())).unwrap();
+        assert!(is_rgb(&resized));
+        assert_eq!((resized.di.width(), resized.di.height()), (3, 2));
+
+        // An image with transparency keeps its alpha channel (rust-logo is RGBA8).
+        let out =
+            tokio_test::block_on(BrightenProcess::new(20).process(new_process_image())).unwrap();
+        assert!(matches!(out.di, DynamicImage::ImageRgba8(_)));
     }
 }
