@@ -72,9 +72,11 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--avif-speed <N>` | 4 | AVIF encoder speed (0 = slowest/best quality, 10 = fastest/lower quality) |
 | `--incremental` | false | Skip images whose every output file is already newer than the source; only applies with `--output` |
 | `--no-diff` | false | Skip the DSSIM diff metric; avoids re-decoding AVIF/JXL output just to score it (DIFF column shows `—`) |
-| `--widths <W1,W2,...>` | — | Generate one output per width for responsive `srcset` (e.g. `320,640,1280`). Widths ≥ the source width are skipped (no upscaling); `--resize` is ignored when set |
-| `--srcset-pattern <PAT>` | `{name}-{w}w.{ext}` | Filename pattern for width variants (`{name}` = stem, `{w}` = width, `{ext}` = extension) |
-| `--emit-html` | false | Print a ready-to-paste `<source srcset>` snippet per source (with `--widths`) |
+| `--widths <W1,W2,...>` | — | Generate one output per width for responsive `srcset` `Nw` descriptors (fluid images), e.g. `320,640,1280`. Widths ≥ the source width are skipped (no upscaling); `--resize` is ignored when set. Mutually exclusive with `--densities` |
+| `--densities <D1,D2,...>` | — | Generate one output per pixel density for `srcset` `Nx` descriptors (fixed-size images), e.g. `1,2,3`. Requires `--base-width`; each output is base-width × density pixels. Densities whose width ≥ the source are skipped. Mutually exclusive with `--widths` |
+| `--base-width <W>` | — | The 1× display width (CSS px) for `--densities`; outputs are base-width × density |
+| `--srcset-pattern <PAT>` | `{name}-{w}w.{ext}` / `{name}@{x}x.{ext}` | Filename pattern for variants (`{name}` = stem, `{w}` = pixel width, `{x}` = density, `{ext}` = extension). Default is width- or density-appropriate |
+| `--emit-html` | false | Print a ready-to-paste `<source srcset>` snippet per source (with `--widths` or `--densities`) |
 | `--auto-quality` | false | Auto-tune quality per output: binary-search the lowest quality whose perceptual diff stays within `--target-diff`. Overrides the per-format quality flags |
 | `--auto-format` | false | Auto-pick the output format: encode each source once as the smallest of webp/avif plus a lossless fallback (png if it has transparency, else jpeg), each quality-tuned to `--target-diff`. One output per source; ignores `--convert`, and is ignored under `--widths` |
 | `--target-diff <N>` | 1.0 | Perceptual-diff target (DSSIM ×1000) for `--auto-quality` / `--auto-format`; lower = higher fidelity, `1.0` ≈ visually lossless |
@@ -159,6 +161,22 @@ Produces e.g. `photo-320w.avif`, `photo-640w.avif`, … (widths larger than the 
   <source type="image/avif" srcset="photo-320w.avif 320w, photo-640w.avif 640w, photo-1280w.avif 1280w">
   <source type="image/webp" srcset="photo-320w.webp 320w, photo-640w.webp 640w, photo-1280w.webp 1280w">
   <img src="photo-1280w.jpeg" sizes="(max-width: 640px) 100vw, 640px" alt="">
+</picture>
+```
+
+**Fixed-size images (density `Nx`)** — for images shown at a fixed CSS size (icons, avatars, logos), use density descriptors instead. Give the 1× display width and the densities to generate:
+
+```bash
+imageoptimize /path/to/source --output /path/to/output --densities 1,2,3 --base-width 320 --emit-html
+```
+
+Produces `photo@1x` (320px), `photo@2x` (640px), `photo@3x` (960px) per format (densities whose width exceeds the source are skipped). The snippet uses `Nx` descriptors and needs no `sizes`:
+
+```html
+<picture>
+  <source type="image/avif" srcset="photo@1x.avif 1x, photo@2x.avif 2x, photo@3x.avif 3x">
+  <source type="image/webp" srcset="photo@1x.webp 1x, photo@2x.webp 2x, photo@3x.webp 3x">
+  <img src="photo@1x.jpeg" alt="">
 </picture>
 ```
 

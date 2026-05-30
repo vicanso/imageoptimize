@@ -71,9 +71,11 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--avif-speed <N>` | 4 | AVIF 编码速度（0 = 最慢/最佳质量，10 = 最快/较低质量） |
 | `--incremental` | false | 跳过所有输出文件均比源文件新的图片（仅适用于 `--output` 模式） |
 | `--no-diff` | false | 跳过 DSSIM 评分；避免为算分而二次解码 AVIF/JXL（DIFF 列显示 `—`） |
-| `--widths <W1,W2,...>` | — | 为响应式 `srcset` 按宽度各生成一份输出（如 `320,640,1280`）。宽度 ≥ 源宽的会被跳过（不放大）；设置后忽略 `--resize` |
-| `--srcset-pattern <PAT>` | `{name}-{w}w.{ext}` | 宽度变体的文件名模板（`{name}` = 主名，`{w}` = 宽度，`{ext}` = 扩展名） |
-| `--emit-html` | false | 为每个源图打印可直接粘贴的 `<source srcset>` 片段（需配合 `--widths`） |
+| `--widths <W1,W2,...>` | — | 按宽度生成响应式 `srcset` 的 `Nw` 描述符（流式图，如 `320,640,1280`）。宽度 ≥ 源宽的会被跳过（不放大）；设置后忽略 `--resize`。与 `--densities` 互斥 |
+| `--densities <D1,D2,...>` | — | 按像素密度生成 `srcset` 的 `Nx` 描述符（固定尺寸图，如 `1,2,3`）。需配合 `--base-width`，每份输出为 base-width × 倍率 像素；宽度 ≥ 源宽的倍率会被跳过。与 `--widths` 互斥 |
+| `--base-width <W>` | — | `--densities` 的 1× 显示宽度（CSS px），输出尺寸 = base-width × 倍率 |
+| `--srcset-pattern <PAT>` | `{name}-{w}w.{ext}` / `{name}@{x}x.{ext}` | 变体文件名模板（`{name}` = 主名，`{w}` = 像素宽度，`{x}` = 倍率，`{ext}` = 扩展名）。默认按宽度/密度模式自动选择 |
+| `--emit-html` | false | 为每个源图打印可直接粘贴的 `<source srcset>` 片段（需配合 `--widths` 或 `--densities`） |
 | `--auto-quality` | false | 按输出自动调质量：二分搜索使感知差异保持在 `--target-diff` 内的最低质量；会覆盖各格式的质量参数 |
 | `--auto-format` | false | 自动选格式：每个源图只输出一份，取 webp/avif 与无损兜底（含透明用 png，否则 jpeg）中体积最小者，各候选按 `--target-diff` 调质量；忽略 `--convert`，在 `--widths` 下不生效 |
 | `--target-diff <N>` | 1.0 | `--auto-quality` / `--auto-format` 的感知差异目标（DSSIM ×1000），越小保真度越高，`1.0` 约为视觉无损 |
@@ -158,6 +160,22 @@ imageoptimize /path/to/source --output /path/to/output --widths 320,640,1280 --e
   <source type="image/avif" srcset="photo-320w.avif 320w, photo-640w.avif 640w, photo-1280w.avif 1280w">
   <source type="image/webp" srcset="photo-320w.webp 320w, photo-640w.webp 640w, photo-1280w.webp 1280w">
   <img src="photo-1280w.jpeg" sizes="(max-width: 640px) 100vw, 640px" alt="">
+</picture>
+```
+
+**固定尺寸图（密度 `Nx`）** — 对以固定 CSS 尺寸显示的图（图标、头像、logo），改用密度描述符。给出 1× 显示宽度和倍率：
+
+```bash
+imageoptimize /path/to/source --output /path/to/output --densities 1,2,3 --base-width 320 --emit-html
+```
+
+每种格式生成 `photo@1x`（320px）、`photo@2x`（640px）、`photo@3x`（960px）（宽度超过源图的倍率会被跳过）。片段使用 `Nx` 描述符，无需 `sizes`：
+
+```html
+<picture>
+  <source type="image/avif" srcset="photo@1x.avif 1x, photo@2x.avif 2x, photo@3x.avif 3x">
+  <source type="image/webp" srcset="photo@1x.webp 1x, photo@2x.webp 2x, photo@3x.webp 3x">
+  <img src="photo@1x.jpeg" alt="">
 </picture>
 ```
 

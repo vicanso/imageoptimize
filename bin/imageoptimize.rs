@@ -57,37 +57,72 @@ fn parse_resize(s: &str) -> std::result::Result<(u32, u32), String> {
     Ok((w, h))
 }
 
-fn parse_widths(s: &str) -> std::result::Result<Vec<u32>, String> {
-    let mut widths = Vec::new();
+/// Parse a comma-separated list of positive integers (`what` names the unit for errors).
+fn parse_u32_list(s: &str, what: &str, example: &str) -> std::result::Result<Vec<u32>, String> {
+    let mut out = Vec::new();
     for part in s.split(',') {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
-        let w = part
+        let v = part
             .parse::<u32>()
-            .map_err(|_| format!("invalid width '{part}'"))?;
-        if w == 0 {
-            return Err("widths must be greater than 0".to_string());
+            .map_err(|_| format!("invalid {what} '{part}'"))?;
+        if v == 0 {
+            return Err(format!("{what}s must be greater than 0"));
         }
-        widths.push(w);
+        out.push(v);
     }
-    if widths.is_empty() {
-        return Err("expected at least one width, e.g. 320,640,1280".to_string());
+    if out.is_empty() {
+        return Err(format!("expected at least one {what}, e.g. {example}"));
     }
-    widths.sort_unstable();
-    widths.dedup();
-    Ok(widths)
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
 }
 
-/// Insert the width into a target path via the pattern (`{name}`, `{w}`, `{ext}`).
-fn srcset_path(target: &str, pattern: &str, width: u32) -> String {
+/// A responsive variant: either a width descriptor (`Nw`, for fluid images) or a density
+/// descriptor (`Nx`, for fixed-display-size images). Both carry the pixel width to render.
+#[derive(Debug, Clone, Copy)]
+enum Variant {
+    Width(u32),
+    Density { px: u32, density: u32 },
+}
+
+impl Variant {
+    /// Pixel width to resize the source to.
+    fn pixel_width(&self) -> u32 {
+        match self {
+            Variant::Width(w) => *w,
+            Variant::Density { px, .. } => *px,
+        }
+    }
+    /// The srcset descriptor, e.g. `640w` or `2x`.
+    fn descriptor(&self) -> String {
+        match self {
+            Variant::Width(w) => format!("{w}w"),
+            Variant::Density { density, .. } => format!("{density}x"),
+        }
+    }
+    /// Value substituted for the `{x}` pattern token (density, or 1 for width variants).
+    fn density(&self) -> u32 {
+        match self {
+            Variant::Width(_) => 1,
+            Variant::Density { density, .. } => *density,
+        }
+    }
+}
+
+/// Insert a variant into a target path via the pattern: `{name}` = stem, `{w}` = pixel
+/// width, `{x}` = density, `{ext}` = extension.
+fn srcset_path(target: &str, pattern: &str, variant: Variant) -> String {
     let p = Path::new(target);
     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
     let name = pattern
         .replace("{name}", stem)
-        .replace("{w}", &width.to_string())
+        .replace("{w}", &variant.pixel_width().to_string())
+        .replace("{x}", &variant.density().to_string())
         .replace("{ext}", ext);
     p.with_file_name(name).to_string_lossy().into_owned()
 }
@@ -222,17 +257,32 @@ struct Args {
     #[arg(long)]
     no_diff: bool,
 
-    /// Generate one output per width for responsive images (srcset). Comma-separated,
-    /// e.g. 320,640,1280. Widths >= the source width are skipped (no upscaling).
-    /// When set, --resize is ignored.
+    /// Generate one output per width for responsive images (srcset `Nw` descriptors, for
+    /// fluid images). Comma-separated, e.g. 320,640,1280. Widths >= the source width are
+    /// skipped (no upscaling). When set, --resize is ignored. Mutually exclusive with
+    /// --densities.
     #[arg(long, value_name = "W1,W2,...")]
     widths: Option<String>,
 
-    /// Filename pattern for width variants: {name} = stem, {w} = width, {ext} = extension
-    #[arg(long, default_value = "{name}-{w}w.{ext}")]
-    srcset_pattern: String,
+    /// Generate one output per pixel density for fixed-size images (srcset `Nx`
+    /// descriptors). Comma-separated multipliers, e.g. 1,2,3. Requires --base-width; each
+    /// output is base-width × density pixels. Densities whose width >= the source are
+    /// skipped (no upscaling). Mutually exclusive with --widths.
+    #[arg(long, value_name = "D1,D2,...")]
+    densities: Option<String>,
 
-    /// Print a ready-to-paste responsive <source srcset> snippet per source (with --widths)
+    /// The 1x display width (CSS px) for --densities; outputs are base-width × density.
+    #[arg(long, value_name = "W")]
+    base_width: Option<u32>,
+
+    /// Filename pattern for variants: {name} = stem, {w} = pixel width, {x} = density,
+    /// {ext} = extension. Defaults to {name}-{w}w.{ext} (widths) or {name}@{x}x.{ext}
+    /// (densities).
+    #[arg(long)]
+    srcset_pattern: Option<String>,
+
+    /// Print a ready-to-paste responsive <source srcset> snippet per source (with --widths
+    /// or --densities)
     #[arg(long)]
     emit_html: bool,
 
@@ -479,27 +529,59 @@ async fn main() {
     let strip_exif = args.strip_exif;
     let incremental = args.incremental;
     let no_diff = args.no_diff;
-    let widths = match args.widths.as_deref() {
-        Some(s) => match parse_widths(s) {
-            Ok(w) => w,
+    if args.widths.is_some() && args.densities.is_some() {
+        println!("imageoptimize: use either --widths or --densities, not both");
+        std::process::exit(1);
+    }
+    // Build the responsive variant list from either widths (Nw) or densities × base-width (Nx).
+    let variants: Vec<Variant> = if let Some(s) = args.widths.as_deref() {
+        match parse_u32_list(s, "width", "320,640,1280") {
+            Ok(ws) => ws.into_iter().map(Variant::Width).collect(),
             Err(e) => {
                 println!("imageoptimize: --widths {e}");
                 std::process::exit(1);
             }
-        },
-        None => Vec::new(),
+        }
+    } else if let Some(s) = args.densities.as_deref() {
+        let Some(base_width) = args.base_width else {
+            println!("imageoptimize: --densities requires --base-width");
+            std::process::exit(1);
+        };
+        match parse_u32_list(s, "density", "1,2,3") {
+            Ok(ds) => ds
+                .into_iter()
+                .map(|d| Variant::Density {
+                    px: base_width.saturating_mul(d),
+                    density: d,
+                })
+                .collect(),
+            Err(e) => {
+                println!("imageoptimize: --densities {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        Vec::new()
     };
-    let srcset_mode = !widths.is_empty();
+    let srcset_mode = !variants.is_empty();
+    let density_mode = args.densities.is_some();
     // Auto-format produces one best-format output per source; it is mutually exclusive with
     // srcset (which is inherently per-format) and takes no effect there.
     let auto_format_mode = args.auto_format && !srcset_mode;
     if args.auto_format && srcset_mode {
         println!(
             "{}",
-            LightYellow.paint("--auto-format is ignored when --widths is set")
+            LightYellow.paint("--auto-format is ignored with --widths / --densities")
         );
     }
-    let srcset_pattern = args.srcset_pattern.clone();
+    // Default the filename pattern to a width- or density-appropriate template.
+    let srcset_pattern = args.srcset_pattern.clone().unwrap_or_else(|| {
+        if density_mode {
+            "{name}@{x}x.{ext}".to_string()
+        } else {
+            "{name}-{w}w.{ext}".to_string()
+        }
+    });
     let emit_html = args.emit_html;
     let min_size_bytes = args.min_size.map(|kb| kb * 1024);
     let exclude_patterns: Vec<Pattern> = args
@@ -737,11 +819,11 @@ async fn main() {
         );
     }
 
-    // One task per source file: decode once, then encode each output. `width` is set
-    // for srcset variants (None in normal mode). Each task returns all its outcomes.
+    // One task per source file: decode once, then encode each output. The variant is set
+    // for srcset/density outputs (None in normal mode). Each task returns all its outcomes.
     type TargetOutcome = (
         String,
-        Option<u32>,
+        Option<Variant>,
         u128,
         Result<(usize, usize, f64, bool, bool, Option<String>)>,
     );
@@ -765,13 +847,13 @@ async fn main() {
     for (file, targets) in grouped {
         let qualities = qualities.clone();
         let sem = semaphore.clone();
-        let widths = widths.clone();
+        let variants = variants.clone();
         let srcset_pattern = srcset_pattern.clone();
         join_set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
             let mut outcomes: Vec<TargetOutcome> = Vec::new();
 
-            if widths.is_empty() {
+            if variants.is_empty() {
                 // Normal mode: decode + resize once, encode each target format.
                 match load_base(&file, resize).await {
                     Ok(base) => {
@@ -805,11 +887,12 @@ async fn main() {
                     }
                 }
             } else {
-                // srcset mode: decode once (no resize here), then width × format.
+                // srcset / density mode: decode once (no resize here), then variant × format.
                 match load_base(&file, None).await {
                     Ok(base) => {
                         let src_w = base.get_size().0;
-                        for &w in &widths {
+                        for &variant in &variants {
+                            let w = variant.pixel_width();
                             if w >= src_w {
                                 continue; // never upscale
                             }
@@ -824,10 +907,10 @@ async fn main() {
                                 Err(e) => {
                                     let message = format!("{e}");
                                     for target in &targets {
-                                        let path = srcset_path(target, &srcset_pattern, w);
+                                        let path = srcset_path(target, &srcset_pattern, variant);
                                         outcomes.push((
                                             path,
-                                            Some(w),
+                                            Some(variant),
                                             0,
                                             Err(Error::Common {
                                                 message: message.clone(),
@@ -845,22 +928,27 @@ async fn main() {
                                 } else {
                                     resized.as_ref().unwrap().clone()
                                 };
-                                let path = srcset_path(target, &srcset_pattern, w);
+                                let path = srcset_path(target, &srcset_pattern, variant);
                                 let start = Instant::now();
                                 let res =
                                     encode_target(b, &file, &path, &qualities, variant_flags).await;
-                                outcomes.push((path, Some(w), start.elapsed().as_millis(), res));
+                                outcomes.push((
+                                    path,
+                                    Some(variant),
+                                    start.elapsed().as_millis(),
+                                    res,
+                                ));
                             }
                         }
                     }
                     Err(e) => {
                         let message = format!("{e}");
                         for target in &targets {
-                            for &w in &widths {
-                                let path = srcset_path(target, &srcset_pattern, w);
+                            for &variant in &variants {
+                                let path = srcset_path(target, &srcset_pattern, variant);
                                 outcomes.push((
                                     path,
-                                    Some(w),
+                                    Some(variant),
                                     0,
                                     Err(Error::Common {
                                         message: message.clone(),
@@ -949,8 +1037,8 @@ async fn main() {
     let mut summary_errors: usize = 0;
     let mut summary_variants: usize = 0;
     let mut summary_variant_bytes: usize = 0;
-    // For --emit-html: source file -> (relative variant path, width, ext).
-    let mut html: std::collections::BTreeMap<String, Vec<(String, u32, String)>> =
+    // For --emit-html: source file -> (relative variant path, variant, ext).
+    let mut html: std::collections::BTreeMap<String, Vec<(String, Variant, String)>> =
         std::collections::BTreeMap::new();
 
     while let Some(task) = join_set.join_next().await {
@@ -991,15 +1079,15 @@ async fn main() {
                         }
                     }
                 }
-                // srcset variant: a derivative output, tallied separately from "saved".
-                Some(w) => match &result {
+                // srcset/density variant: a derivative output, tallied separately from "saved".
+                Some(variant) => match &result {
                     Ok((size, _, _, _, _, _)) => {
                         summary_variants += 1;
                         summary_variant_bytes += size;
                         if emit_html {
                             html.entry(file.clone()).or_default().push((
                                 relative(&effective_target, &base),
-                                w,
+                                variant,
                                 tgt_ext.clone(),
                             ));
                         }
@@ -1052,16 +1140,16 @@ async fn main() {
                     "{}",
                     LightCyan.paint(format!("<!-- {} -->", relative(&file, &base)))
                 );
-                let mut by_ext: std::collections::BTreeMap<String, Vec<(String, u32)>> =
+                let mut by_ext: std::collections::BTreeMap<String, Vec<(String, Variant)>> =
                     std::collections::BTreeMap::new();
-                for (path, w, ext) in variants {
-                    by_ext.entry(ext).or_default().push((path, w));
+                for (path, variant, ext) in variants {
+                    by_ext.entry(ext).or_default().push((path, variant));
                 }
                 for (ext, mut list) in by_ext {
-                    list.sort_by_key(|(_, w)| *w);
+                    list.sort_by_key(|(_, v)| v.pixel_width());
                     let srcset = list
                         .iter()
-                        .map(|(p, w)| format!("{p} {w}w"))
+                        .map(|(p, v)| format!("{p} {}", v.descriptor()))
                         .collect::<Vec<_>>()
                         .join(", ");
                     println!("  <source type=\"image/{ext}\" srcset=\"{srcset}\">");
@@ -1098,6 +1186,66 @@ async fn main() {
                 format_size(summary_optimized),
                 LightGreen.paint(format_size(saved)),
             ))
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_u32_list, srcset_path, Variant};
+
+    #[test]
+    fn test_parse_u32_list() {
+        assert_eq!(
+            parse_u32_list("320,640,1280", "width", "320,640,1280").unwrap(),
+            vec![320, 640, 1280]
+        );
+        // trims, sorts, dedups
+        assert_eq!(
+            parse_u32_list(" 3, 1 , 2,1 ", "density", "1,2,3").unwrap(),
+            vec![1, 2, 3]
+        );
+        assert!(parse_u32_list("0", "density", "1,2,3").is_err());
+        assert!(parse_u32_list("abc", "width", "320").is_err());
+        assert!(parse_u32_list("", "width", "320").is_err());
+    }
+
+    #[test]
+    fn test_variant() {
+        let w = Variant::Width(640);
+        assert_eq!(w.pixel_width(), 640);
+        assert_eq!(w.descriptor(), "640w");
+        assert_eq!(w.density(), 1);
+
+        let d = Variant::Density { px: 96, density: 3 };
+        assert_eq!(d.pixel_width(), 96);
+        assert_eq!(d.descriptor(), "3x");
+        assert_eq!(d.density(), 3);
+    }
+
+    #[test]
+    fn test_srcset_path() {
+        // width pattern uses pixel width
+        assert_eq!(
+            srcset_path("out/photo.jpg", "{name}-{w}w.{ext}", Variant::Width(640)),
+            "out/photo-640w.jpg"
+        );
+        // density pattern uses the multiplier; {w} still resolves to the pixel width
+        assert_eq!(
+            srcset_path(
+                "out/logo.png",
+                "{name}@{x}x.{ext}",
+                Variant::Density { px: 96, density: 3 }
+            ),
+            "out/logo@3x.png"
+        );
+        assert_eq!(
+            srcset_path(
+                "out/logo.png",
+                "{name}-{w}px-{x}x.{ext}",
+                Variant::Density { px: 64, density: 2 }
+            ),
+            "out/logo-64px-2x.png"
         );
     }
 }
