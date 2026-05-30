@@ -50,6 +50,13 @@ const IMAGE_TYPE_WEBP: &str = "webp";
 const IMAGE_TYPE_JPEG: &str = "jpeg";
 const IMAGE_TYPE_JXL: &str = "jxl";
 
+/// Default perceptual-diff target (DSSIM ×1000) treated as "visually lossless".
+/// Mirrors the CLI threshold where a diff above 1.0 is highlighted as lossy.
+const AUTO_TARGET_DIFF: f64 = 1.0;
+/// Quality search bounds for auto-quality tuning.
+const AUTO_MIN_QUALITY: u8 = 30;
+const AUTO_MAX_QUALITY: u8 = 95;
+
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn get_http_client() -> &'static reqwest::Client {
@@ -109,6 +116,42 @@ pub fn new_optim_task(output_type: &str, quality: u8, speed: u8) -> Vec<String> 
         output_type.to_string(),
         quality.to_string(),
         speed.to_string(),
+    ]
+}
+
+/// Auto-quality optim task: binary-search the lowest quality whose perceptual diff stays
+/// within `target` (DSSIM ×1000). Encoded as ["optim", output_type, "auto", speed, target].
+pub fn new_auto_quality_task(output_type: &str, speed: u8, target: f64) -> Vec<String> {
+    vec![
+        PROCESS_OPTIM.to_string(),
+        output_type.to_string(),
+        "auto".to_string(),
+        speed.to_string(),
+        target.to_string(),
+    ]
+}
+
+/// Auto-format optim task: encode candidate formats at `quality` and keep the smallest
+/// one within `target`. Encoded as ["optim", "auto", quality, speed, target].
+pub fn new_auto_format_task(quality: u8, speed: u8, target: f64) -> Vec<String> {
+    vec![
+        PROCESS_OPTIM.to_string(),
+        "auto".to_string(),
+        quality.to_string(),
+        speed.to_string(),
+        target.to_string(),
+    ]
+}
+
+/// Full auto optim task: search both output format and quality for the smallest output
+/// within `target`. Encoded as ["optim", "auto", "auto", speed, target].
+pub fn new_auto_task(speed: u8, target: f64) -> Vec<String> {
+    vec![
+        PROCESS_OPTIM.to_string(),
+        "auto".to_string(),
+        "auto".to_string(),
+        speed.to_string(),
+        target.to_string(),
     ]
 }
 
@@ -314,9 +357,18 @@ pub async fn run_with_image(
         message: "params is invalid",
     };
     let needs_diff = tasks.iter().any(|t| {
-        t.first()
-            .map(|s| s.as_str() == PROCESS_DIFF)
-            .unwrap_or(false)
+        let head = t.first().map(|s| s.as_str());
+        if head == Some(PROCESS_DIFF) {
+            return true;
+        }
+        // Auto optimisation scores candidates internally, so it also needs the
+        // original RGBA snapshot kept even when no explicit diff task is present.
+        if head == Some(PROCESS_OPTIM) {
+            let auto_format = t.get(1).map(|s| s == "auto").unwrap_or(false);
+            let auto_quality = t.get(2).map(|s| s == "auto").unwrap_or(false);
+            return auto_format || auto_quality;
+        }
+        false
     });
     for params in tasks {
         if params.is_empty() {
@@ -467,12 +519,35 @@ pub async fn run_with_image(
                 // 参数不符合
                 ensure!(sub_params.len() >= 3, he);
                 let output_type = &sub_params[0];
-                let quality = sub_params[1].parse::<u8>().context(ParseIntSnafu {})?;
+                let quality_field = &sub_params[1];
                 let speed = sub_params[2].parse::<u8>().context(ParseIntSnafu {})?;
-
-                image = OptimProcess::new(output_type, quality, speed)
-                    .process(image)
-                    .await?;
+                let auto_format = output_type == "auto";
+                let auto_quality = quality_field == "auto";
+                if auto_format || auto_quality {
+                    // Optional 4th arg overrides the perceptual-diff target.
+                    let target = sub_params
+                        .get(3)
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(AUTO_TARGET_DIFF);
+                    let out = if auto_format {
+                        ""
+                    } else {
+                        output_type.as_str()
+                    };
+                    let quality = if auto_quality {
+                        None
+                    } else {
+                        Some(quality_field.parse::<u8>().context(ParseIntSnafu {})?)
+                    };
+                    image = AutoOptimProcess::new(out, quality, speed, target)
+                        .process(image)
+                        .await?;
+                } else {
+                    let quality = quality_field.parse::<u8>().context(ParseIntSnafu {})?;
+                    image = OptimProcess::new(output_type, quality, speed)
+                        .process(image)
+                        .await?;
+                }
             }
             PROCESS_CROP => {
                 // 参数不符合
@@ -620,32 +695,68 @@ impl ProcessImage {
         if !self.support_dssim() {
             return -1.0;
         }
-        // 如果宽高不一致，则不比对
-        if original.width() != self.di.width() || original.height() != self.di.height() {
-            return -1.0;
-        }
-        let width = original.width() as usize;
-        let height = original.height() as usize;
-        let attr = Dssim::new();
-        let gp1 = attr
-            .create_image_rgba(original.as_raw().as_rgba(), width, height)
-            .unwrap();
-        let tmp;
-        let current_rgba = match &self.di {
-            DynamicImage::ImageRgba8(img) => img,
-            other => {
-                tmp = other.to_rgba8();
-                &tmp
-            }
-        };
-        let gp2 = attr
-            .create_image_rgba(current_rgba.as_raw().as_rgba(), width, height)
-            .unwrap();
-        let (diff, _) = attr.compare(&gp1, gp2);
-        let value: f64 = diff.into();
-        // 放大1千倍
-        value * 1000.0
+        dssim_score(original, &self.di)
     }
+}
+
+/// Compute the DSSIM score (×1000) between an original RGBA snapshot and a candidate
+/// image. Returns -1.0 when the dimensions differ (not comparable).
+fn dssim_score(original: &RgbaImage, di: &DynamicImage) -> f64 {
+    // 如果宽高不一致，则不比对
+    if original.width() != di.width() || original.height() != di.height() {
+        return -1.0;
+    }
+    let width = original.width() as usize;
+    let height = original.height() as usize;
+    let attr = Dssim::new();
+    let gp1 = attr
+        .create_image_rgba(original.as_raw().as_rgba(), width, height)
+        .unwrap();
+    let tmp;
+    let current_rgba = match di {
+        DynamicImage::ImageRgba8(img) => img,
+        other => {
+            tmp = other.to_rgba8();
+            &tmp
+        }
+    };
+    let gp2 = attr
+        .create_image_rgba(current_rgba.as_raw().as_rgba(), width, height)
+        .unwrap();
+    let (diff, _) = attr.compare(&gp1, gp2);
+    let value: f64 = diff.into();
+    // 放大1千倍
+    value * 1000.0
+}
+
+/// Encode an `ImageInfo` to bytes for a quality-tunable format. GIF is not supported here
+/// (it has no quality knob and cannot be perceptually scored).
+fn encode_info(info: &ImageInfo, ext: &str, quality: u8, speed: u8) -> Result<Vec<u8>> {
+    let encoded = match ext {
+        IMAGE_TYPE_PNG => info.to_png(quality).context(ImagesSnafu {})?,
+        IMAGE_TYPE_AVIF => info.to_avif(quality, speed).context(ImagesSnafu {})?,
+        IMAGE_TYPE_WEBP => info.to_webp(quality).context(ImagesSnafu {})?,
+        IMAGE_TYPE_JXL => info.to_jxl(quality).context(ImagesSnafu {})?,
+        _ => info.to_mozjpeg(quality).context(ImagesSnafu {})?,
+    };
+    Ok(encoded)
+}
+
+/// Decode encoded bytes back to a `DynamicImage` so the lossy output can be scored.
+fn decode_to_di(buffer: &[u8], ext: &str) -> Result<DynamicImage> {
+    match ext {
+        IMAGE_TYPE_AVIF => avif_decode(buffer).context(ImagesSnafu {}),
+        IMAGE_TYPE_JXL => jxl_decode(buffer).context(ImagesSnafu {}),
+        _ => {
+            let format = ImageFormat::from_extension(ext).unwrap_or(ImageFormat::Jpeg);
+            load(Cursor::new(buffer), format).context(ImageSnafu {})
+        }
+    }
+}
+
+/// True when any pixel is not fully opaque (so an alpha-capable format is required).
+fn has_alpha(image: &RgbaImage) -> bool {
+    image.as_raw().par_chunks(4).any(|p| p[3] < 255)
 }
 
 #[allow(async_fn_in_trait)]
@@ -2007,14 +2118,190 @@ impl Process for OptimProcess {
     }
 }
 
+/// One encoded candidate produced during auto optimisation.
+struct Candidate {
+    ext: String,
+    buffer: Vec<u8>,
+    di: DynamicImage,
+    diff: f64,
+}
+
+/// Auto optimisation: searches output format and/or quality to meet a perceptual-diff
+/// target while minimising file size. Requires the original RGBA snapshot for scoring,
+/// so the pipeline keeps the original whenever an auto task is present.
+pub struct AutoOptimProcess {
+    /// Empty → search across candidate formats; otherwise a fixed output format.
+    output_type: String,
+    /// None → binary-search quality; Some(q) → fixed quality.
+    quality: Option<u8>,
+    speed: u8,
+    target_diff: f64,
+}
+
+impl AutoOptimProcess {
+    pub fn new(output_type: &str, quality: Option<u8>, speed: u8, target_diff: f64) -> Self {
+        Self {
+            output_type: output_type.to_string(),
+            quality,
+            speed,
+            target_diff,
+        }
+    }
+
+    /// Candidate formats: a fixed one, or alpha-aware defaults when searching formats.
+    fn candidate_formats(&self, info: &ImageInfo) -> Vec<String> {
+        if !self.output_type.is_empty() && self.output_type != "auto" {
+            return vec![self.output_type.clone()];
+        }
+        // Alpha-capable set vs photo set; WebP/AVIF lead since they usually win on size.
+        if has_alpha(&info.image) {
+            vec![
+                IMAGE_TYPE_WEBP.to_string(),
+                IMAGE_TYPE_AVIF.to_string(),
+                IMAGE_TYPE_PNG.to_string(),
+            ]
+        } else {
+            vec![
+                IMAGE_TYPE_WEBP.to_string(),
+                IMAGE_TYPE_AVIF.to_string(),
+                IMAGE_TYPE_JPEG.to_string(),
+            ]
+        }
+    }
+
+    fn encode_candidate(
+        &self,
+        info: &ImageInfo,
+        original: Option<&RgbaImage>,
+        ext: &str,
+        quality: u8,
+    ) -> Result<Candidate> {
+        let buffer = encode_info(info, ext, quality, self.speed)?;
+        let di = decode_to_di(&buffer, ext)?;
+        let diff = match original {
+            Some(o) => dssim_score(o, &di),
+            None => -1.0,
+        };
+        Ok(Candidate {
+            ext: ext.to_string(),
+            buffer,
+            di,
+            diff,
+        })
+    }
+
+    /// Binary-search the lowest quality whose diff is within the target; falls back to the
+    /// maximum quality when even that cannot meet it.
+    fn search_quality(
+        &self,
+        info: &ImageInfo,
+        original: &RgbaImage,
+        ext: &str,
+    ) -> Result<Candidate> {
+        let mut lo = AUTO_MIN_QUALITY;
+        let mut hi = AUTO_MAX_QUALITY;
+        let mut best: Option<Candidate> = None;
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let cand = self.encode_candidate(info, Some(original), ext, mid)?;
+            if cand.diff >= 0.0 && cand.diff <= self.target_diff {
+                // Meets the target — record it and try an even lower quality for a smaller file.
+                best = Some(cand);
+                if mid == AUTO_MIN_QUALITY {
+                    break;
+                }
+                hi = mid - 1;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        match best {
+            Some(c) => Ok(c),
+            None => self.encode_candidate(info, Some(original), ext, AUTO_MAX_QUALITY),
+        }
+    }
+
+    fn best_candidate(&self, info: &ImageInfo, original: Option<&RgbaImage>) -> Result<Candidate> {
+        let formats = self.candidate_formats(info);
+        let mut candidates = Vec::with_capacity(formats.len());
+        for ext in &formats {
+            let cand = match (self.quality, original) {
+                (None, Some(orig)) => self.search_quality(info, orig, ext)?,
+                // No original to score against: fall back to a single high-quality encode.
+                (None, None) => self.encode_candidate(info, None, ext, AUTO_MAX_QUALITY)?,
+                (Some(q), _) => self.encode_candidate(info, original, ext, q)?,
+            };
+            candidates.push(cand);
+        }
+        Ok(pick_candidate(candidates, self.target_diff))
+    }
+}
+
+/// Choose the winning candidate: prefer those within the diff target (smallest size wins);
+/// if none qualifies, keep the highest-fidelity result (lowest diff).
+fn pick_candidate(mut candidates: Vec<Candidate>, target: f64) -> Candidate {
+    let within: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.diff >= 0.0 && c.diff <= target)
+        .map(|(i, _)| i)
+        .collect();
+    let idx = if let Some(&i) = within.iter().min_by_key(|&&i| candidates[i].buffer.len()) {
+        i
+    } else {
+        (0..candidates.len())
+            .min_by(|&a, &b| {
+                candidates[a]
+                    .diff
+                    .partial_cmp(&candidates[b].diff)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            // candidate_formats always yields at least one format.
+            .unwrap_or(0)
+    };
+    candidates.swap_remove(idx)
+}
+
+impl Process for AutoOptimProcess {
+    async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
+        let mut img = pi;
+
+        // Move img.di into ImageInfo: zero-copy when already ImageRgba8, one conversion otherwise.
+        let di = std::mem::take(&mut img.di);
+        let info: ImageInfo = match di {
+            DynamicImage::ImageRgba8(rgba) => ImageInfo { image: rgba },
+            other => ImageInfo {
+                image: other.to_rgba8(),
+            },
+        };
+
+        let cand = {
+            let original = img.original.as_ref();
+            // Encoding/decoding/scoring is CPU-heavy; run it in a blocking context under the
+            // CLI's multi-thread runtime so other async tasks keep progressing.
+            #[cfg(feature = "bin")]
+            let c = tokio::task::block_in_place(|| self.best_candidate(&info, original))?;
+            #[cfg(not(feature = "bin"))]
+            let c = self.best_candidate(&info, original)?;
+            c
+        };
+
+        img.ext = cand.ext;
+        img.buffer = cand.buffer;
+        img.diff = cand.diff;
+        img.di = cand.di;
+        Ok(img)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundProcess, BlurProcess, BrightenProcess, ContrastProcess, CropProcess, FlipProcess,
-        GammaProcess, GrayProcess, HueProcess, InvertProcess, LoaderProcess, NormalizeProcess,
-        OpacityProcess, OptimProcess, PaddingProcess, ResizeProcess, RotateProcess,
-        SaturateProcess, SharpenProcess, StripProcess, ThumbnailProcess, TrimProcess,
-        WatermarkProcess,
+        AutoOptimProcess, BackgroundProcess, BlurProcess, BrightenProcess, ContrastProcess,
+        CropProcess, FlipProcess, GammaProcess, GrayProcess, HueProcess, InvertProcess,
+        LoaderProcess, NormalizeProcess, OpacityProcess, OptimProcess, PaddingProcess,
+        ResizeProcess, RotateProcess, SaturateProcess, SharpenProcess, StripProcess,
+        ThumbnailProcess, TrimProcess, WatermarkProcess,
     };
     use crate::image_processing::{Process, ProcessImage};
     use base64::{engine::general_purpose, Engine as _};
@@ -2794,5 +3081,74 @@ mod tests {
                 .unwrap();
         assert_eq!(result.ext, "jxl");
         assert_ne!(result.buffer.len(), 0);
+    }
+
+    #[test]
+    fn test_auto_quality_process() {
+        // Fixed format (webp), search quality to stay within a loose target.
+        let target = 10.0;
+        let result = tokio_test::block_on(
+            AutoOptimProcess::new("webp", None, 0, target).process(new_process_image()),
+        )
+        .unwrap();
+        assert_eq!(result.ext, "webp");
+        assert_ne!(result.buffer.len(), 0);
+        // Search must honour the target: the chosen output is within it (and scored).
+        assert!(result.diff >= 0.0);
+        assert!(result.diff <= target);
+
+        // A tighter target should never produce a smaller file than a looser one.
+        let loose = tokio_test::block_on(
+            AutoOptimProcess::new("webp", None, 0, 20.0).process(new_process_image()),
+        )
+        .unwrap();
+        let tight = tokio_test::block_on(
+            AutoOptimProcess::new("webp", None, 0, 0.2).process(new_process_image()),
+        )
+        .unwrap();
+        assert!(tight.buffer.len() >= loose.buffer.len());
+    }
+
+    #[test]
+    fn test_auto_format_process() {
+        // Format search at a fixed quality; loose target so every candidate qualifies and
+        // the smallest one wins. rust-logo has alpha → candidates are webp/avif/png.
+        let result = tokio_test::block_on(
+            AutoOptimProcess::new("", Some(80), 0, 1000.0).process(new_process_image()),
+        )
+        .unwrap();
+        assert!(["webp", "avif", "png"].contains(&result.ext.as_str()));
+        assert_ne!(result.buffer.len(), 0);
+        assert!(result.diff >= 0.0);
+    }
+
+    #[test]
+    fn test_auto_full_process() {
+        // Search both format and quality.
+        let target = 10.0;
+        let result = tokio_test::block_on(
+            AutoOptimProcess::new("", None, 0, target).process(new_process_image()),
+        )
+        .unwrap();
+        assert!(["webp", "avif", "png"].contains(&result.ext.as_str()));
+        assert!(result.diff >= 0.0);
+        assert!(result.diff <= target);
+    }
+
+    #[test]
+    fn test_pick_candidate() {
+        use super::{pick_candidate, Candidate};
+        let mk = |ext: &str, size: usize, diff: f64| Candidate {
+            ext: ext.to_string(),
+            buffer: vec![0u8; size],
+            di: image::DynamicImage::default(),
+            diff,
+        };
+        // Both within target → smallest size wins.
+        let win = pick_candidate(vec![mk("webp", 100, 0.5), mk("avif", 60, 0.9)], 1.0);
+        assert_eq!(win.ext, "avif");
+        // None within target → lowest diff (best fidelity) wins.
+        let win = pick_candidate(vec![mk("webp", 50, 5.0), mk("avif", 200, 2.0)], 1.0);
+        assert_eq!(win.ext, "avif");
     }
 }

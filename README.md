@@ -75,6 +75,9 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--widths <W1,W2,...>` | — | Generate one output per width for responsive `srcset` (e.g. `320,640,1280`). Widths ≥ the source width are skipped (no upscaling); `--resize` is ignored when set |
 | `--srcset-pattern <PAT>` | `{name}-{w}w.{ext}` | Filename pattern for width variants (`{name}` = stem, `{w}` = width, `{ext}` = extension) |
 | `--emit-html` | false | Print a ready-to-paste `<source srcset>` snippet per source (with `--widths`) |
+| `--auto-quality` | false | Auto-tune quality per output: binary-search the lowest quality whose perceptual diff stays within `--target-diff`. Overrides the per-format quality flags |
+| `--auto-format` | false | Auto-pick the output format: encode each source once as the smallest of webp/avif plus a lossless fallback (png if it has transparency, else jpeg), each quality-tuned to `--target-diff`. One output per source; ignores `--convert`, and is ignored under `--widths` |
+| `--target-diff <N>` | 1.0 | Perceptual-diff target (DSSIM ×1000) for `--auto-quality` / `--auto-format`; lower = higher fidelity, `1.0` ≈ visually lossless |
 
 ### Examples
 
@@ -240,6 +243,9 @@ let bytes = result.get_buffer()?;
 | `padding` | `new_padding_task(w, h, color)` | width, height, hex color (`#rrggbb` / `#rrggbbaa`, default transparent) | Extend canvas, center image |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url, position, margin-left, margin-top | Overlay watermark |
 | `optim` | `new_optim_task(fmt, quality, speed)` | format (`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`), quality 0–100, speed | Encode & compress |
+| `optim` (auto-quality) | `new_auto_quality_task(fmt, speed, target)` | format, speed, target DSSIM ×1000 | Binary-search the lowest quality whose perceptual diff stays within `target` |
+| `optim` (auto-format) | `new_auto_format_task(quality, speed, target)` | quality 0–100, speed, target DSSIM ×1000 | Encode candidate formats (alpha-aware: webp/avif/png or webp/avif/jpeg) and keep the smallest within `target` |
+| `optim` (full auto) | `new_auto_task(speed, target)` | speed, target DSSIM ×1000 | Search both format and quality for the smallest output within `target` |
 | `diff` | `new_diff_task()` | — | Compute DSSIM × 1000 score vs original; stored in `ProcessImage::diff` |
 
 **`optim` speed parameter:**

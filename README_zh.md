@@ -74,6 +74,9 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--widths <W1,W2,...>` | — | 为响应式 `srcset` 按宽度各生成一份输出（如 `320,640,1280`）。宽度 ≥ 源宽的会被跳过（不放大）；设置后忽略 `--resize` |
 | `--srcset-pattern <PAT>` | `{name}-{w}w.{ext}` | 宽度变体的文件名模板（`{name}` = 主名，`{w}` = 宽度，`{ext}` = 扩展名） |
 | `--emit-html` | false | 为每个源图打印可直接粘贴的 `<source srcset>` 片段（需配合 `--widths`） |
+| `--auto-quality` | false | 按输出自动调质量：二分搜索使感知差异保持在 `--target-diff` 内的最低质量；会覆盖各格式的质量参数 |
+| `--auto-format` | false | 自动选格式：每个源图只输出一份，取 webp/avif 与无损兜底（含透明用 png，否则 jpeg）中体积最小者，各候选按 `--target-diff` 调质量；忽略 `--convert`，在 `--widths` 下不生效 |
+| `--target-diff <N>` | 1.0 | `--auto-quality` / `--auto-format` 的感知差异目标（DSSIM ×1000），越小保真度越高，`1.0` 约为视觉无损 |
 
 ### 示例
 
@@ -239,6 +242,9 @@ let bytes = result.get_buffer()?;
 | `padding` | `new_padding_task(w, h, color)` | 宽度、高度、十六进制颜色（`#rrggbb` / `#rrggbbaa`，默认透明） | 扩展画布并居中图片 |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url、位置、左边距、上边距 | 叠加水印 |
 | `optim` | `new_optim_task(fmt, quality, speed)` | 格式（`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`）、质量 0–100、速度 | 编码并压缩 |
+| `optim`（自动质量） | `new_auto_quality_task(fmt, speed, target)` | 格式、速度、目标 DSSIM ×1000 | 二分搜索使感知差异保持在 `target` 内的最低质量 |
+| `optim`（自动格式） | `new_auto_format_task(quality, speed, target)` | 质量 0–100、速度、目标 DSSIM ×1000 | 编码多个候选格式（按是否含透明：webp/avif/png 或 webp/avif/jpeg），保留满足 `target` 的最小者 |
+| `optim`（全自动） | `new_auto_task(speed, target)` | 速度、目标 DSSIM ×1000 | 同时搜索格式与质量，取满足 `target` 的最小输出 |
 | `diff` | `new_diff_task()` | — | 计算 DSSIM × 1000 评分并存入 `ProcessImage::diff` |
 
 **`optim` speed 参数说明：**

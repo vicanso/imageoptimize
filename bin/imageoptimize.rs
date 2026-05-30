@@ -235,6 +235,22 @@ struct Args {
     /// Print a ready-to-paste responsive <source srcset> snippet per source (with --widths)
     #[arg(long)]
     emit_html: bool,
+
+    /// Auto-tune quality per output: binary-search the lowest quality whose perceptual
+    /// diff stays within --target-diff. Ignores the per-format quality flags.
+    #[arg(long)]
+    auto_quality: bool,
+
+    /// Auto-pick the output format: encode each source once as the smallest of webp/avif
+    /// plus a lossless fallback (png for images with transparency, otherwise jpeg), each
+    /// quality-tuned to --target-diff. Produces one output per source and ignores --convert.
+    #[arg(long)]
+    auto_format: bool,
+
+    /// Perceptual-diff target (DSSIM ×1000) for --auto-quality / --auto-format. Lower =
+    /// higher fidelity. 1.0 is roughly visually lossless.
+    #[arg(long, default_value = "1.0", value_name = "N")]
+    target_diff: f64,
 }
 
 fn relative(path: &str, base: &Path) -> String {
@@ -257,6 +273,8 @@ struct ImageQualities {
     webp: u8,
     png: u8,
     jpeg: u8,
+    /// Perceptual-diff target (DSSIM ×1000) used when auto-quality is enabled.
+    target_diff: f64,
 }
 
 /// Per-encode behaviour flags. `is_variant` marks a resized srcset derivative, which
@@ -267,6 +285,12 @@ struct EncodeFlags {
     strip_exif: bool,
     no_diff: bool,
     is_variant: bool,
+    /// Search per-format quality to hit `ImageQualities::target_diff` instead of using
+    /// the fixed per-format quality.
+    auto_quality: bool,
+    /// Search both output format and quality, writing the smallest result; the output
+    /// extension is chosen by the encoder rather than the target path.
+    auto_format: bool,
 }
 
 /// Decode and EXIF-orient a source file exactly once, applying the optional resize.
@@ -298,32 +322,62 @@ async fn load_base(file: &str, resize: Option<(u32, u32)>) -> Result<ProcessImag
 }
 
 /// Encode an already-decoded `base` image to a single target format and write it out.
+/// The trailing `Option<String>` is the actual written path when it differs from `target`
+/// (auto-format chooses the output extension); `None` means `target` was used as-is.
 async fn encode_target(
     base: ProcessImage,
     file: &str,
     target: &str,
     qualities: &ImageQualities,
     flags: EncodeFlags,
-) -> Result<(usize, usize, f64, bool, bool)> {
-    let output_type = target.split('.').next_back().unwrap_or_default();
-    let quality = match output_type {
-        "avif" => qualities.avif,
-        "webp" => qualities.webp,
-        "png" => qualities.png,
-        _ => qualities.jpeg,
-    };
-    let speed = if output_type == "avif" {
-        qualities.avif_speed
+) -> Result<(usize, usize, f64, bool, bool, Option<String>)> {
+    let placeholder_type = target.split('.').next_back().unwrap_or_default();
+
+    // Build the optim task:
+    //  - auto-format: search both format and quality (the encoder picks the extension);
+    //  - auto-quality: search quality for the fixed target format;
+    //  - otherwise: fixed format + fixed quality.
+    let optim = if flags.auto_format {
+        vec![
+            "optim".to_string(),
+            "auto".to_string(),
+            "auto".to_string(),
+            qualities.avif_speed.to_string(),
+            qualities.target_diff.to_string(),
+        ]
     } else {
-        0
+        let quality = match placeholder_type {
+            "avif" => qualities.avif,
+            "webp" => qualities.webp,
+            "png" => qualities.png,
+            _ => qualities.jpeg,
+        };
+        let speed = if placeholder_type == "avif" {
+            qualities.avif_speed
+        } else {
+            0
+        };
+        if flags.auto_quality {
+            vec![
+                "optim".to_string(),
+                placeholder_type.to_string(),
+                "auto".to_string(),
+                speed.to_string(),
+                qualities.target_diff.to_string(),
+            ]
+        } else {
+            vec![
+                "optim".to_string(),
+                placeholder_type.to_string(),
+                quality.to_string(),
+                speed.to_string(),
+            ]
+        }
     };
-    let mut tasks = vec![vec![
-        "optim".to_string(),
-        output_type.to_string(),
-        quality.to_string(),
-        speed.to_string(),
-    ]];
-    if !flags.no_diff {
+    let mut tasks = vec![optim];
+    // Auto modes score their chosen output internally, so a separate diff task is redundant.
+    let auto = flags.auto_quality || flags.auto_format;
+    if !flags.no_diff && !auto {
         tasks.push(vec!["diff".to_string()]);
     }
     if flags.strip_exif {
@@ -332,7 +386,24 @@ async fn encode_target(
 
     let img = run_with_image(base, tasks).await.context(OptimizeSnafu)?;
 
-    let existed = fs::try_exists(target).await.unwrap_or(false);
+    // Auto-format may pick a different extension than the placeholder target carried, so
+    // the real write path is derived from the encoder's chosen format.
+    let (write_target, out_path) = if flags.auto_format {
+        let p = Path::new(target)
+            .with_extension(&img.ext)
+            .to_string_lossy()
+            .into_owned();
+        (p.clone(), Some(p))
+    } else {
+        (target.to_string(), None)
+    };
+    let out_ext = if flags.auto_format {
+        img.ext.as_str()
+    } else {
+        placeholder_type
+    };
+
+    let existed = fs::try_exists(&write_target).await.unwrap_or(false);
     let buf = img.get_buffer().context(OptimizeSnafu)?;
     let size = buf.len();
 
@@ -342,10 +413,10 @@ async fn encode_target(
         .unwrap_or("");
     // A width variant is a distinct derivative, never a replacement for the source,
     // so it always writes its encoded output (never falls back to the original).
-    let same_format = src_ext == output_type;
+    let same_format = src_ext == out_ext;
     if !flags.is_variant && same_format && size >= img.original_size {
-        if !flags.dry_run && file != target {
-            if let Some(parent) = Path::new(target).parent() {
+        if !flags.dry_run && file != write_target {
+            if let Some(parent) = Path::new(&write_target).parent() {
                 fs::create_dir_all(parent).await.context(CreateDirSnafu)?;
             }
             let original = fs::read(file).await.context(WriteFileSnafu)?;
@@ -354,7 +425,7 @@ async fn encode_target(
             } else {
                 original
             };
-            fs::write(target, bytes_to_write)
+            fs::write(&write_target, bytes_to_write)
                 .await
                 .context(WriteFileSnafu)?;
         }
@@ -364,16 +435,19 @@ async fn encode_target(
             img.diff,
             existed,
             true,
+            out_path,
         ));
     }
 
     if !flags.dry_run {
-        if let Some(parent) = Path::new(target).parent() {
+        if let Some(parent) = Path::new(&write_target).parent() {
             fs::create_dir_all(parent).await.context(CreateDirSnafu)?;
         }
-        fs::write(target, buf).await.context(WriteFileSnafu)?;
+        fs::write(&write_target, buf)
+            .await
+            .context(WriteFileSnafu)?;
     }
-    Ok((size, img.original_size, img.diff, existed, false))
+    Ok((size, img.original_size, img.diff, existed, false, out_path))
 }
 
 #[tokio::main]
@@ -416,6 +490,15 @@ async fn main() {
         None => Vec::new(),
     };
     let srcset_mode = !widths.is_empty();
+    // Auto-format produces one best-format output per source; it is mutually exclusive with
+    // srcset (which is inherently per-format) and takes no effect there.
+    let auto_format_mode = args.auto_format && !srcset_mode;
+    if args.auto_format && srcset_mode {
+        println!(
+            "{}",
+            LightYellow.paint("--auto-format is ignored when --widths is set")
+        );
+    }
     let srcset_pattern = args.srcset_pattern.clone();
     let emit_html = args.emit_html;
     let min_size_bytes = args.min_size.map(|kb| kb * 1024);
@@ -536,10 +619,14 @@ async fn main() {
                 .to_path_buf()
             };
             let mut targets = vec![];
-            if let Some(extensions) = convert_extensions.get(image_type) {
-                for item in extensions {
-                    let new_target = target.clone().with_extension(item);
-                    targets.push(new_target);
+            // Auto-format emits a single best-format output per source, so the fixed
+            // conversion matrix is skipped — only the placeholder target is queued.
+            if !auto_format_mode {
+                if let Some(extensions) = convert_extensions.get(image_type) {
+                    for item in extensions {
+                        let new_target = target.clone().with_extension(item);
+                        targets.push(new_target);
+                    }
                 }
             }
             targets.push(target);
@@ -558,6 +645,7 @@ async fn main() {
         webp: args.webp_quality,
         png: args.png_quality,
         jpeg: args.jpeg_quality,
+        target_diff: args.target_diff,
     };
 
     let kb: usize = 1024;
@@ -655,7 +743,7 @@ async fn main() {
         String,
         Option<u32>,
         u128,
-        Result<(usize, usize, f64, bool, bool)>,
+        Result<(usize, usize, f64, bool, bool, Option<String>)>,
     );
     let concurrency = args.threads.unwrap_or_else(num_cpus::get);
     let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -664,9 +752,13 @@ async fn main() {
         strip_exif,
         no_diff,
         is_variant: false,
+        auto_quality: args.auto_quality,
+        auto_format: auto_format_mode,
     };
     let variant_flags = EncodeFlags {
         is_variant: true,
+        // srcset variants are per-format derivatives; never auto-pick their format.
+        auto_format: false,
         ..normal_flags
     };
     let mut join_set: JoinSet<(String, Vec<TargetOutcome>)> = JoinSet::new();
@@ -783,69 +875,72 @@ async fn main() {
         });
     }
 
-    let print_row = |target: &str, duration: u128, res: Result<(usize, usize, f64, bool, bool)>| {
-        match res {
-            Ok((size, original_size, diff, existed, skipped)) => {
-                if quiet {
-                    return;
-                }
-                let duration_str = if duration < 1000 {
-                    format!("{}ms", duration)
-                } else {
-                    format!("{:.1}s", duration as f64 / 1000.0)
-                };
-                if skipped {
+    let print_row =
+        |target: &str,
+         duration: u128,
+         res: Result<(usize, usize, f64, bool, bool, Option<String>)>| {
+            match res {
+                Ok((size, original_size, diff, existed, skipped, _)) => {
+                    if quiet {
+                        return;
+                    }
+                    let duration_str = if duration < 1000 {
+                        format!("{}ms", duration)
+                    } else {
+                        format!("{:.1}s", duration as f64 / 1000.0)
+                    };
+                    if skipped {
+                        println!(
+                            "{:>pct_col$}  {:>diff_col$}  {:>size_col$}  {:>dur_col$}  {} {}",
+                            LightYellow.paint("SKIP"),
+                            "",
+                            "",
+                            duration_str,
+                            relative(target, &base),
+                            LightYellow.paint("(-)"),
+                        );
+                        return;
+                    }
+                    let size_str = if size >= mb {
+                        format!("{}mb", size / mb)
+                    } else if size >= kb {
+                        format!("{}kb", size / kb)
+                    } else {
+                        format!("{}b", size)
+                    };
+                    // diff < 0 means "not computed" (--no-diff, after a resize, or GIF).
+                    let diff_inner = if diff < 0.0 {
+                        format!("{:>4}", "—")
+                    } else {
+                        let diff_num = format!("{diff:>4.2}");
+                        if diff > 1.0 {
+                            LightYellow.paint(&diff_num).to_string()
+                        } else {
+                            LightGreen.paint(&diff_num).to_string()
+                        }
+                    };
+                    let percent = size * 100 / original_size;
+                    let status = if existed {
+                        LightYellow.paint("(U)").to_string()
+                    } else {
+                        LightGreen.paint("(N)").to_string()
+                    };
                     println!(
-                        "{:>pct_col$}  {:>diff_col$}  {:>size_col$}  {:>dur_col$}  {} {}",
-                        LightYellow.paint("SKIP"),
-                        "",
-                        "",
+                        "{:>pct_col$}  ({diff_inner})  {:>size_col$}  {:>dur_col$}  {} {status}",
+                        format!("{percent}%"),
+                        size_str,
                         duration_str,
                         relative(target, &base),
-                        LightYellow.paint("(-)"),
                     );
-                    return;
                 }
-                let size_str = if size >= mb {
-                    format!("{}mb", size / mb)
-                } else if size >= kb {
-                    format!("{}kb", size / kb)
-                } else {
-                    format!("{}b", size)
-                };
-                // diff < 0 means "not computed" (--no-diff, after a resize, or GIF).
-                let diff_inner = if diff < 0.0 {
-                    format!("{:>4}", "—")
-                } else {
-                    let diff_num = format!("{diff:>4.2}");
-                    if diff > 1.0 {
-                        LightYellow.paint(&diff_num).to_string()
-                    } else {
-                        LightGreen.paint(&diff_num).to_string()
-                    }
-                };
-                let percent = size * 100 / original_size;
-                let status = if existed {
-                    LightYellow.paint("(U)").to_string()
-                } else {
-                    LightGreen.paint("(N)").to_string()
-                };
-                println!(
-                    "{:>pct_col$}  ({diff_inner})  {:>size_col$}  {:>dur_col$}  {} {status}",
-                    format!("{percent}%"),
-                    size_str,
-                    duration_str,
-                    relative(target, &base),
-                );
+                Err(e) => {
+                    println!(
+                        "{}",
+                        LightRed.paint(format!("{}: {e:?}", relative(target, &base)))
+                    );
+                }
             }
-            Err(e) => {
-                println!(
-                    "{}",
-                    LightRed.paint(format!("{}: {e:?}", relative(target, &base)))
-                );
-            }
-        }
-    };
+        };
 
     let mut summary_original: usize = 0;
     let mut summary_optimized: usize = 0;
@@ -865,7 +960,13 @@ async fn main() {
             .and_then(|e| e.to_str())
             .unwrap_or("");
         for (target, width, duration, result) in outcomes {
-            let tgt_ext = Path::new(&target)
+            // Auto-format writes a different extension than the placeholder target carried;
+            // use the encoder's actual output path for display and accounting.
+            let effective_target = match &result {
+                Ok((.., Some(actual))) => actual.clone(),
+                _ => target,
+            };
+            let tgt_ext = Path::new(&effective_target)
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
@@ -873,10 +974,11 @@ async fn main() {
             match width {
                 // Normal mode: only count same-format optimisation toward the savings
                 // summary; avif/webp conversions are reported per row but not summed.
+                // Auto-format always yields a single replacement output, so it counts too.
                 None => {
-                    if src_ext == tgt_ext {
+                    if auto_format_mode || src_ext == tgt_ext {
                         match &result {
-                            Ok((size, original_size, _, _, skipped)) => {
+                            Ok((size, original_size, _, _, skipped, _)) => {
                                 if *skipped {
                                     summary_skipped += 1;
                                 } else {
@@ -891,12 +993,12 @@ async fn main() {
                 }
                 // srcset variant: a derivative output, tallied separately from "saved".
                 Some(w) => match &result {
-                    Ok((size, _, _, _, _)) => {
+                    Ok((size, _, _, _, _, _)) => {
                         summary_variants += 1;
                         summary_variant_bytes += size;
                         if emit_html {
                             html.entry(file.clone()).or_default().push((
-                                relative(&target, &base),
+                                relative(&effective_target, &base),
                                 w,
                                 tgt_ext.clone(),
                             ));
@@ -905,7 +1007,7 @@ async fn main() {
                     Err(_) => summary_errors += 1,
                 },
             }
-            print_row(&target, duration, result);
+            print_row(&effective_target, duration, result);
         }
     }
 
