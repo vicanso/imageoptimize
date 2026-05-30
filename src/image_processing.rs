@@ -3,9 +3,10 @@ use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
 use dssim_core::Dssim;
 use exif::{In, Reader, Tag};
+use fast_image_resize::images::Image as FirImage;
+use fast_image_resize::{FilterType as FirFilter, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use image::imageops::{
-    crop, flip_horizontal, flip_vertical, overlay, resize, rotate180, rotate270, rotate90,
-    FilterType,
+    crop, flip_horizontal, flip_vertical, overlay, rotate180, rotate270, rotate90,
 };
 use image::{load, DynamicImage, ImageFormat, RgbaImage};
 use img_parts::ImageEXIF;
@@ -625,6 +626,26 @@ fn apply_orientation(di: DynamicImage, orientation: u32) -> DynamicImage {
     }
 }
 
+/// SIMD-accelerated resize via `fast_image_resize` (NEON/AVX2/SSE4.1, scalar fallback on
+/// older CPUs). Consumes the source buffer (moved into the resizer with no copy) and
+/// returns the scaled RGBA image. Alpha is premultiplied during scaling (fir default),
+/// which avoids color bleeding into fully transparent edges.
+fn fir_resize(src: RgbaImage, dst_w: u32, dst_h: u32, filter: FirFilter) -> RgbaImage {
+    let (sw, sh) = (src.width(), src.height());
+    let src_img = FirImage::from_vec_u8(sw, sh, src.into_raw(), PixelType::U8x4)
+        .expect("rgba8 buffer matches U8x4 dimensions");
+    let mut dst_img = FirImage::new(dst_w, dst_h, PixelType::U8x4);
+    Resizer::new()
+        .resize(
+            &src_img,
+            &mut dst_img,
+            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(filter)),
+        )
+        .expect("source and destination are both U8x4");
+    RgbaImage::from_raw(dst_w, dst_h, dst_img.into_vec())
+        .expect("fir output buffer matches dimensions")
+}
+
 #[derive(Default, Clone)]
 pub struct ProcessImage {
     original: Option<RgbaImage>,
@@ -889,7 +910,12 @@ impl Process for ResizeProcess {
             (w, h)
         };
 
-        let result = resize(&img.di, new_w, new_h, FilterType::Lanczos3);
+        let result = fir_resize(
+            std::mem::take(&mut img.di).into_rgba8(),
+            new_w,
+            new_h,
+            FirFilter::Lanczos3,
+        );
         img.buffer.clear();
         img.di = DynamicImage::ImageRgba8(result);
         Ok(img)
@@ -1375,7 +1401,7 @@ fn smart_crop_offset(di: &DynamicImage, crop_w: u32, crop_h: u32) -> (u32, u32) 
     let small = if sw == src_w && sh == src_h {
         di.to_rgba8()
     } else {
-        resize(di, sw, sh, FilterType::Triangle)
+        fir_resize(di.to_rgba8(), sw, sh, FirFilter::Bilinear)
     };
     let raw = small.as_raw();
     let swu = sw as usize;
@@ -1486,7 +1512,12 @@ impl Process for ThumbnailProcess {
         } else {
             DynamicImage::ImageRgba8(crop(&mut img.di, crop_x, crop_y, crop_w, crop_h).to_image())
         };
-        img.di = DynamicImage::ImageRgba8(resize(&source, dst_w, dst_h, FilterType::Lanczos3));
+        img.di = DynamicImage::ImageRgba8(fir_resize(
+            source.into_rgba8(),
+            dst_w,
+            dst_h,
+            FirFilter::Lanczos3,
+        ));
         img.buffer.clear();
         Ok(img)
     }
