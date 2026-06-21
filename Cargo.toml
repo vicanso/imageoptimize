@@ -27,8 +27,13 @@ required-features = ["bin"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = []
+default = ["network", "jxl"]
 bin = ["clap", "tokio", "glob", "nu-ansi-term", "num_cpus"]
+# HTTP/base64 image loading (pulls reqwest + a TLS stack, ~2MB). Opt out with
+# default-features = false to ship a file://-only build.
+network = ["reqwest"]
+# JPEG XL encode/decode via the vendored libjxl (~1MB). Opt out to drop it.
+jxl = ["jpegxl-rs"]
 
 [dependencies]
 avif-decode = "1.0.2"
@@ -46,13 +51,13 @@ image = { version = "0.25.10", default-features = false, features = [
     "avif",
     "rayon",
 ] }
-jpegxl-rs = { version = "0.14", features = ["vendored"] }
+jpegxl-rs = { version = "0.14", features = ["vendored"], optional = true }
 imagequant = { version = "4.4.1", features = ["threads"] }
 lodepng = "3.12.2"
 mozjpeg = "0.10.13"
 nu-ansi-term = { version = "0.50.3", optional = true }
 num_cpus = { version = "1.17.0", optional = true }
-reqwest = "0.13.3"
+reqwest = { version = "0.13.3", optional = true }
 rgb = "0.8.52"
 snafu = "0.9.0"
 tokio = { version = "1.52.3", features = [

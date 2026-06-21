@@ -15,7 +15,9 @@ use rgb::FromSlice;
 use snafu::{ensure, ResultExt, Snafu};
 use std::borrow::Cow;
 use std::io::Cursor;
+#[cfg(feature = "network")]
 use std::sync::OnceLock;
+#[cfg(feature = "network")]
 use std::time::Duration;
 use urlencoding::decode;
 
@@ -58,8 +60,10 @@ const AUTO_TARGET_DIFF: f64 = 1.0;
 const AUTO_MIN_QUALITY: u8 = 30;
 const AUTO_MAX_QUALITY: u8 = 95;
 
+#[cfg(feature = "network")]
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+#[cfg(feature = "network")]
 fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(reqwest::Client::new)
 }
@@ -68,8 +72,10 @@ fn get_http_client() -> &'static reqwest::Client {
 pub enum ImageProcessingError {
     #[snafu(display("Process image fail, message:{message}"))]
     ParamsInvalid { message: String },
+    #[cfg(feature = "network")]
     #[snafu(display("{source}"))]
     Reqwest { source: reqwest::Error },
+    #[cfg(feature = "network")]
     #[snafu(display("{source}"))]
     HTTPHeaderToStr { source: reqwest::header::ToStrError },
     #[snafu(display("{source}"))]
@@ -902,6 +908,36 @@ pub trait Process {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage>;
 }
 
+/// Fetch image bytes over HTTP, returning the body and any extension inferred from
+/// the Content-Type header.
+#[cfg(feature = "network")]
+async fn http_get(data: &str) -> Result<(Vec<u8>, Option<String>)> {
+    let resp = get_http_client()
+        .get(data)
+        .timeout(Duration::from_secs(5 * 60))
+        .send()
+        .await
+        .context(ReqwestSnafu {})?;
+
+    let mut ext = None;
+    if let Some(content_type) = resp.headers().get("Content-Type") {
+        let str = content_type.to_str().context(HTTPHeaderToStrSnafu {})?;
+        if let Some((_, t)) = str.split_once('/') {
+            ext = Some(t.to_string());
+        }
+    }
+    let raw = resp.bytes().await.context(ReqwestSnafu {})?.to_vec();
+    Ok((raw, ext))
+}
+
+/// Stub used when the `network` feature is disabled: HTTP URLs report a clear error.
+#[cfg(not(feature = "network"))]
+async fn http_get(_data: &str) -> Result<(Vec<u8>, Option<String>)> {
+    Err(ImageProcessingError::ParamsInvalid {
+        message: "HTTP image loading requires the `network` feature".to_string(),
+    })
+}
+
 /// Loader process loads the image data from http, file or base64.
 pub struct LoaderProcess {
     data: String,
@@ -924,20 +960,11 @@ impl LoaderProcess {
         let file_prefix = "file://";
         let from_file = data.starts_with(file_prefix);
         let original_data = if from_http {
-            let resp = get_http_client()
-                .get(data)
-                .timeout(Duration::from_secs(5 * 60))
-                .send()
-                .await
-                .context(ReqwestSnafu {})?;
-
-            if let Some(content_type) = resp.headers().get("Content-Type") {
-                let str = content_type.to_str().context(HTTPHeaderToStrSnafu {})?;
-                if let Some((_, t)) = str.split_once('/') {
-                    ext = t.to_string();
-                }
+            let (raw, detected_ext) = http_get(data).await?;
+            if let Some(t) = detected_ext {
+                ext = t;
             }
-            resp.bytes().await.context(ReqwestSnafu {})?.into()
+            raw
         } else if from_file {
             ext = data.split('.').next_back().unwrap_or_default().to_string();
             std::fs::read(&data[file_prefix.len()..]).context(IoSnafu)?
@@ -2372,13 +2399,16 @@ mod tests {
 
     #[test]
     fn test_load_process() {
-        let p = LoaderProcess::new(
-            "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png",
-            "",
-        );
-        let result = tokio_test::block_on(p.fetch_data()).unwrap();
-        assert_ne!(result.buffer.len(), 0);
-        assert_eq!(result.ext, "png");
+        #[cfg(feature = "network")]
+        {
+            let p = LoaderProcess::new(
+                "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png",
+                "",
+            );
+            let result = tokio_test::block_on(p.fetch_data()).unwrap();
+            assert_ne!(result.buffer.len(), 0);
+            assert_eq!(result.ext, "png");
+        }
 
         let file = format!(
             "file://{}/assets/rust-logo.png",
@@ -3127,19 +3157,22 @@ mod tests {
         assert_ne!(result.get_diff(), -1.0_f64);
 
         // lossy jxl
-        let result =
-            tokio_test::block_on(OptimProcess::new("jxl", 80, 0).process(new_process_image()))
-                .unwrap();
-        assert_eq!(result.ext, "jxl");
-        assert_ne!(result.buffer.len(), 0);
-        assert!(result.get_diff() >= 0.0);
+        #[cfg(feature = "jxl")]
+        {
+            let result =
+                tokio_test::block_on(OptimProcess::new("jxl", 80, 0).process(new_process_image()))
+                    .unwrap();
+            assert_eq!(result.ext, "jxl");
+            assert_ne!(result.buffer.len(), 0);
+            assert!(result.get_diff() >= 0.0);
 
-        // lossless jxl (alpha is dropped — lossless applies to RGB channels only)
-        let result =
-            tokio_test::block_on(OptimProcess::new("jxl", 100, 0).process(new_process_image()))
-                .unwrap();
-        assert_eq!(result.ext, "jxl");
-        assert_ne!(result.buffer.len(), 0);
+            // lossless jxl (alpha is dropped — lossless applies to RGB channels only)
+            let result =
+                tokio_test::block_on(OptimProcess::new("jxl", 100, 0).process(new_process_image()))
+                    .unwrap();
+            assert_eq!(result.ext, "jxl");
+            assert_ne!(result.buffer.len(), 0);
+        }
     }
 
     #[test]

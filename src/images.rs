@@ -38,6 +38,8 @@ pub enum ImageError {
     },
     #[snafu(display("Io fail, {source}"))]
     Io { source: std::io::Error },
+    #[snafu(display("{message}"))]
+    Unsupported { message: String },
     #[snafu(display("Handle image fail"))]
     Unknown,
 }
@@ -177,6 +179,7 @@ pub fn avif_decode(data: &[u8]) -> Result<DynamicImage> {
 }
 
 /// Decode data from JXL format using jpegxl-rs (libjxl FFI).
+#[cfg(feature = "jxl")]
 pub fn jxl_decode(data: &[u8]) -> Result<DynamicImage> {
     let decoder = jpegxl_rs::decoder_builder()
         .build()
@@ -197,6 +200,14 @@ pub fn jxl_decode(data: &[u8]) -> Result<DynamicImage> {
             .ok_or(ImageError::Unknown)
             .map(DynamicImage::ImageRgb8)
     }
+}
+
+/// Stub used when the `jxl` feature is disabled: JXL inputs report a clear error.
+#[cfg(not(feature = "jxl"))]
+pub fn jxl_decode(_data: &[u8]) -> Result<DynamicImage> {
+    Err(ImageError::Unsupported {
+        message: "JXL decoding requires the `jxl` feature".to_string(),
+    })
 }
 
 pub fn load<R: BufRead + Seek>(r: R, ext: &str) -> Result<ImageInfo> {
@@ -333,6 +344,7 @@ impl ImageInfo {
     /// Encode image to JPEG XL.
     /// quality >= 100 = lossless; 0–99 = lossy mapped to JXL psychovisual distance
     /// (distance 0 = best, 15 = worst; quality 80 ≈ distance 3.0).
+    #[cfg(feature = "jxl")]
     pub fn to_jxl(&self, quality: u8) -> Result<Vec<u8>> {
         let width = self.image.width();
         let height = self.image.height();
@@ -360,6 +372,14 @@ impl ImageInfo {
             .encode::<u8, u8>(pixels, width, height)
             .map_err(|_| ImageError::Unknown)?;
         Ok(result.to_vec())
+    }
+
+    /// Stub used when the `jxl` feature is disabled.
+    #[cfg(not(feature = "jxl"))]
+    pub fn to_jxl(&self, _quality: u8) -> Result<Vec<u8>> {
+        Err(ImageError::Unsupported {
+            message: "JXL encoding requires the `jxl` feature".to_string(),
+        })
     }
 
     /// Optimize image to jpeg, the quality 60-80 are recommended.
@@ -423,6 +443,7 @@ mod tests {
         assert_eq!(result.len(), 2402);
     }
     #[test]
+    #[cfg(feature = "jxl")]
     fn test_to_jxl() {
         let img = load_image();
         // lossy
