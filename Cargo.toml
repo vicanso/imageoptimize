@@ -38,7 +38,14 @@ kamadak-exif = "0.6.1"
 clap = { version = "4.6.1", features = ["derive"], optional = true }
 dssim-core = "3.4.0"
 glob = { version = "0.3.3", optional = true }
-image = { version = "0.25.10", features = ["webp", "avif"] }
+image = { version = "0.25.10", default-features = false, features = [
+    "jpeg",
+    "png",
+    "gif",
+    "webp",
+    "avif",
+    "rayon",
+] }
 jpegxl-rs = { version = "0.14", features = ["vendored"] }
 imagequant = { version = "4.4.1", features = ["threads"] }
 lodepng = "3.12.2"

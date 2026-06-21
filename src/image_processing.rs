@@ -786,7 +786,13 @@ impl ProcessImage {
                     message: "Image format is not supported".to_string(),
                 })
             })?;
-            load(Cursor::new(&data), format).context(ImageSnafu {})?
+            // `image`'s avif feature is encoder-only, so AVIF inputs must use the
+            // libaom-backed decoder rather than image::load (which would error).
+            if format == ImageFormat::Avif {
+                avif_decode(&data).context(ImagesSnafu {})?
+            } else {
+                load(Cursor::new(&data), format).context(ImageSnafu {})?
+            }
         };
         let orientation = get_exif_orientation(&data);
         let di = apply_orientation(di, orientation);
@@ -889,11 +895,6 @@ fn decode_to_di(buffer: &[u8], ext: &str) -> Result<DynamicImage> {
             load(Cursor::new(buffer), format).context(ImageSnafu {})
         }
     }
-}
-
-/// True when any pixel is not fully opaque (so an alpha-capable format is required).
-fn has_alpha(image: &RgbaImage) -> bool {
-    image.as_raw().par_chunks(4).any(|p| p[3] < 255)
 }
 
 #[allow(async_fn_in_trait)]
@@ -2097,14 +2098,10 @@ impl Process for OptimProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
 
-        // Move img.di into ImageInfo: zero-copy when already ImageRgba8, one conversion otherwise.
+        // Move img.di into ImageInfo without forcing RGBA: opaque images keep their
+        // RGB8 layout so the encoders below can skip the alpha plane.
         let di = std::mem::take(&mut img.di);
-        let info: ImageInfo = match di {
-            DynamicImage::ImageRgba8(rgba) => ImageInfo { image: rgba },
-            other => ImageInfo {
-                image: other.to_rgba8(),
-            },
-        };
+        let info: ImageInfo = di.into();
 
         let quality = self.quality;
         let speed = self.speed;
@@ -2136,7 +2133,7 @@ impl Process for OptimProcess {
 
         // Closure returns (encoded_bytes, info.image) so the pixel data is available
         // for restoring img.di after encoding.
-        let do_encode = move || -> Result<(Vec<u8>, RgbaImage)> {
+        let do_encode = move || -> Result<(Vec<u8>, DynamicImage)> {
             let encoded = match actual_ext.as_str() {
                 IMAGE_TYPE_GIF => to_gif(Cursor::new(gif_buffer), speed).context(ImagesSnafu {})?,
                 IMAGE_TYPE_PNG => info.to_png(quality).context(ImagesSnafu {})?,
@@ -2172,12 +2169,12 @@ impl Process for OptimProcess {
                     let format = ImageFormat::from_extension(&img.ext).unwrap_or(ImageFormat::Jpeg);
                     load(c, format).context(ImageSnafu {})
                 };
-                img.di = result.unwrap_or(DynamicImage::ImageRgba8(info_image));
+                img.di = result.unwrap_or(info_image);
             } else {
-                img.di = DynamicImage::ImageRgba8(info_image);
+                img.di = info_image;
             }
         } else {
-            img.di = DynamicImage::ImageRgba8(info_image);
+            img.di = info_image;
         }
 
         Ok(img)
@@ -2220,7 +2217,7 @@ impl AutoOptimProcess {
             return vec![self.output_type.clone()];
         }
         // Alpha-capable set vs photo set; WebP/AVIF lead since they usually win on size.
-        if has_alpha(&info.image) {
+        if info.has_alpha() {
             vec![
                 IMAGE_TYPE_WEBP.to_string(),
                 IMAGE_TYPE_AVIF.to_string(),
@@ -2332,14 +2329,10 @@ impl Process for AutoOptimProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
 
-        // Move img.di into ImageInfo: zero-copy when already ImageRgba8, one conversion otherwise.
+        // Move img.di into ImageInfo without forcing RGBA: opaque images keep their
+        // RGB8 layout so format-candidate encoding can skip the alpha plane.
         let di = std::mem::take(&mut img.di);
-        let info: ImageInfo = match di {
-            DynamicImage::ImageRgba8(rgba) => ImageInfo { image: rgba },
-            other => ImageInfo {
-                image: other.to_rgba8(),
-            },
-        };
+        let info: ImageInfo = di.into();
 
         let cand = {
             let original = img.original.as_ref();
@@ -3257,5 +3250,48 @@ mod tests {
         let out =
             tokio_test::block_on(BrightenProcess::new(20).process(new_process_image())).unwrap();
         assert!(matches!(out.di, DynamicImage::ImageRgba8(_)));
+    }
+
+    #[test]
+    fn test_avif_input_decode() {
+        // C1: `image`'s avif feature is encoder-only, so AVIF source inputs must route
+        // to the libaom decoder. Encode to AVIF, then load the bytes back as a source.
+        let avif =
+            tokio_test::block_on(OptimProcess::new("avif", 80, 3).process(new_process_image()))
+                .unwrap();
+        assert_eq!(avif.ext, "avif");
+        assert!(!avif.buffer.is_empty());
+
+        let reloaded = ProcessImage::new(avif.buffer, "avif").unwrap();
+        assert!(reloaded.di.width() > 0 && reloaded.di.height() > 0);
+    }
+
+    #[test]
+    fn test_opaque_encode_roundtrips() {
+        use image::DynamicImage;
+        // A1: opaque RGB8 images encode without an alpha plane (webp/avif/jpeg) and the
+        // bytes still decode back to the original dimensions.
+        let opaque = || {
+            let img = image::RgbImage::from_fn(16, 12, |x, y| {
+                image::Rgb([(x * 15) as u8, (y * 20) as u8, 120])
+            });
+            ProcessImage {
+                di: DynamicImage::ImageRgb8(img),
+                ext: "png".to_string(),
+                ..Default::default()
+            }
+        };
+        for fmt in ["webp", "avif", "jpeg"] {
+            let out =
+                tokio_test::block_on(OptimProcess::new(fmt, 80, 3).process(opaque())).unwrap();
+            assert_eq!(out.ext, fmt);
+            assert!(!out.buffer.is_empty(), "{fmt} produced an empty buffer");
+            let back = super::decode_to_di(&out.buffer, fmt).unwrap();
+            assert_eq!(
+                (back.width(), back.height()),
+                (16, 12),
+                "{fmt} roundtrip dimensions"
+            );
+        }
     }
 }

@@ -4,8 +4,10 @@ use image::codecs::gif;
 use image::codecs::webp::WebPEncoder;
 use image::{AnimationDecoder, DynamicImage, ImageEncoder, ImageFormat, RgbaImage};
 use lodepng::Bitmap;
-use rgb::{ComponentBytes, FromSlice, RGB8, RGBA8};
+use rayon::prelude::*;
+use rgb::{ComponentBytes, FromSlice, RGBA8};
 use snafu::{ResultExt, Snafu};
+use std::borrow::Cow;
 use std::{
     ffi::OsStr,
     io::{BufRead, Seek},
@@ -42,18 +44,51 @@ pub enum ImageError {
 
 type Result<T, E = ImageError> = std::result::Result<T, E>;
 
-/// Holds a decoded RGBA image ready for encoding. Internally backed by `RgbaImage`
-/// so all encoders can borrow its raw bytes without any intermediate copies.
+/// Holds a decoded image ready for encoding. The channel layout of the backing
+/// `DynamicImage` is preserved (opaque inputs stay RGB8), so encoders can borrow
+/// the raw bytes without re-adding an alpha plane. `opaque` is computed once at
+/// construction so per-encode calls don't rescan the pixels.
 pub struct ImageInfo {
-    pub image: RgbaImage,
+    pub image: DynamicImage,
+    opaque: bool,
 }
 
 impl ImageInfo {
+    fn from_dynamic(image: DynamicImage) -> Self {
+        let opaque = match &image {
+            DynamicImage::ImageRgba8(img) => img.as_raw().par_chunks(4).all(|p| p[3] == 255),
+            other => !other.color().has_alpha(),
+        };
+        ImageInfo { image, opaque }
+    }
+
     pub fn width(&self) -> usize {
         self.image.width() as usize
     }
     pub fn height(&self) -> usize {
         self.image.height() as usize
+    }
+
+    /// True when any pixel carries transparency, so an alpha-capable format is required.
+    pub fn has_alpha(&self) -> bool {
+        !self.opaque
+    }
+
+    /// Borrow the image as RGBA8 bytes, converting only when it is not already RGBA8.
+    fn rgba_bytes(&self) -> Cow<'_, [u8]> {
+        match &self.image {
+            DynamicImage::ImageRgba8(img) => Cow::Borrowed(img.as_raw()),
+            other => Cow::Owned(other.to_rgba8().into_raw()),
+        }
+    }
+
+    /// Borrow the image as RGB8 bytes (alpha dropped), converting only when it is
+    /// not already RGB8.
+    fn rgb_bytes(&self) -> Cow<'_, [u8]> {
+        match &self.image {
+            DynamicImage::ImageRgb8(img) => Cow::Borrowed(img.as_raw()),
+            other => Cow::Owned(other.to_rgb8().into_raw()),
+        }
     }
 }
 
@@ -62,13 +97,19 @@ impl From<Bitmap<RGBA8>> for ImageInfo {
         let raw = info.buffer.as_bytes().to_vec();
         let image =
             RgbaImage::from_raw(info.width as u32, info.height as u32, raw).unwrap_or_default();
-        ImageInfo { image }
+        ImageInfo::from_dynamic(DynamicImage::ImageRgba8(image))
     }
 }
 
 impl From<RgbaImage> for ImageInfo {
     fn from(image: RgbaImage) -> Self {
-        ImageInfo { image }
+        ImageInfo::from_dynamic(DynamicImage::ImageRgba8(image))
+    }
+}
+
+impl From<DynamicImage> for ImageInfo {
+    fn from(image: DynamicImage) -> Self {
+        ImageInfo::from_dynamic(image)
     }
 }
 
@@ -161,7 +202,9 @@ pub fn jxl_decode(data: &[u8]) -> Result<DynamicImage> {
 pub fn load<R: BufRead + Seek>(r: R, ext: &str) -> Result<ImageInfo> {
     let format = ImageFormat::from_extension(OsStr::new(ext)).unwrap_or(ImageFormat::Jpeg);
     let result = image::load(r, format).context(ImageSnafu { category: "load" })?;
-    Ok(result.to_rgba8().into())
+    // Preserve the decoded channel layout (opaque images stay RGB8) so encoders
+    // can skip the alpha plane.
+    Ok(result.into())
 }
 
 pub fn to_gif<R>(r: R, speed: u8) -> Result<Vec<u8>>
@@ -192,19 +235,11 @@ where
 }
 
 impl ImageInfo {
-    fn get_rgb8(&self) -> Vec<RGB8> {
-        self.image
-            .as_raw()
-            .as_rgba()
-            .iter()
-            .map(|p| p.rgb())
-            .collect()
-    }
-
     /// Optimize image to png, the quality is min 0, max 100, which means best effort,
     /// and never aborts the process.
     pub fn to_png(&self, quality: u8) -> Result<Vec<u8>> {
-        let pixels: &[RGBA8] = self.image.as_raw().as_rgba();
+        let rgba = self.rgba_bytes();
+        let pixels: &[RGBA8] = rgba.as_rgba();
         let width = self.width();
         let height = self.height();
 
@@ -245,22 +280,28 @@ impl ImageInfo {
     /// Optimize image to webp. quality >= 100 produces lossless output;
     /// any lower value encodes lossy at that quality (0–99).
     pub fn to_webp(&self, quality: u8) -> Result<Vec<u8>> {
+        let width = self.image.width();
+        let height = self.image.height();
+        // Opaque images encode as RGB so no useless alpha plane is written (smaller, faster).
+        let (bytes, color) = if self.opaque {
+            (self.rgb_bytes(), image::ColorType::Rgb8)
+        } else {
+            (self.rgba_bytes(), image::ColorType::Rgba8)
+        };
         if quality >= 100 {
             let mut w = Vec::new();
             WebPEncoder::new_lossless(&mut w)
-                .encode(
-                    self.image.as_raw(),
-                    self.image.width(),
-                    self.image.height(),
-                    image::ColorType::Rgba8.into(),
-                )
+                .encode(bytes.as_ref(), width, height, color.into())
                 .context(ImageSnafu {
                     category: "webp_encode",
                 })?;
             Ok(w)
         } else {
-            let encoder =
-                Encoder::from_rgba(self.image.as_raw(), self.image.width(), self.image.height());
+            let encoder = if self.opaque {
+                Encoder::from_rgb(bytes.as_ref(), width, height)
+            } else {
+                Encoder::from_rgba(bytes.as_ref(), width, height)
+            };
             Ok(encoder.encode(quality as f32).to_vec())
         }
     }
@@ -271,17 +312,20 @@ impl ImageInfo {
     pub fn to_avif(&self, quality: u8, speed: u8) -> Result<Vec<u8>> {
         let mut w = Vec::new();
         let sp = if speed == 0 { 3 } else { speed };
+        let width = self.image.width();
+        let height = self.image.height();
+        // Opaque images skip the alpha plane (smaller output, faster encode).
+        let (bytes, color) = if self.opaque {
+            (self.rgb_bytes(), image::ColorType::Rgb8)
+        } else {
+            (self.rgba_bytes(), image::ColorType::Rgba8)
+        };
 
         let img = avif::AvifEncoder::new_with_speed_quality(&mut w, sp, quality);
-        img.write_image(
-            self.image.as_raw(),
-            self.image.width(),
-            self.image.height(),
-            image::ColorType::Rgba8.into(),
-        )
-        .context(ImageSnafu {
-            category: "avif_encode",
-        })?;
+        img.write_image(bytes.as_ref(), width, height, color.into())
+            .context(ImageSnafu {
+                category: "avif_encode",
+            })?;
 
         Ok(w)
     }
@@ -294,8 +338,8 @@ impl ImageInfo {
         let height = self.image.height();
         // JXL is encoded as RGB (3-channel); libjxl 0.11 requires explicit extra-channel
         // initialisation for alpha which jpegxl-rs 0.11 does not expose, so alpha is dropped.
-        let rgb = self.get_rgb8();
-        let pixels = rgb.as_bytes();
+        let rgb = self.rgb_bytes();
+        let pixels = rgb.as_ref();
         // quality 0 → distance 15, quality 99 → distance ~0.15, quality >= 100 → lossless
         let mut encoder = if quality >= 100 {
             // Lossless requires uses_original_profile=true; set it explicitly so
@@ -324,7 +368,7 @@ impl ImageInfo {
         comp.set_size(self.width(), self.height());
         comp.set_quality(quality as f32);
         let mut comp = comp.start_compress(Vec::new()).context(IoSnafu {})?;
-        comp.write_scanlines(self.get_rgb8().as_bytes())
+        comp.write_scanlines(self.rgb_bytes().as_ref())
             .context(IoSnafu {})?;
         let data = comp.finish().context(IoSnafu {})?;
         Ok(data)
