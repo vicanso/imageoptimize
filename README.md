@@ -68,6 +68,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--png-quality <N>` | 90 | PNG encode quality (0–100) |
 | `--avif-quality <N>` | 80 | AVIF encode quality (0–100) |
 | `--webp-quality <N>` | 80 | WebP encode quality (0–99 lossy, ≥100 lossless) |
+| `--lossless` | false | Encode at maximum fidelity (forces every quality to 100). WebP becomes truly lossless; AVIF is only visually near-lossless (the rav1e encoder has no bit-exact mode); JPEG is max-quality lossy (no lossless mode); PNG uses its top palette. Overrides the per-format quality flags; cannot combine with `--auto-quality` / `--auto-format` |
 | `-t, --threads <N>` | CPU count | Number of parallel worker threads |
 | `--dry-run` | false | Preview results without writing any files |
 | `--min-size <KB>` | — | Skip files smaller than this size in KB |
@@ -124,6 +125,14 @@ imageoptimize /path/to/source --output /path/to/output --convert disable
 ```bash
 imageoptimize /path/to/source --output /path/to/output \
   --jpeg-quality 75 --png-quality 85 --avif-quality 70 --webp-quality 75
+```
+
+**Lossless** — for screenshots, line art, and UI assets where lossy is wrong. WebP encodes
+truly lossless; AVIF falls back to visually near-lossless (the rav1e encoder has no bit-exact
+mode). Equivalent to passing `--webp-quality 100`:
+
+```bash
+imageoptimize /path/to/source --output /path/to/output --convert png-webp --lossless
 ```
 
 **Dry run** — preview compression results without writing any files:

@@ -67,6 +67,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--png-quality <N>` | 90 | PNG 编码质量（0–100） |
 | `--avif-quality <N>` | 80 | AVIF 编码质量（0–100） |
 | `--webp-quality <N>` | 80 | WebP 编码质量（0–99 有损，≥100 无损） |
+| `--lossless` | false | 以最高保真编码（将所有质量强制为 100）。WebP 为真正无损；AVIF 仅视觉上接近无损（rav1e 编码器没有比特精确模式）；JPEG 为最高质量有损（该格式没有无损模式）；PNG 使用其最高质量调色板。覆盖各格式的质量参数；不能与 `--auto-quality` / `--auto-format` 同用 |
 | `-t, --threads <N>` | CPU 核心数 | 并行工作线程数 |
 | `--dry-run` | false | 预览结果但不写入任何文件 |
 | `--min-size <KB>` | — | 跳过小于该大小（KB）的文件 |
@@ -123,6 +124,12 @@ imageoptimize /path/to/source --output /path/to/output --convert disable
 ```bash
 imageoptimize /path/to/source --output /path/to/output \
   --jpeg-quality 75 --png-quality 85 --avif-quality 70 --webp-quality 75
+```
+
+**无损** — 用于截图、线稿、UI 素材等不适合有损的场景。WebP 编码为真正无损；AVIF 退化为视觉上接近无损（rav1e 编码器没有比特精确模式）。等价于传入 `--webp-quality 100`：
+
+```bash
+imageoptimize /path/to/source --output /path/to/output --convert png-webp --lossless
 ```
 
 **试运行** — 预览压缩结果，不写入任何文件：

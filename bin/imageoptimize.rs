@@ -215,6 +215,14 @@ struct Args {
     #[arg(long, default_value = "80")]
     webp_quality: u8,
 
+    /// Encode at maximum fidelity (forces every per-format quality to 100). WebP becomes
+    /// truly lossless; AVIF is visually near-lossless only (the rav1e encoder has no
+    /// bit-exact mode); JPEG is max-quality lossy (the format has no lossless mode); PNG
+    /// uses its highest-quality palette. Overrides the per-format quality flags. Cannot be
+    /// combined with --auto-quality / --auto-format.
+    #[arg(long)]
+    lossless: bool,
+
     /// Number of parallel threads (default: number of logical CPUs)
     #[arg(short, long)]
     threads: Option<usize>,
@@ -533,6 +541,14 @@ async fn main() {
         println!("imageoptimize: use either --widths or --densities, not both");
         std::process::exit(1);
     }
+    // --lossless pins the per-format quality to 100; the auto modes search quality instead,
+    // so the two are mutually exclusive rather than silently ignoring one.
+    if args.lossless && (args.auto_quality || args.auto_format) {
+        println!(
+            "imageoptimize: --lossless cannot be combined with --auto-quality / --auto-format"
+        );
+        std::process::exit(1);
+    }
     // Build the responsive variant list from either widths (Nw) or densities × base-width (Nx).
     let variants: Vec<Variant> = if let Some(s) = args.widths.as_deref() {
         match parse_u32_list(s, "width", "320,640,1280") {
@@ -721,12 +737,16 @@ async fn main() {
         }
     }
 
+    // --lossless forces every per-format quality to 100. WebP (and JXL) treat >=100 as a
+    // true lossless encode; AVIF/JPEG have no lossless mode so 100 is best-effort, and PNG
+    // encodes at its top palette quality.
+    let quality_of = |fixed: u8| if args.lossless { 100 } else { fixed };
     let qualities = ImageQualities {
-        avif: args.avif_quality,
+        avif: quality_of(args.avif_quality),
         avif_speed: args.avif_speed,
-        webp: args.webp_quality,
-        png: args.png_quality,
-        jpeg: args.jpeg_quality,
+        webp: quality_of(args.webp_quality),
+        png: quality_of(args.png_quality),
+        jpeg: quality_of(args.jpeg_quality),
         target_diff: args.target_diff,
     };
 
