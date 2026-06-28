@@ -84,6 +84,8 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--base-width <W>` | — | `--densities` 的 1× 显示宽度（CSS px），输出尺寸 = base-width × 倍率 |
 | `--srcset-pattern <PAT>` | `{name}-{w}w.{ext}` / `{name}@{x}x.{ext}` | 变体文件名模板（`{name}` = 主名，`{w}` = 像素宽度，`{x}` = 倍率，`{ext}` = 扩展名）。默认按宽度/密度模式自动选择 |
 | `--emit-html` | false | 为每个源图打印可直接粘贴的 `<source srcset>` 片段（需配合 `--widths` 或 `--densities`） |
+| `--lqip` | false | 为每个源图输出一个极小的 base64 低质量占位图（LQIP，`data:` URI），用于 blur-up / 渐进加载。以列表形式打印，或作为 HTML 注释嵌入每个 `--emit-html` 片段。可配合 `--widths` / `--densities` |
+| `--lqip-width <N>` | 32 | `--lqip` 占位图的像素宽度（高度按宽高比自动计算） |
 | `--auto-quality` | false | 按输出自动调质量：二分搜索使感知差异保持在 `--target-diff` 内的最低质量；会覆盖各格式的质量参数 |
 | `--auto-format` | false | 自动选格式：每个源图只输出一份，取 webp/avif 与无损兜底（含透明用 png，否则 jpeg）中体积最小者，各候选按 `--target-diff` 调质量；忽略 `--convert`，在 `--widths` 下不生效 |
 | `--target-diff <N>` | 1.0 | `--auto-quality` / `--auto-format` 的感知差异目标（DSSIM ×1000），越小保真度越高，`1.0` 约为视觉无损 |

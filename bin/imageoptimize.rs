@@ -304,6 +304,16 @@ struct Args {
     #[arg(long)]
     emit_html: bool,
 
+    /// Emit a tiny base64 Low-Quality Image Placeholder (a `data:` URI) per source for
+    /// blur-up / progressive loading. Printed as a list, or as an HTML comment under each
+    /// `--emit-html` snippet. Pairs with `--widths` / `--densities`.
+    #[arg(long)]
+    lqip: bool,
+
+    /// Placeholder width in pixels for `--lqip` (height follows the aspect ratio).
+    #[arg(long, default_value = "32", value_name = "N")]
+    lqip_width: u32,
+
     /// Auto-tune quality per output: binary-search the lowest quality whose perceptual
     /// diff stays within --target-diff. Ignores the per-format quality flags.
     #[arg(long)]
@@ -878,7 +888,9 @@ async fn main() {
         auto_format: false,
         ..normal_flags
     };
-    let mut join_set: JoinSet<(String, Vec<TargetOutcome>)> = JoinSet::new();
+    let lqip_enabled = args.lqip;
+    let lqip_width = args.lqip_width;
+    let mut join_set: JoinSet<(String, Vec<TargetOutcome>, Option<String>)> = JoinSet::new();
     for (file, targets) in grouped {
         let qualities = qualities.clone();
         let sem = semaphore.clone();
@@ -887,11 +899,15 @@ async fn main() {
         join_set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
             let mut outcomes: Vec<TargetOutcome> = Vec::new();
+            let mut lqip: Option<String> = None;
 
             if variants.is_empty() {
                 // Normal mode: decode + resize once, encode each target format.
                 match load_base(&file, resize).await {
                     Ok(base) => {
+                        if lqip_enabled {
+                            lqip = base.lqip_data_uri(lqip_width).ok();
+                        }
                         let mut base = Some(base);
                         let last = targets.len().saturating_sub(1);
                         for (i, target) in targets.iter().enumerate() {
@@ -925,6 +941,9 @@ async fn main() {
                 // srcset / density mode: decode once (no resize here), then variant × format.
                 match load_base(&file, None).await {
                     Ok(base) => {
+                        if lqip_enabled {
+                            lqip = base.lqip_data_uri(lqip_width).ok();
+                        }
                         let src_w = base.get_size().0;
                         for &variant in &variants {
                             let w = variant.pixel_width();
@@ -994,7 +1013,7 @@ async fn main() {
                     }
                 }
             }
-            (file, outcomes)
+            (file, outcomes, lqip)
         });
     }
 
@@ -1075,9 +1094,14 @@ async fn main() {
     // For --emit-html: source file -> (relative variant path, variant, ext).
     let mut html: std::collections::BTreeMap<String, Vec<(String, Variant, String)>> =
         std::collections::BTreeMap::new();
+    // For --lqip: source file -> data: URI placeholder.
+    let mut lqips: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 
     while let Some(task) = join_set.join_next().await {
-        let (file, outcomes) = task.expect("task panicked");
+        let (file, outcomes, lqip) = task.expect("task panicked");
+        if let Some(uri) = lqip {
+            lqips.insert(file.clone(), uri);
+        }
         let src_ext = Path::new(&file)
             .extension()
             .and_then(|e| e.to_str())
@@ -1189,6 +1213,9 @@ async fn main() {
                         .join(", ");
                     println!("  <source type=\"image/{ext}\" srcset=\"{srcset}\">");
                 }
+                if let Some(uri) = lqips.get(&file) {
+                    println!("  <!-- LQIP: {uri} -->");
+                }
             }
         }
     } else if summary_count > 0 || summary_skipped > 0 || summary_errors > 0 {
@@ -1222,6 +1249,17 @@ async fn main() {
                 LightGreen.paint(format_size(saved)),
             ))
         );
+    }
+
+    // --lqip: print the placeholder data URIs. --emit-html already embeds them as comments
+    // under each source's snippet, so skip the standalone list in that case.
+    let embedded_in_html = emit_html && srcset_mode;
+    if !(lqips.is_empty() || embedded_in_html) {
+        println!();
+        println!("{}", LightCyan.paint("LQIP placeholders:"));
+        for (file, uri) in &lqips {
+            println!("  {}  {}", relative(file, &base), uri);
+        }
     }
 }
 

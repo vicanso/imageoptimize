@@ -834,6 +834,23 @@ impl ProcessImage {
     pub fn get_size(&self) -> (u32, u32) {
         (self.di.width(), self.di.height())
     }
+    /// Generate a Low-Quality Image Placeholder (LQIP): the image downscaled to `width`
+    /// px (aspect preserved, never upscaled) and encoded as a tiny lossy WebP, returned as
+    /// a self-contained `data:image/webp;base64,...` URI. Drop it into an `<img src>` or a
+    /// CSS `background` for a blur-up placeholder while the full image loads — no JS needed.
+    pub fn lqip_data_uri(&self, width: u32) -> Result<String> {
+        // A low quality is intentional: the placeholder is shown scaled-up and blurred.
+        const LQIP_QUALITY: u8 = 50;
+        let (ow, oh) = (self.di.width(), self.di.height());
+        let w = width.clamp(1, ow.max(1));
+        let h = ((oh as u64 * w as u64) / ow.max(1) as u64).max(1) as u32;
+        let info: ImageInfo = self.di.thumbnail_exact(w, h).into();
+        let bytes = encode_info(&info, IMAGE_TYPE_WEBP, LQIP_QUALITY, 0)?;
+        Ok(format!(
+            "data:image/webp;base64,{}",
+            general_purpose::STANDARD.encode(&bytes)
+        ))
+    }
     fn support_dssim(&self) -> bool {
         self.ext != IMAGE_TYPE_GIF
     }
@@ -2430,6 +2447,30 @@ mod tests {
     fn new_process_image() -> ProcessImage {
         let data = include_bytes!("../assets/rust-logo.png");
         ProcessImage::new(data.to_vec(), "png").unwrap()
+    }
+
+    #[test]
+    fn test_lqip_data_uri() {
+        use base64::Engine as _;
+        let pi = new_process_image(); // 144x144 source
+        let uri = pi.lqip_data_uri(24).unwrap();
+        assert!(uri.starts_with("data:image/webp;base64,"));
+        let b64 = uri.strip_prefix("data:image/webp;base64,").unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        // RIFF....WEBP container header
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WEBP");
+        // Downscaled to the requested width (aspect preserved) and kept tiny.
+        let decoded = super::decode_to_di(&bytes, super::IMAGE_TYPE_WEBP).unwrap();
+        assert_eq!(decoded.width(), 24);
+        assert_eq!(decoded.height(), 24);
+        assert!(
+            bytes.len() < 2000,
+            "LQIP should be tiny, got {}",
+            bytes.len()
+        );
     }
 
     #[test]

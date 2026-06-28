@@ -85,6 +85,8 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--base-width <W>` | — | The 1× display width (CSS px) for `--densities`; outputs are base-width × density |
 | `--srcset-pattern <PAT>` | `{name}-{w}w.{ext}` / `{name}@{x}x.{ext}` | Filename pattern for variants (`{name}` = stem, `{w}` = pixel width, `{x}` = density, `{ext}` = extension). Default is width- or density-appropriate |
 | `--emit-html` | false | Print a ready-to-paste `<source srcset>` snippet per source (with `--widths` or `--densities`) |
+| `--lqip` | false | Emit a tiny base64 Low-Quality Image Placeholder (`data:` URI) per source for blur-up / progressive loading. Printed as a list, or embedded as an HTML comment under each `--emit-html` snippet. Pairs with `--widths` / `--densities` |
+| `--lqip-width <N>` | 32 | Placeholder width in pixels for `--lqip` (height follows the aspect ratio) |
 | `--auto-quality` | false | Auto-tune quality per output: binary-search the lowest quality whose perceptual diff stays within `--target-diff`. Overrides the per-format quality flags |
 | `--auto-format` | false | Auto-pick the output format: encode each source once as the smallest of webp/avif plus a lossless fallback (png if it has transparency, else jpeg), each quality-tuned to `--target-diff`. One output per source; ignores `--convert`, and is ignored under `--widths` |
 | `--target-diff <N>` | 1.0 | Perceptual-diff target (DSSIM ×1000) for `--auto-quality` / `--auto-format`; lower = higher fidelity, `1.0` ≈ visually lossless |
