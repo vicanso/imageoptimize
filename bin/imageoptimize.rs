@@ -131,6 +131,7 @@ static IMAGE_JPEG: &str = "jpeg";
 static IMAGE_PNG: &str = "png";
 static IMAGE_AVIF: &str = "avif";
 static IMAGE_WEBP: &str = "webp";
+static IMAGE_JXL: &str = "jxl";
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum ImageFormat {
@@ -162,6 +163,10 @@ enum ConvertFormat {
     PngAvif,
     #[value(name = "png-webp")]
     PngWebp,
+    #[value(name = "jpeg-jxl")]
+    JpegJxl,
+    #[value(name = "png-jxl")]
+    PngJxl,
     #[value(name = "disable")]
     Disable,
 }
@@ -195,7 +200,7 @@ struct Args {
     #[arg(
         long,
         value_enum,
-        help = "Convert to format (jpeg-avif, jpeg-webp, png-avif, png-webp). Default: jpeg-avif, jpeg-webp, png-avif, png-webp"
+        help = "Convert to format (jpeg-avif, jpeg-webp, png-avif, png-webp, jpeg-jxl, png-jxl). Default: jpeg-avif, jpeg-webp, png-avif, png-webp (jxl is opt-in)"
     )]
     convert: Option<Vec<ConvertFormat>>,
 
@@ -214,6 +219,11 @@ struct Args {
     /// WebP quality (0-99 lossy, >=100 lossless)
     #[arg(long, default_value = "80")]
     webp_quality: u8,
+
+    /// JXL quality (0-99 lossy, >=100 lossless). Applies to `--convert jpeg-jxl / png-jxl`
+    /// output, which needs the `jxl` build feature (enabled by default).
+    #[arg(long, default_value = "80")]
+    jxl_quality: u8,
 
     /// Encode at maximum fidelity (forces every per-format quality to 100). WebP becomes
     /// truly lossless; AVIF is visually near-lossless only (the rav1e encoder has no
@@ -331,6 +341,7 @@ struct ImageQualities {
     webp: u8,
     png: u8,
     jpeg: u8,
+    jxl: u8,
     /// Perceptual-diff target (DSSIM ×1000) used when auto-quality is enabled.
     target_diff: f64,
 }
@@ -408,6 +419,7 @@ async fn encode_target(
             "avif" => qualities.avif,
             "webp" => qualities.webp,
             "png" => qualities.png,
+            "jxl" => qualities.jxl,
             _ => qualities.jpeg,
         };
         let speed = if placeholder_type == "avif" {
@@ -646,6 +658,8 @@ async fn main() {
             ConvertFormat::JpegWebp => (IMAGE_JPEG, IMAGE_WEBP),
             ConvertFormat::PngAvif => (IMAGE_PNG, IMAGE_AVIF),
             ConvertFormat::PngWebp => (IMAGE_PNG, IMAGE_WEBP),
+            ConvertFormat::JpegJxl => (IMAGE_JPEG, IMAGE_JXL),
+            ConvertFormat::PngJxl => (IMAGE_PNG, IMAGE_JXL),
             ConvertFormat::Disable => continue,
         };
         if let Some(targets) = convert_extensions.get_mut(source) {
@@ -747,6 +761,7 @@ async fn main() {
         webp: quality_of(args.webp_quality),
         png: quality_of(args.png_quality),
         jpeg: quality_of(args.jpeg_quality),
+        jxl: quality_of(args.jxl_quality),
         target_diff: args.target_diff,
     };
 

@@ -346,17 +346,24 @@ impl ImageInfo {
     /// (distance 0 = best, 15 = worst; quality 80 ≈ distance 3.0).
     #[cfg(feature = "jxl")]
     pub fn to_jxl(&self, quality: u8) -> Result<Vec<u8>> {
+        use jpegxl_rs::encode::EncoderFrame;
         let width = self.image.width();
         let height = self.image.height();
-        // JXL is encoded as RGB (3-channel); libjxl 0.11 requires explicit extra-channel
-        // initialisation for alpha which jpegxl-rs 0.11 does not expose, so alpha is dropped.
-        let rgb = self.rgb_bytes();
-        let pixels = rgb.as_ref();
+        // Opaque images encode as RGB (3 channels). Images with transparency keep their
+        // alpha as a JXL extra channel (4 channels) so PNG → JXL stays visually correct
+        // (jpegxl-rs 0.14 exposes this via has_alpha + a 4-channel EncoderFrame).
+        let has_alpha = !self.opaque;
+        let (pixels, channels): (Cow<'_, [u8]>, u32) = if has_alpha {
+            (self.rgba_bytes(), 4)
+        } else {
+            (self.rgb_bytes(), 3)
+        };
         // quality 0 → distance 15, quality 99 → distance ~0.15, quality >= 100 → lossless
         let mut encoder = if quality >= 100 {
             // Lossless requires uses_original_profile=true; set it explicitly so
             // JxlEncoderSetBasicInfo receives the correct value before frame encoding.
             jpegxl_rs::encoder_builder()
+                .has_alpha(has_alpha)
                 .lossless(true)
                 .uses_original_profile(true)
                 .build()
@@ -364,12 +371,14 @@ impl ImageInfo {
         } else {
             let distance = (100 - quality) as f32 * 15.0 / 100.0;
             jpegxl_rs::encoder_builder()
+                .has_alpha(has_alpha)
                 .quality(distance)
                 .build()
                 .map_err(|_| ImageError::Unknown)?
         };
+        let frame = EncoderFrame::new(pixels.as_ref()).num_channels(channels);
         let result = encoder
-            .encode::<u8, u8>(pixels, width, height)
+            .encode_frame::<u8, u8>(&frame, width, height)
             .map_err(|_| ImageError::Unknown)?;
         Ok(result.to_vec())
     }
@@ -452,9 +461,15 @@ mod tests {
         // lossless
         let lossless = img.to_jxl(100).unwrap();
         assert_ne!(lossless.len(), 0);
-        // round-trip decode produces RGB (alpha is dropped during encoding)
-        let decoded = super::jxl_decode(&lossy).unwrap();
+        // The source PNG is transparent; the lossless round-trip must keep its alpha
+        // (regression guard — alpha was previously dropped on the RGB-only encode path).
+        let decoded = super::jxl_decode(&lossless).unwrap();
         assert_eq!(decoded.width(), 144);
         assert_eq!(decoded.height(), 144);
+        let rgba = decoded.to_rgba8();
+        assert!(
+            rgba.pixels().any(|p| p.0[3] < 255),
+            "alpha channel was lost during JXL encode"
+        );
     }
 }

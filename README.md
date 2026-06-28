@@ -63,11 +63,12 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--output <DIR>` | — | Output directory (required unless `--overwrite`) |
 | `-o, --overwrite` | false | Write optimized files back to the source directory |
 | `-f, --format <FMT>` | jpeg,jpg,png | Only process these formats (`jpeg`, `jpg`, `png`) |
-| `--convert <CONV>` | all four | Format conversions to generate (`jpeg-avif`, `jpeg-webp`, `png-avif`, `png-webp`, `disable`) |
+| `--convert <CONV>` | all four | Format conversions to generate (`jpeg-avif`, `jpeg-webp`, `png-avif`, `png-webp`, `jpeg-jxl`, `png-jxl`, `disable`). JXL is opt-in (not in the default set) and needs the `jxl` build feature |
 | `--jpeg-quality <N>` | 80 | JPEG encode quality (0–100) |
 | `--png-quality <N>` | 90 | PNG encode quality (0–100) |
 | `--avif-quality <N>` | 80 | AVIF encode quality (0–100) |
 | `--webp-quality <N>` | 80 | WebP encode quality (0–99 lossy, ≥100 lossless) |
+| `--jxl-quality <N>` | 80 | JPEG XL encode quality (0–99 lossy, ≥100 lossless); used by `--convert *-jxl`. Alpha is preserved |
 | `--lossless` | false | Encode at maximum fidelity (forces every quality to 100). WebP becomes truly lossless; AVIF is only visually near-lossless (the rav1e encoder has no bit-exact mode); JPEG is max-quality lossy (no lossless mode); PNG uses its top palette. Overrides the per-format quality flags; cannot combine with `--auto-quality` / `--auto-format` |
 | `-t, --threads <N>` | CPU count | Number of parallel worker threads |
 | `--dry-run` | false | Preview results without writing any files |
