@@ -38,8 +38,14 @@ Download the archive for your platform from [GitHub Releases](https://github.com
 ### Build from source
 
 ```bash
+# Full CLI: HTTP/base64 loading + JPEG XL
 cargo install imageoptimize --features bin
+
+# Slim CLI: file:// only, no JXL — ~42% smaller binary
+cargo install imageoptimize --no-default-features --features bin
 ```
+
+See [Cargo features](#cargo-features) for what the optional dependencies pull in.
 
 ## Usage
 
@@ -276,6 +282,34 @@ let bytes = result.get_buffer()?;
 | `jpeg` / `png` / `webp` | Ignored |
 
 Watermark positions: `leftTop`, `top`, `rightTop`, `left`, `center`, `right`, `leftBottom`, `bottom`, `rightBottom` (default).
+
+## Cargo features
+
+| Feature | Default | Pulls in | Description |
+|---------|---------|----------|-------------|
+| `network` | ✅ | `reqwest` + a TLS stack | HTTP/base64 image loading (the `load` task's `http(s)://` URLs). |
+| `jxl` | ✅ | vendored libjxl | JPEG XL encode/decode. |
+| `bin` | — | clap, tokio, glob | Builds the CLI binary. |
+
+`network` and `jxl` are each backed by a large C library, so they dominate the binary
+size. They are **on by default** (existing behaviour is unchanged), but dropping them with
+`default-features = false` produces a `file://`-only, no-JXL build that is **~42% smaller**:
+
+```toml
+# Full
+imageoptimize = "0.5"
+
+# Slim: no HTTP loading, no JXL
+imageoptimize = { version = "0.5", default-features = false }
+```
+
+Disabling a feature does not change the API — exercising a disabled path (an `http(s)://`
+URL with `network` off, or a JXL encode/decode with `jxl` off) returns a clear runtime
+error instead.
+
+The decoders for raster inputs (`jpeg`, `png`, `gif`, `webp`, `avif`) are always available;
+EXR/TIFF/BMP and other formats `image` would normally enable are turned off to keep the
+default build small.
 
 ## License
 

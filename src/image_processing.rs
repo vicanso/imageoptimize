@@ -1,7 +1,7 @@
 use super::images::{avif_decode, jxl_decode, to_gif, ImageError, ImageInfo};
 use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
-use dssim_core::Dssim;
+use dssim_core::{Dssim, DssimImage};
 use exif::{In, Reader, Tag};
 use fast_image_resize::images::Image as FirImage;
 use fast_image_resize::{FilterType as FirFilter, PixelType, ResizeAlg, ResizeOptions, Resizer};
@@ -848,34 +848,65 @@ impl ProcessImage {
     }
 }
 
-/// Compute the DSSIM score (×1000) between an original RGBA snapshot and a candidate
-/// image. Returns -1.0 when the dimensions differ (not comparable).
-fn dssim_score(original: &RgbaImage, di: &DynamicImage) -> f64 {
-    // 如果宽高不一致，则不比对
-    if original.width() != di.width() || original.height() != di.height() {
-        return -1.0;
-    }
-    let width = original.width() as usize;
-    let height = original.height() as usize;
-    let attr = Dssim::new();
-    let gp1 = attr
-        .create_image_rgba(original.as_raw().as_rgba(), width, height)
-        .unwrap();
-    let tmp;
-    let current_rgba = match di {
-        DynamicImage::ImageRgba8(img) => img,
-        other => {
-            tmp = other.to_rgba8();
-            &tmp
+/// Holds the DSSIM context and the original's prepared image so a quality binary
+/// search can score many candidates without re-preprocessing the original each time
+/// (`create_image_rgba` builds multi-scale pyramids — the expensive half of a compare).
+struct DiffScorer {
+    attr: Dssim,
+    original: DssimImage<f32>,
+    width: usize,
+    height: usize,
+}
+
+impl DiffScorer {
+    fn new(original: &RgbaImage) -> Self {
+        let width = original.width() as usize;
+        let height = original.height() as usize;
+        let attr = Dssim::new();
+        let prepared = attr
+            .create_image_rgba(original.as_raw().as_rgba(), width, height)
+            .unwrap();
+        DiffScorer {
+            attr,
+            original: prepared,
+            width,
+            height,
         }
-    };
-    let gp2 = attr
-        .create_image_rgba(current_rgba.as_raw().as_rgba(), width, height)
-        .unwrap();
-    let (diff, _) = attr.compare(&gp1, gp2);
-    let value: f64 = diff.into();
-    // 放大1千倍
-    value * 1000.0
+    }
+
+    /// DSSIM score (×1000) of a candidate against the prepared original.
+    /// Returns -1.0 when the dimensions differ (not comparable).
+    fn score(&self, di: &DynamicImage) -> f64 {
+        // 如果宽高不一致，则不比对
+        if self.width != di.width() as usize || self.height != di.height() as usize {
+            return -1.0;
+        }
+        let tmp;
+        let current_rgba = match di {
+            DynamicImage::ImageRgba8(img) => img,
+            other => {
+                tmp = other.to_rgba8();
+                &tmp
+            }
+        };
+        let Some(gp2) =
+            self.attr
+                .create_image_rgba(current_rgba.as_raw().as_rgba(), self.width, self.height)
+        else {
+            return -1.0;
+        };
+        let (diff, _) = self.attr.compare(&self.original, gp2);
+        let value: f64 = diff.into();
+        // 放大1千倍
+        value * 1000.0
+    }
+}
+
+/// Compute the DSSIM score (×1000) between an original RGBA snapshot and a candidate
+/// image. Returns -1.0 when the dimensions differ (not comparable). For repeated
+/// comparisons against the same original (quality search), build a `DiffScorer` once.
+fn dssim_score(original: &RgbaImage, di: &DynamicImage) -> f64 {
+    DiffScorer::new(original).score(di)
 }
 
 /// Encode an `ImageInfo` to bytes for a quality-tunable format. GIF is not supported here
@@ -2262,14 +2293,14 @@ impl AutoOptimProcess {
     fn encode_candidate(
         &self,
         info: &ImageInfo,
-        original: Option<&RgbaImage>,
+        scorer: Option<&DiffScorer>,
         ext: &str,
         quality: u8,
     ) -> Result<Candidate> {
         let buffer = encode_info(info, ext, quality, self.speed)?;
         let di = decode_to_di(&buffer, ext)?;
-        let diff = match original {
-            Some(o) => dssim_score(o, &di),
+        let diff = match scorer {
+            Some(s) => s.score(&di),
             None => -1.0,
         };
         Ok(Candidate {
@@ -2285,7 +2316,7 @@ impl AutoOptimProcess {
     fn search_quality(
         &self,
         info: &ImageInfo,
-        original: &RgbaImage,
+        scorer: &DiffScorer,
         ext: &str,
     ) -> Result<Candidate> {
         let mut lo = AUTO_MIN_QUALITY;
@@ -2293,7 +2324,7 @@ impl AutoOptimProcess {
         let mut best: Option<Candidate> = None;
         while lo <= hi {
             let mid = lo + (hi - lo) / 2;
-            let cand = self.encode_candidate(info, Some(original), ext, mid)?;
+            let cand = self.encode_candidate(info, Some(scorer), ext, mid)?;
             if cand.diff >= 0.0 && cand.diff <= self.target_diff {
                 // Meets the target — record it and try an even lower quality for a smaller file.
                 best = Some(cand);
@@ -2307,19 +2338,23 @@ impl AutoOptimProcess {
         }
         match best {
             Some(c) => Ok(c),
-            None => self.encode_candidate(info, Some(original), ext, AUTO_MAX_QUALITY),
+            None => self.encode_candidate(info, Some(scorer), ext, AUTO_MAX_QUALITY),
         }
     }
 
     fn best_candidate(&self, info: &ImageInfo, original: Option<&RgbaImage>) -> Result<Candidate> {
         let formats = self.candidate_formats(info);
+        // Prepare the original's DSSIM pyramids once and reuse across every format and
+        // every quality probe (instead of re-preprocessing it on each comparison).
+        let scorer = original.map(DiffScorer::new);
+        let scorer = scorer.as_ref();
         let mut candidates = Vec::with_capacity(formats.len());
         for ext in &formats {
-            let cand = match (self.quality, original) {
-                (None, Some(orig)) => self.search_quality(info, orig, ext)?,
+            let cand = match (self.quality, scorer) {
+                (None, Some(s)) => self.search_quality(info, s, ext)?,
                 // No original to score against: fall back to a single high-quality encode.
                 (None, None) => self.encode_candidate(info, None, ext, AUTO_MAX_QUALITY)?,
-                (Some(q), _) => self.encode_candidate(info, original, ext, q)?,
+                (Some(q), _) => self.encode_candidate(info, scorer, ext, q)?,
             };
             candidates.push(cand);
         }

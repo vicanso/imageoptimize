@@ -37,8 +37,14 @@ curl -fsSL https://raw.githubusercontent.com/vicanso/imageoptimize/main/install.
 ### 从源码构建
 
 ```bash
+# 完整 CLI：HTTP/base64 加载 + JPEG XL
 cargo install imageoptimize --features bin
+
+# 精简 CLI：仅 file://、无 JXL —— 二进制小约 42%
+cargo install imageoptimize --no-default-features --features bin
 ```
+
+可选依赖各自引入的内容见 [Cargo features](#cargo-features)。
 
 ## 使用方法
 
@@ -275,6 +281,31 @@ let bytes = result.get_buffer()?;
 | `jpeg` / `png` / `webp` | 忽略此参数 |
 
 水印位置：`leftTop`、`top`、`rightTop`、`left`、`center`、`right`、`leftBottom`、`bottom`、`rightBottom`（默认）。
+
+## Cargo features
+
+| Feature | 默认 | 引入 | 说明 |
+|---------|------|------|------|
+| `network` | ✅ | `reqwest` + 一套 TLS | HTTP/base64 图片加载（`load` 任务的 `http(s)://` URL）。 |
+| `jxl` | ✅ | vendored libjxl | JPEG XL 编解码。 |
+| `bin` | — | clap、tokio、glob | 构建 CLI 可执行文件。 |
+
+`network` 和 `jxl` 各自背后是一个大型 C 库，体积占比很高。二者**默认开启**（行为不变），
+但用 `default-features = false` 关掉后可得到仅 `file://`、无 JXL 的构建，**体积小约 42%**：
+
+```toml
+# 完整
+imageoptimize = "0.5"
+
+# 精简：无 HTTP 加载、无 JXL
+imageoptimize = { version = "0.5", default-features = false }
+```
+
+关闭 feature 不改变 API——走到被关闭的路径（`network` 关时的 `http(s)://` URL，或
+`jxl` 关时的 JXL 编解码）会返回明确的运行时错误，而不是编译失败。
+
+光栅输入解码器（`jpeg`、`png`、`gif`、`webp`、`avif`）始终可用；`image` 默认会带的
+EXR/TIFF/BMP 等格式已关闭，以保持默认构建精简。
 
 ## 许可证
 
