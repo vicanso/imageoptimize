@@ -15,14 +15,17 @@
 // limitations under the License.
 
 use clap::{Parser, ValueEnum};
-use glob::{glob, Pattern};
-use imageoptimize::{run_with_image, strip_exif_bytes, ImageProcessingError, ProcessImage};
+use glob::{glob_with, MatchOptions, Pattern};
+use imageoptimize::{
+    get_exif_orientation, run_with_image, strip_exif_bytes, ImageProcessingError, ProcessImage,
+};
 use nu_ansi_term::Color::{LightCyan, LightGreen, LightRed, LightYellow};
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use tokio::fs;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -141,6 +144,8 @@ enum ImageFormat {
     Jpg,
     #[value(name = "png")]
     Png,
+    #[value(name = "webp")]
+    Webp,
 }
 
 impl ImageFormat {
@@ -149,6 +154,89 @@ impl ImageFormat {
             ImageFormat::Jpeg => vec!["jpeg"],
             ImageFormat::Jpg => vec!["jpg"],
             ImageFormat::Png => vec!["png"],
+            ImageFormat::Webp => vec!["webp"],
+        }
+    }
+}
+
+/// Map a matched source path into the output tree by swapping only the leading `source`
+/// directory for `output`; a deeper path component that repeats the source name is left
+/// alone.
+fn output_path(path: &Path, source: &str, output: &str) -> PathBuf {
+    if source == output {
+        return path.to_path_buf();
+    }
+    // glob may drop a leading "./" from the pattern, so try the bare form as well.
+    let bare = source.strip_prefix("./").unwrap_or(source);
+    match path
+        .strip_prefix(source)
+        .or_else(|_| path.strip_prefix(bare))
+    {
+        Ok(rel) => Path::new(output).join(rel),
+        Err(_) => PathBuf::from(path.to_string_lossy().replacen(source, output, 1)),
+    }
+}
+
+fn modified(path: impl AsRef<Path>) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Pixel width of a source as displayed, i.e. after its EXIF orientation is applied, read
+/// from the file header without decoding.
+fn source_width(file: &str) -> Option<u32> {
+    let (w, h) = image::ImageReader::open(file)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    // EXIF sits near the start of JPEG/PNG files; a prefix avoids reading whole photos.
+    let mut head = Vec::new();
+    std::fs::File::open(file)
+        .ok()?
+        .take(1024 * 1024)
+        .read_to_end(&mut head)
+        .ok()?;
+    Some(if get_exif_orientation(&head) >= 5 {
+        h
+    } else {
+        w
+    })
+}
+
+/// How `--incremental` locates the outputs a source produces.
+#[derive(Clone, Copy)]
+enum IncrementalMode<'a> {
+    /// The target path is written as-is.
+    Fixed,
+    /// The encoder picks the extension, so any candidate format counts.
+    AutoFormat,
+    /// One file per variant narrower than the source.
+    Srcset {
+        variants: &'a [Variant],
+        pattern: &'a str,
+    },
+}
+
+/// True when every output `target` stands for already exists and is newer than `file`.
+fn is_up_to_date(file: &str, target: &str, mode: IncrementalMode) -> bool {
+    let Some(src_mtime) = modified(file) else {
+        return false;
+    };
+    let fresh = |path: &Path| modified(path).is_some_and(|t| t > src_mtime);
+    match mode {
+        IncrementalMode::Fixed => fresh(Path::new(target)),
+        IncrementalMode::AutoFormat => [IMAGE_WEBP, IMAGE_AVIF, IMAGE_JPEG, IMAGE_PNG]
+            .iter()
+            .any(|ext| fresh(&Path::new(target).with_extension(ext))),
+        IncrementalMode::Srcset { variants, pattern } => {
+            let Some(src_w) = source_width(file) else {
+                return false;
+            };
+            variants
+                .iter()
+                .filter(|v| v.pixel_width() < src_w)
+                .all(|&v| fresh(Path::new(&srcset_path(target, pattern, v))))
         }
     }
 }
@@ -188,7 +276,7 @@ struct Args {
         short,
         long,
         value_enum,
-        help = "Filter by image formats (jpeg, jpg, png). Default: jpeg,jpg,png"
+        help = "Filter by image formats (jpeg, jpg, png, webp; extensions match case-insensitively). Default: jpeg,jpg,png"
     )]
     format: Option<Vec<ImageFormat>>,
 
@@ -373,17 +461,27 @@ struct EncodeFlags {
 }
 
 /// Decode and EXIF-orient a source file exactly once, applying the optional resize.
-/// The returned `ProcessImage` keeps the original RGBA snapshot so each output format
-/// can compute its own diff, and is cloned per target instead of re-decoding the source.
-async fn load_base(file: &str, resize: Option<(u32, u32)>) -> Result<ProcessImage> {
+/// The returned `ProcessImage` is cloned per target instead of re-decoding the source.
+/// `keep_original` retains the original RGBA snapshot so each output can compute its own
+/// diff; without it the snapshot copy and the post-encode re-decode are both skipped.
+async fn load_base(
+    file: &str,
+    resize: Option<(u32, u32)>,
+    keep_original: bool,
+) -> Result<ProcessImage> {
     let bytes = fs::read(file).await.context(WriteFileSnafu)?;
     let ext = Path::new(file)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    // ProcessImage::new keeps the original snapshot (needed for the per-target diff).
-    let base =
-        tokio::task::block_in_place(|| ProcessImage::new(bytes, ext)).context(OptimizeSnafu)?;
+    let base = tokio::task::block_in_place(|| {
+        if keep_original {
+            ProcessImage::new(bytes, ext)
+        } else {
+            ProcessImage::new_without_original(bytes, ext)
+        }
+    })
+    .context(OptimizeSnafu)?;
     match resize {
         Some((max_w, max_h)) => run_with_image(
             base,
@@ -410,7 +508,13 @@ async fn encode_target(
     qualities: &ImageQualities,
     flags: EncodeFlags,
 ) -> Result<(usize, usize, f64, bool, bool, Option<String>)> {
-    let placeholder_type = target.split('.').next_back().unwrap_or_default();
+    // Lowercased so `IMG_0001.PNG` is encoded as PNG rather than falling through to JPEG.
+    let placeholder_type = target
+        .split('.')
+        .next_back()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let placeholder_type = placeholder_type.as_str();
 
     // Build the optim task:
     //  - auto-format: search both format and quality (the encoder picks the extension);
@@ -490,33 +594,52 @@ async fn encode_target(
     let src_ext = Path::new(file)
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let src_ext = src_ext.as_str();
     // A width variant is a distinct derivative, never a replacement for the source,
     // so it always writes its encoded output (never falls back to the original).
     let same_format = src_ext == out_ext;
     if !flags.is_variant && same_format && size >= img.original_size {
-        if !flags.dry_run && file != write_target {
-            if let Some(parent) = Path::new(&write_target).parent() {
-                fs::create_dir_all(parent).await.context(CreateDirSnafu)?;
+        // Read the source back only when it has to be copied out or stripped.
+        let original = if flags.strip_exif || file != write_target {
+            Some(fs::read(file).await.context(WriteFileSnafu)?)
+        } else {
+            None
+        };
+        // Stripping EXIF also drops the orientation tag, so a rotated source would display
+        // sideways; for those fall through and write the re-encoded (already upright) output.
+        let rotated = flags.strip_exif
+            && original
+                .as_deref()
+                .is_some_and(|b| get_exif_orientation(b) != 1);
+        if !rotated {
+            if let (Some(original), false) = (original, flags.dry_run) {
+                let original_len = original.len();
+                let bytes_to_write = if flags.strip_exif {
+                    strip_exif_bytes(original, src_ext)
+                } else {
+                    original
+                };
+                // In place, only rewrite when stripping actually removed metadata.
+                if file != write_target || bytes_to_write.len() != original_len {
+                    if let Some(parent) = Path::new(&write_target).parent() {
+                        fs::create_dir_all(parent).await.context(CreateDirSnafu)?;
+                    }
+                    fs::write(&write_target, bytes_to_write)
+                        .await
+                        .context(WriteFileSnafu)?;
+                }
             }
-            let original = fs::read(file).await.context(WriteFileSnafu)?;
-            let bytes_to_write = if flags.strip_exif {
-                strip_exif_bytes(original, src_ext)
-            } else {
-                original
-            };
-            fs::write(&write_target, bytes_to_write)
-                .await
-                .context(WriteFileSnafu)?;
+            return Ok((
+                img.original_size,
+                img.original_size,
+                img.diff,
+                existed,
+                true,
+                out_path,
+            ));
         }
-        return Ok((
-            img.original_size,
-            img.original_size,
-            img.diff,
-            existed,
-            true,
-            out_path,
-        ));
     }
 
     if !flags.dry_run {
@@ -684,14 +807,16 @@ async fn main() {
         let pattern = format!("{source}/**/*.{ext}");
         if !quiet {
             println!(
-                "{}",
-                format!(
-                    "Searching pattern: {}",
-                    LightCyan.paint(relative(&pattern, &base))
-                )
+                "Searching pattern: {}",
+                LightCyan.paint(relative(&pattern, &base))
             );
         }
-        let entries = match glob(&pattern) {
+        // Case-insensitive so camera exports like `IMG_0001.JPG` are found too.
+        let options = MatchOptions {
+            case_sensitive: false,
+            ..MatchOptions::new()
+        };
+        let entries = match glob_with(&pattern, options) {
             Ok(entries) => entries,
             Err(e) => {
                 println!("{}", LightRed.paint(format!("Error reading path: {e}")));
@@ -723,23 +848,18 @@ async fn main() {
                 }
             }
 
-            let ext = path.extension().unwrap_or_default();
-            let ext = ext.to_str().unwrap_or_default();
-            let image_type = match ext {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let image_type = match ext.as_str() {
                 "png" => IMAGE_PNG,
+                "webp" => IMAGE_WEBP,
                 _ => IMAGE_JPEG,
             };
             let file = path.to_string_lossy().to_string();
-            let target = if source == output {
-                path
-            } else {
-                Path::new(
-                    &path
-                        .to_string_lossy()
-                        .replace(source.as_str(), output.as_str()),
-                )
-                .to_path_buf()
-            };
+            let target = output_path(&path, &source, &output);
             let mut targets = vec![];
             // Auto-format emits a single best-format output per source, so the fixed
             // conversion matrix is skipped — only the placeholder target is queued.
@@ -793,18 +913,17 @@ async fn main() {
     // --incremental: drop targets whose output is already newer than the source.
     let mut incremental_skipped = 0usize;
     if incremental && source != output {
-        image_optimize_params.retain(|item| {
-            let src_mtime = std::fs::metadata(&item.file)
-                .and_then(|m| m.modified())
-                .ok();
-            let tgt_mtime = std::fs::metadata(&item.target)
-                .and_then(|m| m.modified())
-                .ok();
-            match (src_mtime, tgt_mtime) {
-                (Some(s), Some(t)) => t <= s,
-                _ => true,
+        let mode = if srcset_mode {
+            IncrementalMode::Srcset {
+                variants: &variants,
+                pattern: &srcset_pattern,
             }
-        });
+        } else if auto_format_mode {
+            IncrementalMode::AutoFormat
+        } else {
+            IncrementalMode::Fixed
+        };
+        image_optimize_params.retain(|item| !is_up_to_date(&item.file, &item.target, mode));
         let remaining: std::collections::HashSet<&str> = image_optimize_params
             .iter()
             .map(|i| i.file.as_str())
@@ -888,6 +1007,9 @@ async fn main() {
         auto_format: false,
         ..normal_flags
     };
+    // The original snapshot only feeds the explicit diff task: auto modes score against
+    // their own encoder input, and srcset variants are always resized (so never comparable).
+    let keep_original = !no_diff && !normal_flags.auto_quality && !normal_flags.auto_format;
     let lqip_enabled = args.lqip;
     let lqip_width = args.lqip_width;
     let mut join_set: JoinSet<(String, Vec<TargetOutcome>, Option<String>)> = JoinSet::new();
@@ -903,7 +1025,7 @@ async fn main() {
 
             if variants.is_empty() {
                 // Normal mode: decode + resize once, encode each target format.
-                match load_base(&file, resize).await {
+                match load_base(&file, resize, keep_original).await {
                     Ok(base) => {
                         if lqip_enabled {
                             lqip = base.lqip_data_uri(lqip_width).ok();
@@ -939,7 +1061,7 @@ async fn main() {
                 }
             } else {
                 // srcset / density mode: decode once (no resize here), then variant × format.
-                match load_base(&file, None).await {
+                match load_base(&file, None, false).await {
                     Ok(base) => {
                         if lqip_enabled {
                             lqip = base.lqip_data_uri(lqip_width).ok();
@@ -1061,7 +1183,7 @@ async fn main() {
                             LightGreen.paint(&diff_num).to_string()
                         }
                     };
-                    let percent = size * 100 / original_size;
+                    let percent = (size * 100).checked_div(original_size).unwrap_or(0);
                     let status = if existed {
                         LightYellow.paint("(U)").to_string()
                     } else {
@@ -1123,7 +1245,7 @@ async fn main() {
                 // summary; avif/webp conversions are reported per row but not summed.
                 // Auto-format always yields a single replacement output, so it counts too.
                 None => {
-                    if auto_format_mode || src_ext == tgt_ext {
+                    if auto_format_mode || src_ext.eq_ignore_ascii_case(&tgt_ext) {
                         match &result {
                             Ok((size, original_size, _, _, skipped, _)) => {
                                 if *skipped {
@@ -1220,11 +1342,7 @@ async fn main() {
         }
     } else if summary_count > 0 || summary_skipped > 0 || summary_errors > 0 {
         let saved = summary_original.saturating_sub(summary_optimized);
-        let saved_pct = if summary_original > 0 {
-            saved * 100 / summary_original
-        } else {
-            0
-        };
+        let saved_pct = (saved * 100).checked_div(summary_original).unwrap_or(0);
         let skipped_note = if summary_skipped > 0 {
             format!(
                 ", {} unchanged",
@@ -1265,7 +1383,58 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_u32_list, srcset_path, Variant};
+    use super::{
+        is_up_to_date, output_path, parse_u32_list, srcset_path, IncrementalMode, Variant,
+    };
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn test_output_path() {
+        // Only the leading source directory is swapped, not a repeated name deeper down.
+        assert_eq!(
+            output_path(Path::new("img/a/img/b.png"), "img", "out"),
+            PathBuf::from("out/a/img/b.png")
+        );
+        assert_eq!(
+            output_path(Path::new("img/b.png"), "./img", "out"),
+            PathBuf::from("out/b.png")
+        );
+        assert_eq!(
+            output_path(Path::new("img/b.png"), "img", "img"),
+            PathBuf::from("img/b.png")
+        );
+    }
+
+    #[test]
+    fn test_is_up_to_date() {
+        let dir = std::env::temp_dir().join(format!("imageoptimize-incr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("photo.png");
+        image::RgbImage::new(100, 50).save(&src).unwrap();
+        let src = src.to_string_lossy().into_owned();
+        // Outputs are written after the source, so they count as fresh.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let target = dir.join("out.png").to_string_lossy().into_owned();
+
+        assert!(!is_up_to_date(&src, &target, IncrementalMode::Fixed));
+        std::fs::write(dir.join("out.webp"), b"x").unwrap();
+        assert!(!is_up_to_date(&src, &target, IncrementalMode::Fixed));
+        // Auto-format may have written any candidate extension.
+        assert!(is_up_to_date(&src, &target, IncrementalMode::AutoFormat));
+
+        // srcset: only variants narrower than the 100px source are expected.
+        let variants = [Variant::Width(40), Variant::Width(80), Variant::Width(200)];
+        let mode = IncrementalMode::Srcset {
+            variants: &variants,
+            pattern: "{name}-{w}w.{ext}",
+        };
+        std::fs::write(dir.join("out-40w.png"), b"x").unwrap();
+        assert!(!is_up_to_date(&src, &target, mode));
+        std::fs::write(dir.join("out-80w.png"), b"x").unwrap();
+        assert!(is_up_to_date(&src, &target, mode));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn test_parse_u32_list() {

@@ -61,7 +61,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `-s, --source <DIR>` | — | 源目录（位置参数的替代写法） |
 | `--output <DIR>` | — | 输出目录（与 `--overwrite` 二选一，必填其一） |
 | `-o, --overwrite` | false | 将优化后的文件写回源目录 |
-| `-f, --format <FMT>` | jpeg,jpg,png | 仅处理指定格式（`jpeg`、`jpg`、`png`） |
+| `-f, --format <FMT>` | jpeg,jpg,png | 仅处理指定格式（`jpeg`、`jpg`、`png`、`webp`）；扩展名不区分大小写，`IMG_0001.JPG` 也会被处理 |
 | `--convert <CONV>` | 全部四种 | 生成的格式转换类型（`jpeg-avif`、`jpeg-webp`、`png-avif`、`png-webp`、`jpeg-jxl`、`png-jxl`、`disable`）。JXL 为可选项（不在默认集合内），需要 `jxl` 构建特性 |
 | `--jpeg-quality <N>` | 80 | JPEG 编码质量（0–100） |
 | `--png-quality <N>` | 90 | PNG 编码质量（0–100） |
@@ -77,7 +77,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--resize <WxH>` | — | 编码前将超出尺寸的图片缩放至指定范围内，小图不受影响（如 `1920x1080`、`1920x0`） |
 | `--strip-exif` | false | 从输出文件中移除 EXIF 元数据（含 GPS 定位），无需重新编码 |
 | `--avif-speed <N>` | 4 | AVIF 编码速度（0 = 最慢/最佳质量，10 = 最快/较低质量） |
-| `--incremental` | false | 跳过所有输出文件均比源文件新的图片（仅适用于 `--output` 模式） |
+| `--incremental` | false | 跳过所有输出文件均比源文件新的图片（仅适用于 `--output` 模式）。支持 `--auto-format`（任一候选扩展名的输出均算数）和 `--widths` / `--densities`（所有应生成的变体都需是最新的） |
 | `--no-diff` | false | 跳过 DSSIM 评分；避免为算分而二次解码 AVIF/JXL（DIFF 列显示 `—`） |
 | `--widths <W1,W2,...>` | — | 按宽度生成响应式 `srcset` 的 `Nw` 描述符（流式图，如 `320,640,1280`）。宽度 ≥ 源宽的会被跳过（不放大）；设置后忽略 `--resize`。与 `--densities` 互斥 |
 | `--densities <D1,D2,...>` | — | 按像素密度生成 `srcset` 的 `Nx` 描述符（固定尺寸图，如 `1,2,3`）。需配合 `--base-width`，每份输出为 base-width × 倍率 像素；宽度 ≥ 源宽的倍率会被跳过。与 `--widths` 互斥 |
@@ -247,6 +247,21 @@ let result = run(vec![
 let bytes = result.get_buffer()?;
 ```
 
+所有任务会在执行第一个之前全部解析并校验：未知任务名或参数格式错误（如 `["rotate", "abc"]`）会直接返回错误，不会先去下载或解码图片。也可以用 `Task` + `run_tasks` 直接构建强类型流水线。
+
+**不可信的任务输入：** 默认情况下 `load` / `watermark` 接受 `http(s)://`、`file://` 和 base64，编码后输入最大 200 MB。运行用户提交任务的服务应收紧限制：
+
+```rust
+use imageoptimize::{run_with_options, LoadOptions, ProcessImage};
+
+let options = LoadOptions { allow_file: false, max_bytes: 20 * 1024 * 1024, ..Default::default() };
+let result = run_with_options(ProcessImage::default(), tasks, &options).await?;
+```
+
+解码时会拒绝像素缓冲超过 512 MB 的图片（在分配内存前根据文件头判断，AVIF 与 JPEG XL 同样生效）；带嵌入 ICC 配置文件的图片（如手机拍摄的 Display P3 照片）会在加载时转换为 sRGB，重新编码后颜色保持正确。
+
+各处理器均为 CPU 密集型；在异步服务中请通过运行时的阻塞接口（如 `tokio::task::spawn_blocking`）执行流水线，避免编码阻塞其他任务。
+
 ### 可用任务
 
 | 任务 | 辅助函数 | 参数 | 说明 |
@@ -257,7 +272,7 @@ let bytes = result.get_buffer()?;
 | `crop` | `new_crop_task(x, y, w, h)` | x、y、宽度、高度 | 裁剪区域 |
 | `gray` | `new_gray_task()` | — | 转为灰度图 |
 | `flip` | `new_flip_task(dir)` | `"h"` / `"horizontal"` 或 `"v"` / `"vertical"` | 翻转图片 |
-| `rotate` | `new_rotate_task(deg)` | `90`、`180`、`270` | 旋转（其他值无效果） |
+| `rotate` | `new_rotate_task(deg)` | 90 的倍数（`90`、`180`、`270`） | 旋转（其他角度会报错） |
 | `brighten` | `new_brighten_task(val)` | 整数，正值增亮 / 负值变暗 | 调整亮度 |
 | `contrast` | `new_contrast_task(val)` | 浮点数，正值增强 / 负值减弱 | 调整对比度 |
 | `sharpen` | `new_sharpen_task(sigma, threshold)` | sigma（如 `1.0`）、threshold（如 `0`） | USM 锐化 |
@@ -275,7 +290,7 @@ let bytes = result.get_buffer()?;
 | `strip` | `new_strip_task()` | — | 从编码后的缓冲区移除 EXIF 元数据，无需重新编码（支持 JPEG、PNG、WebP） |
 | `padding` | `new_padding_task(w, h, color)` | 宽度、高度、十六进制颜色（`#rrggbb` / `#rrggbbaa`，默认透明） | 扩展画布并居中图片 |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url、位置、左边距、上边距 | 叠加水印 |
-| `optim` | `new_optim_task(fmt, quality, speed)` | 格式（`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`）、质量 0–100、速度 | 编码并压缩 |
+| `optim` | `new_optim_task(fmt, quality, speed)` | 格式（`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`）、质量 0–100、速度 | 编码并压缩。未经变换的动态 GIF 输出为 `gif` 或 `webp` 时保持动画；经过变换（缩放、裁剪等）或由其他格式转换时，`gif` 输出为单帧 |
 | `optim`（自动质量） | `new_auto_quality_task(fmt, speed, target)` | 格式、速度、目标 DSSIM ×1000 | 二分搜索使感知差异保持在 `target` 内的最低质量 |
 | `optim`（自动格式） | `new_auto_format_task(quality, speed, target)` | 质量 0–100、速度、目标 DSSIM ×1000 | 编码多个候选格式（按是否含透明：webp/avif/png 或 webp/avif/jpeg），保留满足 `target` 的最小者 |
 | `optim`（全自动） | `new_auto_task(speed, target)` | 速度、目标 DSSIM ×1000 | 同时搜索格式与质量，取满足 `target` 的最小输出 |
@@ -286,7 +301,7 @@ let bytes = result.get_buffer()?;
 | 格式 | 作用 |
 |------|------|
 | `avif` | 编码速度 0–10，值越小速度越慢但压缩率/质量越好（默认 `0`） |
-| `gif`  | 重新编码动态 GIF 时帧之间的延迟，单位为百分之一秒 |
+| `gif`  | 调色板量化速度 1–30（越小调色板质量越好、速度越慢；超出范围会自动截断） |
 | `jxl`  | 忽略此参数（编码 effort 固定） |
 | `jpeg` / `png` / `webp` | 忽略此参数 |
 

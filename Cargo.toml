@@ -37,12 +37,13 @@ jxl = ["jpegxl-rs"]
 
 [dependencies]
 avif-decode = "1.0.2"
-base64 = "0.22.1"
-bytes = "1.12.0"
+avif-parse = "2.1.0"
+base64 = "0.23.1"
+bytes = "1.12.1"
 kamadak-exif = "0.6.1"
-clap = { version = "4.6.1", features = ["derive"], optional = true }
-dssim-core = "3.4.0"
-glob = { version = "0.3.3", optional = true }
+clap = { version = "4.6.6", features = ["derive"], optional = true }
+dssim-core = "3.5.1"
+glob = { version = "0.3.4", optional = true }
 image = { version = "0.25.10", default-features = false, features = [
     "jpeg",
     "png",
@@ -51,16 +52,17 @@ image = { version = "0.25.10", default-features = false, features = [
     "avif",
     "rayon",
 ] }
-jpegxl-rs = { version = "0.14", features = ["vendored"], optional = true }
+jpegxl-rs = { version = "0.15", features = ["vendored"], optional = true }
 imagequant = { version = "4.4.1", features = ["threads"] }
 lodepng = "3.12.2"
 mozjpeg = "0.10.13"
 nu-ansi-term = { version = "0.50.3", optional = true }
 num_cpus = { version = "1.17.0", optional = true }
-reqwest = { version = "0.13.4", optional = true }
+qcms = "0.3.0"
+reqwest = { version = "0.13.5", optional = true }
 rgb = "0.8.52"
-snafu = "0.9.1"
-tokio = { version = "1.52.3", features = [
+snafu = "0.9.2"
+tokio = { version = "1.53.1", features = [
     "rt",
     "fs",
     "macros",
@@ -71,7 +73,7 @@ urlencoding = "2.1.3"
 webp = "0.3.1"
 img-parts = "0.4.0"
 rayon = "1.12.0"
-fast_image_resize = "6.0.0"
+fast_image_resize = "6.1.0"
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"

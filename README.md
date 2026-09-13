@@ -62,7 +62,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `-s, --source <DIR>` | — | Source directory (alternative to positional arg) |
 | `--output <DIR>` | — | Output directory (required unless `--overwrite`) |
 | `-o, --overwrite` | false | Write optimized files back to the source directory |
-| `-f, --format <FMT>` | jpeg,jpg,png | Only process these formats (`jpeg`, `jpg`, `png`) |
+| `-f, --format <FMT>` | jpeg,jpg,png | Only process these formats (`jpeg`, `jpg`, `png`, `webp`); extensions match case-insensitively, so `IMG_0001.JPG` is included |
 | `--convert <CONV>` | all four | Format conversions to generate (`jpeg-avif`, `jpeg-webp`, `png-avif`, `png-webp`, `jpeg-jxl`, `png-jxl`, `disable`). JXL is opt-in (not in the default set) and needs the `jxl` build feature |
 | `--jpeg-quality <N>` | 80 | JPEG encode quality (0–100) |
 | `--png-quality <N>` | 90 | PNG encode quality (0–100) |
@@ -78,7 +78,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--resize <WxH>` | — | Resize images to fit within WxH before encoding; smaller images are untouched (e.g. `1920x1080`, `1920x0`) |
 | `--strip-exif` | false | Strip EXIF metadata (including GPS) from output files without re-encoding |
 | `--avif-speed <N>` | 4 | AVIF encoder speed (0 = slowest/best quality, 10 = fastest/lower quality) |
-| `--incremental` | false | Skip images whose every output file is already newer than the source; only applies with `--output` |
+| `--incremental` | false | Skip images whose every output file is already newer than the source; only applies with `--output`. Understands `--auto-format` (any candidate extension counts) and `--widths` / `--densities` (every expected variant must be fresh) |
 | `--no-diff` | false | Skip the DSSIM diff metric; avoids re-decoding AVIF/JXL output just to score it (DIFF column shows `—`) |
 | `--widths <W1,W2,...>` | — | Generate one output per width for responsive `srcset` `Nw` descriptors (fluid images), e.g. `320,640,1280`. Widths ≥ the source width are skipped (no upscaling); `--resize` is ignored when set. Mutually exclusive with `--densities` |
 | `--densities <D1,D2,...>` | — | Generate one output per pixel density for `srcset` `Nx` descriptors (fixed-size images), e.g. `1,2,3`. Requires `--base-width`; each output is base-width × density pixels. Densities whose width ≥ the source are skipped. Mutually exclusive with `--widths` |
@@ -250,6 +250,21 @@ let result = run(vec![
 let bytes = result.get_buffer()?;
 ```
 
+Every task is parsed and validated before the first one runs, so an unknown task name or a malformed argument (e.g. `["rotate", "abc"]`) returns an error without downloading or decoding anything. Typed pipelines can skip the strings entirely with `Task` + `run_tasks`.
+
+**Untrusted tasks:** by default `load` / `watermark` accept `http(s)://`, `file://` and base64, up to 200 MB of encoded input. A service that runs user-supplied tasks should restrict that:
+
+```rust
+use imageoptimize::{run_with_options, LoadOptions, ProcessImage};
+
+let options = LoadOptions { allow_file: false, max_bytes: 20 * 1024 * 1024, ..Default::default() };
+let result = run_with_options(ProcessImage::default(), tasks, &options).await?;
+```
+
+Decoding also refuses images whose pixel buffer would exceed 512 MB (checked from the header before allocating, including AVIF and JPEG XL), and images with an embedded ICC profile (e.g. Display P3 phone photos) are converted to sRGB on load so colors stay correct after re-encoding.
+
+The processors are CPU-bound; on an async server, run the pipeline via your runtime's blocking facility (e.g. `tokio::task::spawn_blocking`) so encoding doesn't stall other tasks.
+
 ### Available tasks
 
 | Task | Helper | Arguments | Description |
@@ -260,7 +275,7 @@ let bytes = result.get_buffer()?;
 | `crop` | `new_crop_task(x, y, w, h)` | x, y, width, height | Crop region |
 | `gray` | `new_gray_task()` | — | Convert to grayscale |
 | `flip` | `new_flip_task(dir)` | `"h"` / `"horizontal"` or `"v"` / `"vertical"` | Flip image |
-| `rotate` | `new_rotate_task(deg)` | `90`, `180`, `270` | Rotate (other values are no-ops) |
+| `rotate` | `new_rotate_task(deg)` | multiple of 90 (`90`, `180`, `270`) | Rotate (other angles are rejected) |
 | `brighten` | `new_brighten_task(val)` | integer, positive brightens / negative darkens | Adjust brightness |
 | `contrast` | `new_contrast_task(val)` | float, positive increases / negative decreases | Adjust contrast |
 | `sharpen` | `new_sharpen_task(sigma, threshold)` | sigma (e.g. `1.0`), threshold (e.g. `0`) | USM sharpening |
@@ -278,7 +293,7 @@ let bytes = result.get_buffer()?;
 | `strip` | `new_strip_task()` | — | Strip EXIF metadata from the encoded buffer without re-encoding (JPEG, PNG, WebP) |
 | `padding` | `new_padding_task(w, h, color)` | width, height, hex color (`#rrggbb` / `#rrggbbaa`, default transparent) | Extend canvas, center image |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url, position, margin-left, margin-top | Overlay watermark |
-| `optim` | `new_optim_task(fmt, quality, speed)` | format (`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`), quality 0–100, speed | Encode & compress |
+| `optim` | `new_optim_task(fmt, quality, speed)` | format (`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`), quality 0–100, speed | Encode & compress. An untouched animated GIF stays animated as `gif` or `webp`; after a transform (resize, crop, …) or from another format, `gif` output is a single frame |
 | `optim` (auto-quality) | `new_auto_quality_task(fmt, speed, target)` | format, speed, target DSSIM ×1000 | Binary-search the lowest quality whose perceptual diff stays within `target` |
 | `optim` (auto-format) | `new_auto_format_task(quality, speed, target)` | quality 0–100, speed, target DSSIM ×1000 | Encode candidate formats (alpha-aware: webp/avif/png or webp/avif/jpeg) and keep the smallest within `target` |
 | `optim` (full auto) | `new_auto_task(speed, target)` | speed, target DSSIM ×1000 | Search both format and quality for the smallest output within `target` |
@@ -289,7 +304,7 @@ let bytes = result.get_buffer()?;
 | Format | Effect |
 |--------|--------|
 | `avif` | Encoder speed 0–10; lower = slower but smaller/better quality (default `0`) |
-| `gif`  | Frame delay in centiseconds between frames when re-encoding animated GIFs |
+| `gif`  | Palette quantization speed 1–30 (lower = better palette, slower; out-of-range values are clamped) |
 | `jxl`  | Ignored (encoder effort is fixed) |
 | `jpeg` / `png` / `webp` | Ignored |
 

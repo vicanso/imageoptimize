@@ -40,6 +40,8 @@ pub enum ImageError {
     Io { source: std::io::Error },
     #[snafu(display("{message}"))]
     Unsupported { message: String },
+    #[snafu(display("Handle image fail, category:{category}, message:{message}"))]
+    Encode { category: String, message: String },
     #[snafu(display("Handle image fail"))]
     Unknown,
 }
@@ -57,11 +59,24 @@ pub struct ImageInfo {
 
 impl ImageInfo {
     fn from_dynamic(image: DynamicImage) -> Self {
-        let opaque = match &image {
-            DynamicImage::ImageRgba8(img) => img.as_raw().par_chunks(4).all(|p| p[3] == 255),
-            other => !other.color().has_alpha(),
-        };
-        ImageInfo { image, opaque }
+        match image {
+            // A fully opaque RGBA8 image (e.g. after padding or flattening) is dropped to
+            // RGB8 once here, so the JPEG/WebP/AVIF encoders — called many times during an
+            // auto-quality search — borrow the bytes instead of re-converting on every call.
+            DynamicImage::ImageRgba8(img) if img.as_raw().par_chunks(4).all(|p| p[3] == 255) => {
+                ImageInfo {
+                    image: DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(img).to_rgb8()),
+                    opaque: true,
+                }
+            }
+            other => {
+                let opaque = !other.color().has_alpha();
+                ImageInfo {
+                    image: other,
+                    opaque,
+                }
+            }
+        }
     }
 
     pub fn width(&self) -> usize {
@@ -218,6 +233,139 @@ pub fn load<R: BufRead + Seek>(r: R, ext: &str) -> Result<ImageInfo> {
     Ok(result.into())
 }
 
+/// The GIF encoder panics outside 1..=30, so map any `speed` (0 included) into range.
+fn gif_speed(speed: u8) -> i32 {
+    speed.clamp(1, 30) as i32
+}
+
+/// Width and height from a JPEG XL header (bare codestream or ISOBMFF container), read
+/// without decoding so oversized images can be rejected before libjxl allocates for them.
+/// Returns `None` when the header can't be parsed.
+pub(crate) fn jxl_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    const CONTAINER_SIG: &[u8] = &[
+        0, 0, 0, 0x0c, b'J', b'X', b'L', b' ', 0x0d, 0x0a, 0x87, 0x0a,
+    ];
+    let codestream = if data.starts_with(&[0xff, 0x0a]) {
+        data
+    } else if data.starts_with(CONTAINER_SIG) {
+        let mut rest = &data[CONTAINER_SIG.len()..];
+        loop {
+            if rest.len() < 8 {
+                return None;
+            }
+            let size = u32::from_be_bytes(rest[0..4].try_into().ok()?) as usize;
+            let kind = &rest[4..8];
+            let (header, size) = match size {
+                1 => (
+                    16,
+                    u64::from_be_bytes(rest.get(8..16)?.try_into().ok()?) as usize,
+                ),
+                0 => (8, rest.len()),
+                n => (8, n),
+            };
+            let payload = rest.get(header..size.min(rest.len()))?;
+            match kind {
+                b"jxlc" => break payload,
+                // Partial codestream boxes carry a 4-byte index before the data.
+                b"jxlp" => break payload.get(4..)?,
+                _ => rest = rest.get(size.max(header)..)?,
+            }
+        }
+    } else {
+        return None;
+    };
+    if !codestream.starts_with(&[0xff, 0x0a]) {
+        return None;
+    }
+
+    // SizeHeader (ISO/IEC 18181-1), bits read least-significant first.
+    let bytes = &codestream[2..];
+    let mut pos = 0usize;
+    let mut bits = |n: usize| -> Option<u32> {
+        let mut v = 0u32;
+        for i in 0..n {
+            let byte = *bytes.get(pos / 8)?;
+            v |= u32::from((byte >> (pos % 8)) & 1) << i;
+            pos += 1;
+        }
+        Some(v)
+    };
+    // A dimension stored as `U32(Bits(9), Bits(13), Bits(18), Bits(30))` minus one.
+    fn u32_field(bits: &mut impl FnMut(usize) -> Option<u32>) -> Option<u32> {
+        let width = [9, 13, 18, 30][bits(2)? as usize];
+        Some(bits(width)? + 1)
+    }
+    let div8 = bits(1)? == 1;
+    let height = if div8 {
+        (bits(5)? + 1) * 8
+    } else {
+        u32_field(&mut bits)?
+    };
+    let ratio = bits(3)?;
+    let h = height as u64;
+    let width = match ratio {
+        0 if div8 => (bits(5)? + 1) * 8,
+        0 => u32_field(&mut bits)?,
+        1 => height,
+        2 => (h * 12 / 10) as u32,
+        3 => (h * 4 / 3) as u32,
+        4 => (h * 3 / 2) as u32,
+        5 => (h * 16 / 9) as u32,
+        6 => (h * 5 / 4) as u32,
+        _ => (h * 2) as u32,
+    };
+    Some((width, height))
+}
+
+/// Re-encode an animated GIF as an animated WebP, keeping every frame and its timing.
+/// `quality` >= 100 encodes losslessly. Returns `None` for a single-frame GIF so the caller
+/// can use the regular still-image encoder instead.
+pub fn gif_to_animated_webp<R>(r: R, quality: u8) -> Result<Option<Vec<u8>>>
+where
+    R: std::io::BufRead,
+    R: std::io::Seek,
+{
+    let decoder = gif::GifDecoder::new(r).context(ImageSnafu {
+        category: "gif_decode",
+    })?;
+    let frames = decoder.into_frames().collect_frames().context(ImageSnafu {
+        category: "gif_decode",
+    })?;
+    if frames.len() <= 1 {
+        return Ok(None);
+    }
+    let (width, height) = frames[0].buffer().dimensions();
+    let mut config = webp::WebPConfig::new().map_err(|_| ImageError::Encode {
+        category: "webp_anim_config".to_string(),
+        message: "failed to initialise WebP config".to_string(),
+    })?;
+    if quality >= 100 {
+        config.lossless = 1;
+    } else {
+        config.quality = quality as f32;
+    }
+    let mut encoder = webp::AnimEncoder::new(width, height, &config);
+    encoder.set_loop_count(0);
+    // Frames are composited to the full canvas by the decoder; timestamps are cumulative.
+    let mut timestamp_ms = 0i32;
+    for frame in &frames {
+        let buf = frame.buffer();
+        encoder.add_frame(webp::AnimFrame::from_rgba(
+            buf.as_raw(),
+            buf.width(),
+            buf.height(),
+            timestamp_ms,
+        ));
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        timestamp_ms = timestamp_ms.saturating_add((numer / denom.max(1)) as i32);
+    }
+    let data = encoder.try_encode().map_err(|e| ImageError::Encode {
+        category: "webp_anim_encode".to_string(),
+        message: format!("{e:?}"),
+    })?;
+    Ok(Some(data.to_vec()))
+}
+
 pub fn to_gif<R>(r: R, speed: u8) -> Result<Vec<u8>>
 where
     R: std::io::BufRead,
@@ -231,7 +379,7 @@ where
     let mut w = Vec::new();
 
     {
-        let mut encoder = gif::GifEncoder::new_with_speed(&mut w, speed as i32);
+        let mut encoder = gif::GifEncoder::new_with_speed(&mut w, gif_speed(speed));
         encoder
             .set_repeat(gif::Repeat::Infinite)
             .context(ImageSnafu {
@@ -246,6 +394,21 @@ where
 }
 
 impl ImageInfo {
+    /// Encode the image as a single-frame GIF (NeuQuant palette). Used when the pixels no
+    /// longer match an original GIF buffer — e.g. after a resize, or converting from another
+    /// format. `speed` trades palette quality for speed (clamped to 1..=30).
+    pub fn to_gif(&self, speed: u8) -> Result<Vec<u8>> {
+        let mut w = Vec::new();
+        {
+            let mut encoder = gif::GifEncoder::new_with_speed(&mut w, gif_speed(speed));
+            let frame = image::Frame::new(self.image.to_rgba8());
+            encoder.encode_frame(frame).context(ImageSnafu {
+                category: "gif_encode",
+            })?;
+        }
+        Ok(w)
+    }
+
     /// Optimize image to png, the quality is min 0, max 100, which means best effort,
     /// and never aborts the process.
     pub fn to_png(&self, quality: u8) -> Result<Vec<u8>> {
@@ -421,35 +584,94 @@ mod tests {
         assert_eq!(img.height(), 144);
         assert_eq!(img.width(), 144);
     }
+    /// Decode encoder output and check it round-trips to the source dimensions. Exact byte
+    /// counts are deliberately not asserted: they shift with every encoder release.
+    fn assert_decodes(bytes: &[u8]) -> image::DynamicImage {
+        assert!(!bytes.is_empty());
+        let di = image::load_from_memory(bytes).unwrap();
+        assert_eq!((di.width(), di.height()), (144, 144));
+        di
+    }
+
     #[test]
     fn test_to_png() {
         let img = load_image();
         let result = img.to_png(90).unwrap();
-        // 直接判断长度可能导致版本更新则需要重新修改测试
-        assert_eq!(result.len(), 1665);
+        assert_decodes(&result);
+        assert!(result.len() < include_bytes!("../assets/rust-logo.png").len());
     }
     #[test]
     fn test_to_webp() {
         let img = load_image();
-        // lossless
-        let result = img.to_webp(100).unwrap();
-        assert_eq!(result.len(), 2764);
-        // lossy
-        let result = img.to_webp(80).unwrap();
-        assert_ne!(result.len(), 0);
-        assert!(result.len() < 2764);
+        // lossless: pixels survive exactly
+        let lossless = img.to_webp(100).unwrap();
+        let decoded = assert_decodes(&lossless);
+        assert_eq!(decoded.to_rgba8(), img.image.to_rgba8());
+        // lossy: smaller than lossless
+        let lossy = img.to_webp(80).unwrap();
+        assert_decodes(&lossy);
+        assert!(lossy.len() < lossless.len());
     }
     #[test]
     fn test_to_jpeg() {
         let img = load_image();
         let result = img.to_mozjpeg(90).unwrap();
-        assert_eq!(result.len(), 392);
+        assert_decodes(&result);
     }
     #[test]
     fn test_to_avif() {
         let img = load_image();
         let result = img.to_avif(90, 3).unwrap();
-        assert_eq!(result.len(), 2402);
+        let decoded = super::avif_decode(&result).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (144, 144));
+    }
+    #[test]
+    fn test_to_gif() {
+        let img = load_image();
+        // speed 0 used to panic inside the GIF encoder
+        let result = img.to_gif(0).unwrap();
+        assert_decodes(&result);
+    }
+    #[test]
+    fn test_gif_to_animated_webp() {
+        use image::{codecs::gif::GifEncoder, Delay, Frame, Rgba, RgbaImage};
+        let frame = |v: u8| {
+            Frame::from_parts(
+                RgbaImage::from_pixel(8, 6, Rgba([v, 0, 0, 255])),
+                0,
+                0,
+                Delay::from_numer_denom_ms(100, 1),
+            )
+        };
+        let mut gif = Vec::new();
+        GifEncoder::new(&mut gif)
+            .encode_frames([frame(10), frame(200)])
+            .unwrap();
+        let webp = super::gif_to_animated_webp(Cursor::new(&gif), 80)
+            .unwrap()
+            .expect("two frames → animated webp");
+        let anim = webp::AnimDecoder::new(&webp).decode().unwrap();
+        assert_eq!(anim.len(), 2);
+
+        // A single-frame GIF is left to the still-image encoder.
+        let mut still = Vec::new();
+        GifEncoder::new(&mut still)
+            .encode_frames([frame(10)])
+            .unwrap();
+        assert!(super::gif_to_animated_webp(Cursor::new(&still), 80)
+            .unwrap()
+            .is_none());
+    }
+    #[test]
+    #[cfg(feature = "jxl")]
+    fn test_jxl_dimensions() {
+        use image::{DynamicImage, RgbImage};
+        for (w, h) in [(144, 144), (300, 77), (64, 48), (1000, 3), (17, 1200)] {
+            let info: ImageInfo = DynamicImage::ImageRgb8(RgbImage::new(w, h)).into();
+            let jxl = info.to_jxl(80).unwrap();
+            assert_eq!(super::jxl_dimensions(&jxl), Some((w, h)), "{w}x{h}");
+        }
+        assert_eq!(super::jxl_dimensions(b"not a jxl"), None);
     }
     #[test]
     #[cfg(feature = "jxl")]

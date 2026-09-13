@@ -1,20 +1,22 @@
-use super::images::{avif_decode, jxl_decode, to_gif, ImageError, ImageInfo};
+use super::images::{
+    avif_decode, gif_to_animated_webp, jxl_decode, jxl_dimensions, to_gif, ImageError, ImageInfo,
+};
 use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
 use dssim_core::{Dssim, DssimImage};
 use exif::{In, Reader, Tag};
-use fast_image_resize::images::Image as FirImage;
+use fast_image_resize::images::{Image as FirImage, ImageRef as FirImageRef};
 use fast_image_resize::{FilterType as FirFilter, PixelType, ResizeAlg, ResizeOptions, Resizer};
-use image::imageops::{
-    crop, flip_horizontal, flip_vertical, overlay, rotate180, rotate270, rotate90,
-};
-use image::{load, DynamicImage, ImageFormat, RgbImage, RgbaImage};
+use image::imageops::overlay;
+use image::metadata::Orientation;
+use image::{load, DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbImage, RgbaImage};
 use img_parts::ImageEXIF;
 use rayon::prelude::*;
 use rgb::FromSlice;
 use snafu::{ensure, ResultExt, Snafu};
 use std::borrow::Cow;
 use std::io::Cursor;
+use std::sync::Arc;
 #[cfg(feature = "network")]
 use std::sync::OnceLock;
 #[cfg(feature = "network")]
@@ -356,246 +358,476 @@ pub fn new_trim_task(tolerance: u8) -> Vec<String> {
     vec![PROCESS_TRIM.to_string(), tolerance.to_string()]
 }
 
-pub async fn run_with_image(
-    mut image: ProcessImage,
-    tasks: Vec<Vec<String>>,
-) -> Result<ProcessImage> {
-    let he = ParamsInvalidSnafu {
-        message: "params is invalid",
-    };
-    let needs_diff = tasks.iter().any(|t| {
-        let head = t.first().map(|s| s.as_str());
-        if head == Some(PROCESS_DIFF) {
-            return true;
+/// Parse the optional positional param at `idx`: a missing or empty value yields `default`,
+/// while a present but malformed value is an error rather than being silently replaced.
+fn opt_param<T: std::str::FromStr>(params: &[String], idx: usize, default: T) -> Result<T> {
+    match params.get(idx).map(|s| s.as_str()) {
+        None | Some("") => Ok(default),
+        Some(s) => s
+            .parse::<T>()
+            .map_err(|_| ImageProcessingError::ParamsInvalid {
+                message: format!("invalid param '{s}'"),
+            }),
+    }
+}
+
+/// Parse the required integer param at `idx` (the caller checks it is present).
+fn int_param<T>(params: &[String], idx: usize) -> Result<T>
+where
+    T: std::str::FromStr<Err = std::num::ParseIntError>,
+{
+    params[idx].parse::<T>().context(ParseIntSnafu {})
+}
+
+fn invalid<T>(message: String) -> Result<T> {
+    ParamsInvalidSnafu { message }.fail()
+}
+
+/// Accept an empty color (the task's default) or `#rrggbb` / `#rrggbbaa`.
+fn check_hex_color(color: &str) -> Result<()> {
+    let hex = color.trim_start_matches('#');
+    if color.is_empty()
+        || (matches!(hex.len(), 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        Ok(())
+    } else {
+        invalid(format!(
+            "invalid color '{color}', expected #rrggbb or #rrggbbaa"
+        ))
+    }
+}
+
+/// Largest encoded input `load` / `watermark` accept by default (HTTP bodies, files and
+/// inline base64).
+pub const DEFAULT_MAX_INPUT_BYTES: usize = 200 * 1024 * 1024;
+
+/// Where `load` / `watermark` tasks may read image data from. The default allows HTTP(S),
+/// `file://` and inline base64. Services that run user-supplied tasks should turn off
+/// `allow_file` (arbitrary local file reads) and consider `allow_http` (requests to
+/// internal hosts).
+#[derive(Debug, Clone)]
+pub struct LoadOptions {
+    pub allow_http: bool,
+    pub allow_file: bool,
+    /// Maximum encoded input size in bytes.
+    pub max_bytes: usize,
+}
+
+impl Default for LoadOptions {
+    fn default() -> Self {
+        LoadOptions {
+            allow_http: true,
+            allow_file: true,
+            max_bytes: DEFAULT_MAX_INPUT_BYTES,
         }
-        // Auto optimisation scores candidates internally, so it also needs the
-        // original RGBA snapshot kept even when no explicit diff task is present.
-        if head == Some(PROCESS_OPTIM) {
-            let auto_format = t.get(1).map(|s| s == "auto").unwrap_or(false);
-            let auto_quality = t.get(2).map(|s| s == "auto").unwrap_or(false);
-            return auto_format || auto_quality;
-        }
-        false
-    });
-    for params in tasks {
-        if params.is_empty() {
-            continue;
-        }
-        let sub_params = &params[1..];
-        let task = &params[0];
-        match task.as_str() {
+    }
+}
+
+/// A validated pipeline step. [`run_with_image`] parses every string task into a `Task`
+/// before running any of them, so a malformed step fails before an image is downloaded or
+/// decoded. Use [`run_tasks`] to build a pipeline from typed tasks directly.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Task {
+    Load {
+        data: String,
+        ext: String,
+    },
+    Resize {
+        width: u32,
+        height: u32,
+        fit: bool,
+    },
+    Gray,
+    Flip {
+        horizontal: bool,
+    },
+    Rotate {
+        degrees: u16,
+    },
+    Brighten {
+        value: i32,
+    },
+    Contrast {
+        value: f32,
+    },
+    Sharpen {
+        sigma: f32,
+        threshold: i32,
+    },
+    Blur {
+        sigma: f32,
+    },
+    Hue {
+        shift: i32,
+    },
+    Saturate {
+        factor: f32,
+    },
+    Thumbnail {
+        width: u32,
+        height: u32,
+        smart: bool,
+    },
+    Invert,
+    Opacity {
+        factor: f32,
+    },
+    Gamma {
+        gamma: f32,
+    },
+    Background {
+        color: String,
+    },
+    Normalize {
+        per_channel: bool,
+    },
+    Trim {
+        tolerance: u8,
+    },
+    Strip,
+    Padding {
+        width: u32,
+        height: u32,
+        color: String,
+    },
+    Optim {
+        output_type: String,
+        quality: u8,
+        speed: u8,
+    },
+    /// `output_type` empty = search formats; `quality` None = search quality.
+    AutoOptim {
+        output_type: String,
+        quality: Option<u8>,
+        speed: u8,
+        target: f64,
+    },
+    Crop {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
+    Watermark {
+        url: String,
+        position: WatermarkPosition,
+        margin_left: i64,
+        margin_top: i64,
+    },
+    Diff,
+}
+
+impl Task {
+    /// Parse a string task such as `["resize", "100", "0"]`.
+    pub fn parse(params: &[String]) -> Result<Task> {
+        let he = ParamsInvalidSnafu {
+            message: "params is invalid",
+        };
+        let Some((name, sub)) = params.split_first() else {
+            return he.fail();
+        };
+        let task = match name.as_str() {
             PROCESS_LOAD => {
-                let data = &sub_params[0];
-                let mut ext = "";
-                if sub_params.len() >= 2 {
-                    ext = &sub_params[1];
+                ensure!(!sub.is_empty(), he);
+                Task::Load {
+                    data: sub[0].clone(),
+                    ext: sub.get(1).cloned().unwrap_or_default(),
                 }
-                let mut loader = LoaderProcess::new(data, ext);
-                loader.keep_original = needs_diff;
-                image = loader.process(image).await?;
             }
             PROCESS_RESIZE => {
-                ensure!(sub_params.len() >= 2, he);
-                let width = sub_params[0].parse::<u32>().context(ParseIntSnafu {})?;
-                let height = sub_params[1].parse::<u32>().context(ParseIntSnafu {})?;
-                let fit = sub_params.get(2).map(|s| s == "fit").unwrap_or(false);
+                ensure!(sub.len() >= 2, he);
+                Task::Resize {
+                    width: int_param(sub, 0)?,
+                    height: int_param(sub, 1)?,
+                    fit: sub.get(2).is_some_and(|s| s == "fit"),
+                }
+            }
+            PROCESS_GRAY => Task::Gray,
+            PROCESS_FLIP => {
+                let horizontal = match sub.first().map(|s| s.as_str()).unwrap_or("") {
+                    "" | "h" | "horizontal" => true,
+                    "v" | "vertical" => false,
+                    other => {
+                        return invalid(format!("flip direction must be h or v, got '{other}'"))
+                    }
+                };
+                Task::Flip { horizontal }
+            }
+            PROCESS_ROTATE => {
+                let degrees = opt_param::<u16>(sub, 0, 90)?;
+                if degrees % 90 != 0 {
+                    return invalid(format!(
+                        "rotate degrees must be a multiple of 90, got {degrees}"
+                    ));
+                }
+                Task::Rotate { degrees }
+            }
+            PROCESS_BRIGHTEN => Task::Brighten {
+                value: opt_param(sub, 0, 0)?,
+            },
+            PROCESS_CONTRAST => Task::Contrast {
+                value: opt_param(sub, 0, 0.0)?,
+            },
+            PROCESS_SHARPEN => Task::Sharpen {
+                sigma: opt_param(sub, 0, 1.0)?,
+                threshold: opt_param(sub, 1, 0)?,
+            },
+            PROCESS_BLUR => Task::Blur {
+                sigma: opt_param(sub, 0, 1.0)?,
+            },
+            PROCESS_HUE => Task::Hue {
+                shift: opt_param(sub, 0, 0)?,
+            },
+            PROCESS_SATURATE => Task::Saturate {
+                factor: opt_param(sub, 0, 1.0)?,
+            },
+            PROCESS_THUMBNAIL => {
+                ensure!(sub.len() >= 2, he);
+                Task::Thumbnail {
+                    width: int_param(sub, 0)?,
+                    height: int_param(sub, 1)?,
+                    smart: sub.get(2).is_some_and(|s| s == "smart"),
+                }
+            }
+            PROCESS_INVERT => Task::Invert,
+            PROCESS_OPACITY => Task::Opacity {
+                factor: opt_param(sub, 0, 1.0)?,
+            },
+            PROCESS_GAMMA => Task::Gamma {
+                gamma: opt_param(sub, 0, 1.0)?,
+            },
+            PROCESS_BACKGROUND => {
+                let color = sub.first().cloned().unwrap_or_default();
+                check_hex_color(&color)?;
+                Task::Background { color }
+            }
+            PROCESS_NORMALIZE => {
+                let per_channel = match sub.first().map(|s| s.as_str()).unwrap_or("") {
+                    "" | "rgb" => true,
+                    "luma" => false,
+                    other => {
+                        return invalid(format!(
+                            "normalize mode must be rgb or luma, got '{other}'"
+                        ))
+                    }
+                };
+                Task::Normalize { per_channel }
+            }
+            PROCESS_TRIM => Task::Trim {
+                tolerance: opt_param(sub, 0, 0)?,
+            },
+            PROCESS_STRIP => Task::Strip,
+            PROCESS_PADDING => {
+                ensure!(sub.len() >= 2, he);
+                let color = sub.get(2).cloned().unwrap_or_default();
+                check_hex_color(&color)?;
+                Task::Padding {
+                    width: int_param(sub, 0)?,
+                    height: int_param(sub, 1)?,
+                    color,
+                }
+            }
+            PROCESS_OPTIM => {
+                ensure!(sub.len() >= 3, he);
+                let output_type = &sub[0];
+                let quality_field = &sub[1];
+                let speed = int_param::<u8>(sub, 2)?;
+                let auto_format = output_type == "auto";
+                let auto_quality = quality_field == "auto";
+                if auto_format || auto_quality {
+                    Task::AutoOptim {
+                        output_type: if auto_format {
+                            String::new()
+                        } else {
+                            output_type.clone()
+                        },
+                        quality: if auto_quality {
+                            None
+                        } else {
+                            Some(int_param(sub, 1)?)
+                        },
+                        speed,
+                        // Optional 4th arg overrides the perceptual-diff target.
+                        target: opt_param(sub, 3, AUTO_TARGET_DIFF)?,
+                    }
+                } else {
+                    Task::Optim {
+                        output_type: output_type.clone(),
+                        quality: int_param(sub, 1)?,
+                        speed,
+                    }
+                }
+            }
+            PROCESS_CROP => {
+                ensure!(sub.len() >= 4, he);
+                Task::Crop {
+                    x: int_param(sub, 0)?,
+                    y: int_param(sub, 1)?,
+                    width: int_param(sub, 2)?,
+                    height: int_param(sub, 3)?,
+                }
+            }
+            PROCESS_WATERMARK => {
+                ensure!(!sub.is_empty(), he);
+                let url = decode(sub[0].as_str())
+                    .context(FromUtfSnafu {})?
+                    .to_string();
+                let position = match sub.get(1).map(|s| s.as_str()).unwrap_or("") {
+                    "" => WatermarkPosition::RightBottom,
+                    name => match WatermarkPosition::from_name(name) {
+                        Some(p) => p,
+                        None => return invalid(format!("unknown watermark position '{name}'")),
+                    },
+                };
+                Task::Watermark {
+                    url,
+                    position,
+                    margin_left: if sub.len() > 2 { int_param(sub, 2)? } else { 0 },
+                    margin_top: if sub.len() > 3 { int_param(sub, 3)? } else { 0 },
+                }
+            }
+            PROCESS_DIFF => Task::Diff,
+            // A misspelt task would otherwise be skipped without any sign it did nothing.
+            other => return invalid(format!("unknown task '{other}'")),
+        };
+        Ok(task)
+    }
+}
+
+pub async fn run_with_image(image: ProcessImage, tasks: Vec<Vec<String>>) -> Result<ProcessImage> {
+    run_with_options(image, tasks, &LoadOptions::default()).await
+}
+
+/// Like [`run_with_image`], restricting where `load` / `watermark` tasks may read from.
+/// Every task is parsed and validated before the first one runs.
+pub async fn run_with_options(
+    image: ProcessImage,
+    tasks: Vec<Vec<String>>,
+    options: &LoadOptions,
+) -> Result<ProcessImage> {
+    let tasks = tasks
+        .iter()
+        .filter(|t| !t.is_empty())
+        .map(|t| Task::parse(t))
+        .collect::<Result<Vec<_>>>()?;
+    run_tasks(image, tasks, options).await
+}
+
+/// Run already-parsed tasks in order.
+pub async fn run_tasks(
+    mut image: ProcessImage,
+    tasks: Vec<Task>,
+    options: &LoadOptions,
+) -> Result<ProcessImage> {
+    // Only an explicit diff task needs the original RGBA snapshot; auto optimisation
+    // scores candidates against its own encoder input.
+    let needs_diff = tasks.iter().any(|t| matches!(t, Task::Diff));
+    for task in tasks {
+        image = match task {
+            Task::Load { data, ext } => {
+                let mut loader = LoaderProcess::new(&data, &ext);
+                loader.keep_original = needs_diff;
+                loader.options = options.clone();
+                loader.process(image).await?
+            }
+            Task::Resize { width, height, fit } => {
                 let proc = if fit {
                     ResizeProcess::new_fit(width, height)
                 } else {
                     ResizeProcess::new(width, height)
                 };
-                image = proc.process(image).await?;
+                proc.process(image).await?
             }
-            PROCESS_GRAY => {
-                image = GrayProcess::new().process(image).await?;
+            Task::Gray => GrayProcess::new().process(image).await?,
+            Task::Flip { horizontal } => {
+                let direction = if horizontal { "h" } else { "v" };
+                FlipProcess::new(direction).process(image).await?
             }
-            PROCESS_FLIP => {
-                let direction = sub_params.first().map(|s| s.as_str()).unwrap_or("h");
-                image = FlipProcess::new(direction).process(image).await?;
+            Task::Rotate { degrees } => RotateProcess::new(degrees).process(image).await?,
+            Task::Brighten { value } => BrightenProcess::new(value).process(image).await?,
+            Task::Contrast { value } => ContrastProcess::new(value).process(image).await?,
+            Task::Sharpen { sigma, threshold } => {
+                SharpenProcess::new(sigma, threshold).process(image).await?
             }
-            PROCESS_ROTATE => {
-                let degrees = sub_params
-                    .first()
-                    .and_then(|s| s.parse::<u16>().ok())
-                    .unwrap_or(90);
-                image = RotateProcess::new(degrees).process(image).await?;
-            }
-            PROCESS_BRIGHTEN => {
-                let value = sub_params
-                    .first()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(0);
-                image = BrightenProcess::new(value).process(image).await?;
-            }
-            PROCESS_CONTRAST => {
-                let value = sub_params
-                    .first()
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .unwrap_or(0.0);
-                image = ContrastProcess::new(value).process(image).await?;
-            }
-            PROCESS_SHARPEN => {
-                let sigma = sub_params
-                    .first()
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .unwrap_or(1.0);
-                let threshold = sub_params
-                    .get(1)
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(0);
-                image = SharpenProcess::new(sigma, threshold).process(image).await?;
-            }
-            PROCESS_BLUR => {
-                let sigma = sub_params
-                    .first()
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .unwrap_or(1.0);
-                image = BlurProcess::new(sigma).process(image).await?;
-            }
-            PROCESS_HUE => {
-                let shift = sub_params
-                    .first()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(0);
-                image = HueProcess::new(shift).process(image).await?;
-            }
-            PROCESS_SATURATE => {
-                let factor = sub_params
-                    .first()
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .unwrap_or(1.0);
-                image = SaturateProcess::new(factor).process(image).await?;
-            }
-            PROCESS_THUMBNAIL => {
-                ensure!(sub_params.len() >= 2, he);
-                let width = sub_params[0].parse::<u32>().context(ParseIntSnafu {})?;
-                let height = sub_params[1].parse::<u32>().context(ParseIntSnafu {})?;
-                let smart = sub_params.get(2).map(|s| s == "smart").unwrap_or(false);
+            Task::Blur { sigma } => BlurProcess::new(sigma).process(image).await?,
+            Task::Hue { shift } => HueProcess::new(shift).process(image).await?,
+            Task::Saturate { factor } => SaturateProcess::new(factor).process(image).await?,
+            Task::Thumbnail {
+                width,
+                height,
+                smart,
+            } => {
                 let proc = if smart {
                     ThumbnailProcess::new_smart(width, height)
                 } else {
                     ThumbnailProcess::new(width, height)
                 };
-                image = proc.process(image).await?;
+                proc.process(image).await?
             }
-            PROCESS_INVERT => {
-                image = InvertProcess::new().process(image).await?;
+            Task::Invert => InvertProcess::new().process(image).await?,
+            Task::Opacity { factor } => OpacityProcess::new(factor).process(image).await?,
+            Task::Gamma { gamma } => GammaProcess::new(gamma).process(image).await?,
+            Task::Background { color } => BackgroundProcess::new(&color).process(image).await?,
+            Task::Normalize { per_channel } => {
+                NormalizeProcess::new(per_channel).process(image).await?
             }
-            PROCESS_OPACITY => {
-                let factor = sub_params
-                    .first()
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .unwrap_or(1.0);
-                image = OpacityProcess::new(factor).process(image).await?;
-            }
-            PROCESS_GAMMA => {
-                let gamma = sub_params
-                    .first()
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .unwrap_or(1.0);
-                image = GammaProcess::new(gamma).process(image).await?;
-            }
-            PROCESS_BACKGROUND => {
-                let color = sub_params.first().map(|s| s.as_str()).unwrap_or("");
-                image = BackgroundProcess::new(color).process(image).await?;
-            }
-            PROCESS_NORMALIZE => {
-                let per_channel = sub_params.first().map(|s| s != "luma").unwrap_or(true);
-                image = NormalizeProcess::new(per_channel).process(image).await?;
-            }
-            PROCESS_TRIM => {
-                let tolerance = sub_params
-                    .first()
-                    .and_then(|s| s.parse::<u8>().ok())
-                    .unwrap_or(0);
-                image = TrimProcess::new(tolerance).process(image).await?;
-            }
-            PROCESS_STRIP => {
-                image = StripProcess::new().process(image).await?;
-            }
-            PROCESS_PADDING => {
-                ensure!(sub_params.len() >= 2, he);
-                let width = sub_params[0].parse::<u32>().context(ParseIntSnafu {})?;
-                let height = sub_params[1].parse::<u32>().context(ParseIntSnafu {})?;
-                let color = sub_params.get(2).map(|s| s.as_str()).unwrap_or("");
-                image = PaddingProcess::new(width, height, color)
+            Task::Trim { tolerance } => TrimProcess::new(tolerance).process(image).await?,
+            Task::Strip => StripProcess::new().process(image).await?,
+            Task::Padding {
+                width,
+                height,
+                color,
+            } => {
+                PaddingProcess::new(width, height, &color)
                     .process(image)
-                    .await?;
+                    .await?
             }
-            PROCESS_OPTIM => {
-                // 参数不符合
-                ensure!(sub_params.len() >= 3, he);
-                let output_type = &sub_params[0];
-                let quality_field = &sub_params[1];
-                let speed = sub_params[2].parse::<u8>().context(ParseIntSnafu {})?;
-                let auto_format = output_type == "auto";
-                let auto_quality = quality_field == "auto";
-                if auto_format || auto_quality {
-                    // Optional 4th arg overrides the perceptual-diff target.
-                    let target = sub_params
-                        .get(3)
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .unwrap_or(AUTO_TARGET_DIFF);
-                    let out = if auto_format {
-                        ""
-                    } else {
-                        output_type.as_str()
-                    };
-                    let quality = if auto_quality {
-                        None
-                    } else {
-                        Some(quality_field.parse::<u8>().context(ParseIntSnafu {})?)
-                    };
-                    image = AutoOptimProcess::new(out, quality, speed, target)
-                        .process(image)
-                        .await?;
-                } else {
-                    let quality = quality_field.parse::<u8>().context(ParseIntSnafu {})?;
-                    image = OptimProcess::new(output_type, quality, speed)
-                        .process(image)
-                        .await?;
-                }
+            Task::Optim {
+                output_type,
+                quality,
+                speed,
+            } => {
+                OptimProcess::new(&output_type, quality, speed)
+                    .process(image)
+                    .await?
             }
-            PROCESS_CROP => {
-                // 参数不符合
-                ensure!(sub_params.len() >= 4, he);
-                let x = sub_params[0].parse::<u32>().context(ParseIntSnafu {})?;
-                let y = sub_params[1].parse::<u32>().context(ParseIntSnafu {})?;
-                let width = sub_params[2].parse::<u32>().context(ParseIntSnafu {})?;
-                let height = sub_params[3].parse::<u32>().context(ParseIntSnafu {})?;
-                image = CropProcess::new(x, y, width, height).process(image).await?;
+            Task::AutoOptim {
+                output_type,
+                quality,
+                speed,
+                target,
+            } => {
+                AutoOptimProcess::new(&output_type, quality, speed, target)
+                    .process(image)
+                    .await?
             }
-            PROCESS_WATERMARK => {
-                // 参数不符合
-                ensure!(!sub_params.is_empty(), he);
-                let url = decode(sub_params[0].as_str())
-                    .context(FromUtfSnafu {})?
-                    .to_string();
-                let mut position = WatermarkPosition::RightBottom;
-                if sub_params.len() > 1 {
-                    position = (sub_params[1].as_str()).into();
-                }
-                let mut margin_left = 0;
-                if sub_params.len() > 2 {
-                    margin_left = sub_params[2].parse::<i64>().context(ParseIntSnafu {})?;
-                }
-                let mut margin_top = 0;
-                if sub_params.len() > 3 {
-                    margin_top = sub_params[3].parse::<i64>().context(ParseIntSnafu {})?;
-                }
-                let watermark = LoaderProcess::new(&url, "")
-                    .process(ProcessImage::default())
-                    .await?;
-
-                let pro = WatermarkProcess::new(watermark.di, position, margin_left, margin_top);
-                image = pro.process(image).await?;
+            Task::Crop {
+                x,
+                y,
+                width,
+                height,
+            } => CropProcess::new(x, y, width, height).process(image).await?,
+            Task::Watermark {
+                url,
+                position,
+                margin_left,
+                margin_top,
+            } => {
+                let mut loader = LoaderProcess::new(&url, "");
+                // The watermark itself is never diffed, so skip its RGBA snapshot.
+                loader.keep_original = false;
+                loader.options = options.clone();
+                let watermark = loader.process(ProcessImage::default()).await?;
+                WatermarkProcess::new(watermark.di, position, margin_left, margin_top)
+                    .process(image)
+                    .await?
             }
-            PROCESS_DIFF => {
+            Task::Diff => {
                 image.diff = image.get_diff();
                 image.original = None;
+                image
             }
-            _ => {}
-        }
+        };
     }
     Ok(image)
 }
@@ -604,7 +836,8 @@ pub async fn run(tasks: Vec<Vec<String>>) -> Result<ProcessImage> {
     run_with_image(ProcessImage::default(), tasks).await
 }
 
-fn get_exif_orientation(data: &[u8]) -> u32 {
+/// Read the EXIF orientation tag (1–8) from encoded image bytes; 1 (upright) when absent.
+pub fn get_exif_orientation(data: &[u8]) -> u32 {
     Reader::new()
         .read_from_container(&mut Cursor::new(data))
         .ok()
@@ -613,23 +846,107 @@ fn get_exif_orientation(data: &[u8]) -> u32 {
         .unwrap_or(1)
 }
 
-fn apply_orientation(di: DynamicImage, orientation: u32) -> DynamicImage {
-    match orientation {
-        2 => DynamicImage::ImageRgba8(flip_horizontal(&di)),
-        3 => DynamicImage::ImageRgba8(rotate180(&di)),
-        4 => DynamicImage::ImageRgba8(flip_vertical(&di)),
-        5 => {
-            let tmp = DynamicImage::ImageRgba8(flip_horizontal(&di));
-            DynamicImage::ImageRgba8(rotate270(&tmp))
-        }
-        6 => DynamicImage::ImageRgba8(rotate90(&di)),
-        7 => {
-            let tmp = DynamicImage::ImageRgba8(flip_horizontal(&di));
-            DynamicImage::ImageRgba8(rotate90(&tmp))
-        }
-        8 => DynamicImage::ImageRgba8(rotate270(&di)),
-        _ => di,
+/// Apply an EXIF orientation (1–8). The channel layout is preserved — an opaque RGB8 photo
+/// stays RGB8 — and flips / 180° turns happen in place without a copy.
+fn apply_orientation(mut di: DynamicImage, orientation: u32) -> DynamicImage {
+    if let Some(o) = u8::try_from(orientation)
+        .ok()
+        .and_then(Orientation::from_exif)
+    {
+        di.apply_orientation(o);
     }
+    di
+}
+
+/// Largest decoded pixel buffer (as RGBA bytes) accepted from any input. Matches the `image`
+/// crate's default allocation limit, and is also enforced for AVIF / JXL — whose decoders
+/// don't apply it — so a tiny file declaring huge dimensions can't exhaust memory.
+const MAX_DECODE_BYTES: u64 = 512 * 1024 * 1024;
+
+fn ensure_decode_size(dimensions: Option<(u32, u32)>) -> Result<()> {
+    if let Some((w, h)) = dimensions {
+        let bytes = w as u64 * h as u64 * 4;
+        if bytes > MAX_DECODE_BYTES {
+            return invalid(format!(
+                "image {w}x{h} exceeds the {MAX_DECODE_BYTES}-byte decode limit"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn avif_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    let avif = avif_parse::read_avif(&mut &data[..]).ok()?;
+    let meta = avif.primary_item_metadata().ok()?;
+    Some((meta.max_frame_width.get(), meta.max_frame_height.get()))
+}
+
+/// Decode encoded bytes into pixels plus any embedded ICC profile, refusing images whose
+/// decoded buffer would exceed [`MAX_DECODE_BYTES`] before allocating for them.
+fn decode_image(data: &[u8], ext: &str) -> Result<(DynamicImage, Option<Vec<u8>>)> {
+    let jxl_dims = jxl_dimensions(data);
+    if ext == IMAGE_TYPE_JXL || jxl_dims.is_some() {
+        ensure_decode_size(jxl_dims)?;
+        return Ok((jxl_decode(data).context(ImagesSnafu {})?, None));
+    }
+    let format = image::guess_format(data).or_else(|_| {
+        ImageFormat::from_extension(ext).ok_or(ImageProcessingError::ParamsInvalid {
+            message: "Image format is not supported".to_string(),
+        })
+    })?;
+    // `image`'s avif feature is encoder-only, so AVIF inputs must use the libaom-backed
+    // decoder rather than image::load (which would error).
+    if format == ImageFormat::Avif {
+        ensure_decode_size(avif_dimensions(data))?;
+        return Ok((avif_decode(data).context(ImagesSnafu {})?, None));
+    }
+    let mut decoder = ImageReader::with_format(Cursor::new(data), format)
+        .into_decoder()
+        .context(ImageSnafu {})?;
+    // `into_decoder` skips the allocation check `ImageReader::decode` performs; redo it.
+    image::Limits::default()
+        .reserve(decoder.total_bytes())
+        .context(ImageSnafu {})?;
+    let icc = decoder.icc_profile().ok().flatten();
+    let di = DynamicImage::from_decoder(decoder).context(ImageSnafu {})?;
+    Ok((di, icc))
+}
+
+/// Convert pixels tagged with an embedded ICC profile (e.g. Display P3 from phone cameras)
+/// to sRGB. None of the encoders carry the profile over, so without this, wide-gamut images
+/// would display with dull, shifted colors. Profiles qcms can't apply to the pixel layout
+/// (gray, CMYK, malformed) leave the image untouched.
+fn icc_to_srgb(di: DynamicImage, icc: Option<&[u8]>) -> DynamicImage {
+    let Some(input) = icc.and_then(|icc| qcms::Profile::new_from_slice(icc, false)) else {
+        return di;
+    };
+    let mut output = qcms::Profile::new_sRGB();
+    output.precache_output_transform();
+    let has_alpha = di.color().has_alpha();
+    let (ty, stride) = if has_alpha {
+        (qcms::DataType::RGBA8, 4)
+    } else {
+        (qcms::DataType::RGB8, 3)
+    };
+    let Some(transform) = qcms::Transform::new(&input, &output, ty, qcms::Intent::default()) else {
+        return di;
+    };
+    let mut di = match di {
+        DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => di,
+        other if has_alpha => DynamicImage::ImageRgba8(other.into_rgba8()),
+        other => DynamicImage::ImageRgb8(other.into_rgb8()),
+    };
+    let row = stride * di.width().max(1) as usize;
+    let bytes = match &mut di {
+        DynamicImage::ImageRgb8(img) => img.as_flat_samples_mut().samples,
+        DynamicImage::ImageRgba8(img) => img.as_flat_samples_mut().samples,
+        _ => unreachable!("normalised to RGB8 / RGBA8 above"),
+    };
+    // Transform whole rows in parallel bands.
+    bytes
+        .par_chunks_mut(row * 64)
+        .for_each(|band| transform.apply(band));
+    di
 }
 
 /// SIMD-accelerated resize via `fast_image_resize` (NEON/AVX2/SSE4.1, scalar fallback on
@@ -678,6 +995,48 @@ fn fir_resize_dynamic(di: DynamicImage, dst_w: u32, dst_h: u32, filter: FirFilte
             DynamicImage::ImageRgba8(fir_resize(img, dst_w, dst_h, filter))
         }
         other => DynamicImage::ImageRgba8(fir_resize(other.into_rgba8(), dst_w, dst_h, filter)),
+    }
+}
+
+/// Resize `di` — or just the `(x, y, width, height)` region of it — reading its pixels in
+/// place rather than taking an owned or cropped copy first. RGB8 stays RGB8 and RGBA8 stays
+/// RGBA8 (alpha premultiplied during scaling); other variants are normalised first.
+fn fir_resize_view(
+    di: &DynamicImage,
+    region: Option<(u32, u32, u32, u32)>,
+    dst_w: u32,
+    dst_h: u32,
+    filter: FirFilter,
+) -> DynamicImage {
+    let normalised;
+    let di = match di {
+        DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => di,
+        other => {
+            normalised = rgb_or_rgba(other.clone());
+            &normalised
+        }
+    };
+    let (bytes, stride) = pixel_bytes(di).expect("normalised to RGB8 or RGBA8 above");
+    let pixel_type = if stride == 3 {
+        PixelType::U8x3
+    } else {
+        PixelType::U8x4
+    };
+    let src = FirImageRef::new(di.width(), di.height(), bytes, pixel_type)
+        .expect("buffer matches image dimensions");
+    let mut dst = FirImage::new(dst_w, dst_h, pixel_type);
+    let mut options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(filter));
+    if let Some((x, y, w, h)) = region {
+        options = options.crop(x as f64, y as f64, w as f64, h as f64);
+    }
+    Resizer::new()
+        .resize(&src, &mut dst, &options)
+        .expect("source and destination share a pixel type");
+    let raw = dst.into_vec();
+    if stride == 3 {
+        DynamicImage::ImageRgb8(RgbImage::from_raw(dst_w, dst_h, raw).expect("rgb8 output size"))
+    } else {
+        DynamicImage::ImageRgba8(RgbaImage::from_raw(dst_w, dst_h, raw).expect("rgba8 output size"))
     }
 }
 
@@ -770,7 +1129,8 @@ fn luma_extents(bytes: &[u8], stride: usize) -> (f32, f32) {
 
 #[derive(Default, Clone)]
 pub struct ProcessImage {
-    original: Option<RgbaImage>,
+    /// Shared so cloning a decoded image per output target doesn't copy the snapshot.
+    original: Option<Arc<RgbaImage>>,
     di: DynamicImage,
     pub diff: f64,
     pub original_size: usize,
@@ -783,23 +1143,16 @@ impl ProcessImage {
         Self::new_impl(data, ext, true)
     }
 
+    /// Like [`ProcessImage::new`] but without the original RGBA snapshot, saving a
+    /// full-image copy and the lossy re-decode after encoding. A later `diff` task
+    /// reports -1; auto optimisation is unaffected (it scores against its own input).
+    pub fn new_without_original(data: Vec<u8>, ext: &str) -> Result<Self> {
+        Self::new_impl(data, ext, false)
+    }
+
     fn new_impl(data: Vec<u8>, ext: &str, keep_original: bool) -> Result<Self> {
-        let di = if ext == IMAGE_TYPE_JXL {
-            jxl_decode(&data).context(ImagesSnafu {})?
-        } else {
-            let format = image::guess_format(&data).or_else(|_| {
-                ImageFormat::from_extension(ext).ok_or(ImageProcessingError::ParamsInvalid {
-                    message: "Image format is not supported".to_string(),
-                })
-            })?;
-            // `image`'s avif feature is encoder-only, so AVIF inputs must use the
-            // libaom-backed decoder rather than image::load (which would error).
-            if format == ImageFormat::Avif {
-                avif_decode(&data).context(ImagesSnafu {})?
-            } else {
-                load(Cursor::new(&data), format).context(ImageSnafu {})?
-            }
-        };
+        let (di, icc) = decode_image(&data, ext)?;
+        let di = icc_to_srgb(di, icc.as_deref());
         let orientation = get_exif_orientation(&data);
         let di = apply_orientation(di, orientation);
         let original_size = data.len();
@@ -809,7 +1162,7 @@ impl ProcessImage {
         Ok(ProcessImage {
             original_size,
             original: if keep_original {
-                Some(di.to_rgba8())
+                Some(Arc::new(di.to_rgba8()))
             } else {
                 None
             },
@@ -870,19 +1223,27 @@ impl ProcessImage {
 /// (`create_image_rgba` builds multi-scale pyramids — the expensive half of a compare).
 struct DiffScorer {
     attr: Dssim,
-    original: DssimImage<f32>,
+    /// `None` when dssim can't prepare the reference; every score is then -1.
+    original: Option<DssimImage<f32>>,
     width: usize,
     height: usize,
 }
 
 impl DiffScorer {
+    /// Prepare a scorer against the image an encoder is about to consume, so the score
+    /// measures encoding loss only (not earlier resizes or color edits).
+    fn from_dynamic(di: &DynamicImage) -> Self {
+        match di {
+            DynamicImage::ImageRgba8(img) => Self::new(img),
+            other => Self::new(&other.to_rgba8()),
+        }
+    }
+
     fn new(original: &RgbaImage) -> Self {
         let width = original.width() as usize;
         let height = original.height() as usize;
         let attr = Dssim::new();
-        let prepared = attr
-            .create_image_rgba(original.as_raw().as_rgba(), width, height)
-            .unwrap();
+        let prepared = attr.create_image_rgba(original.as_raw().as_rgba(), width, height);
         DiffScorer {
             attr,
             original: prepared,
@@ -894,6 +1255,9 @@ impl DiffScorer {
     /// DSSIM score (×1000) of a candidate against the prepared original.
     /// Returns -1.0 when the dimensions differ (not comparable).
     fn score(&self, di: &DynamicImage) -> f64 {
+        let Some(original) = &self.original else {
+            return -1.0;
+        };
         // 如果宽高不一致，则不比对
         if self.width != di.width() as usize || self.height != di.height() as usize {
             return -1.0;
@@ -912,7 +1276,7 @@ impl DiffScorer {
         else {
             return -1.0;
         };
-        let (diff, _) = self.attr.compare(&self.original, gp2);
+        let (diff, _) = self.attr.compare(original, gp2);
         let value: f64 = diff.into();
         // 放大1千倍
         value * 1000.0
@@ -951,36 +1315,83 @@ fn decode_to_di(buffer: &[u8], ext: &str) -> Result<DynamicImage> {
     }
 }
 
+/// Run CPU-heavy work. Inside a multi-threaded Tokio runtime (the CLI) it goes through
+/// `block_in_place` so other async tasks keep progressing; anywhere else — no runtime, or a
+/// current-thread runtime, where `block_in_place` would panic — it simply runs inline.
+#[cfg(feature = "bin")]
+fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
+#[cfg(not(feature = "bin"))]
+fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+/// Pipeline step. The processors are CPU-bound; `async` only matters for loading over
+/// HTTP. Library users on an async server should run a pipeline through their runtime's
+/// blocking facility (e.g. `tokio::task::spawn_blocking` + `block_on`) so encoding doesn't
+/// stall other tasks.
 #[allow(async_fn_in_trait)]
 pub trait Process {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage>;
 }
 
-/// Fetch image bytes over HTTP, returning the body and any extension inferred from
-/// the Content-Type header.
+fn too_large<T>(max_bytes: usize) -> Result<T> {
+    invalid(format!("image input exceeds the {max_bytes}-byte limit"))
+}
+
+/// Extension from a Content-Type value: `image/png; charset=binary` → `png`.
 #[cfg(feature = "network")]
-async fn http_get(data: &str) -> Result<(Vec<u8>, Option<String>)> {
-    let resp = get_http_client()
-        .get(data)
+fn ext_from_content_type(content_type: &str) -> Option<String> {
+    let mime = content_type.split(';').next()?.trim();
+    let (_, subtype) = mime.split_once('/')?;
+    Some(subtype.trim().to_ascii_lowercase())
+}
+
+/// Fetch image bytes over HTTP, returning the body and any extension inferred from
+/// the Content-Type header. Error statuses fail instead of decoding the error page, and
+/// the body is read incrementally so an oversized response stops at `max_bytes`.
+#[cfg(feature = "network")]
+async fn http_get(url: &str, max_bytes: usize) -> Result<(Vec<u8>, Option<String>)> {
+    let mut resp = get_http_client()
+        .get(url)
         .timeout(Duration::from_secs(5 * 60))
         .send()
         .await
+        .context(ReqwestSnafu {})?
+        .error_for_status()
         .context(ReqwestSnafu {})?;
 
-    let mut ext = None;
-    if let Some(content_type) = resp.headers().get("Content-Type") {
-        let str = content_type.to_str().context(HTTPHeaderToStrSnafu {})?;
-        if let Some((_, t)) = str.split_once('/') {
-            ext = Some(t.to_string());
-        }
+    let ext = match resp.headers().get(reqwest::header::CONTENT_TYPE) {
+        Some(value) => ext_from_content_type(value.to_str().context(HTTPHeaderToStrSnafu {})?),
+        None => None,
+    };
+    if resp
+        .content_length()
+        .is_some_and(|len| len > max_bytes as u64)
+    {
+        return too_large(max_bytes);
     }
-    let raw = resp.bytes().await.context(ReqwestSnafu {})?.to_vec();
+    let mut raw = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context(ReqwestSnafu {})? {
+        if raw.len() + chunk.len() > max_bytes {
+            return too_large(max_bytes);
+        }
+        raw.extend_from_slice(&chunk);
+    }
     Ok((raw, ext))
 }
 
 /// Stub used when the `network` feature is disabled: HTTP URLs report a clear error.
 #[cfg(not(feature = "network"))]
-async fn http_get(_data: &str) -> Result<(Vec<u8>, Option<String>)> {
+async fn http_get(_url: &str, _max_bytes: usize) -> Result<(Vec<u8>, Option<String>)> {
     Err(ImageProcessingError::ParamsInvalid {
         message: "HTTP image loading requires the `network` feature".to_string(),
     })
@@ -991,6 +1402,8 @@ pub struct LoaderProcess {
     data: String,
     ext: String,
     pub keep_original: bool,
+    /// Which sources are allowed and how large an input may be.
+    pub options: LoadOptions,
 }
 
 impl LoaderProcess {
@@ -999,24 +1412,41 @@ impl LoaderProcess {
             data: data.to_string(),
             ext: ext.to_string(),
             keep_original: true,
+            options: LoadOptions::default(),
         }
     }
     async fn fetch_data(&self) -> Result<ProcessImage> {
         let data = &self.data;
+        let max_bytes = self.options.max_bytes;
         let mut ext = self.ext.clone();
-        let from_http = data.starts_with("http");
-        let file_prefix = "file://";
-        let from_file = data.starts_with(file_prefix);
+        let from_http = data.starts_with("http://") || data.starts_with("https://");
         let original_data = if from_http {
-            let (raw, detected_ext) = http_get(data).await?;
+            if !self.options.allow_http {
+                return invalid("loading images over HTTP is disabled".to_string());
+            }
+            let (raw, detected_ext) = http_get(data, max_bytes).await?;
             if let Some(t) = detected_ext {
                 ext = t;
             }
             raw
-        } else if from_file {
-            ext = data.split('.').next_back().unwrap_or_default().to_string();
-            std::fs::read(&data[file_prefix.len()..]).context(IoSnafu)?
+        } else if let Some(path) = data.strip_prefix("file://") {
+            if !self.options.allow_file {
+                return invalid("loading images from file:// is disabled".to_string());
+            }
+            let path = std::path::Path::new(path);
+            if std::fs::metadata(path).context(IoSnafu)?.len() > max_bytes as u64 {
+                return too_large(max_bytes);
+            }
+            ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            std::fs::read(path).context(IoSnafu)?
         } else {
+            if data.len() / 4 * 3 > max_bytes {
+                return too_large(max_bytes);
+            }
             general_purpose::STANDARD
                 .decode(data.as_bytes())
                 .context(Base64DecodeSnafu {})?
@@ -1068,6 +1498,9 @@ impl Process for ResizeProcess {
         }
         let src_w = img.di.width();
         let src_h = img.di.height();
+        if src_w == 0 || src_h == 0 {
+            return Ok(img);
+        }
 
         let (new_w, new_h) = if self.fit {
             let fits_w = self.width == 0 || src_w <= self.width;
@@ -1086,19 +1519,26 @@ impl Process for ResizeProcess {
                 1.0
             };
             let scale = scale_w.min(scale_h);
+            // Extreme aspect ratios can round the short side to 0; keep at least 1px.
             (
-                (src_w as f64 * scale).round() as u32,
-                (src_h as f64 * scale).round() as u32,
+                ((src_w as f64 * scale).round() as u32).max(1),
+                ((src_h as f64 * scale).round() as u32).max(1),
             )
         } else {
-            let mut w = self.width;
-            let mut h = self.height;
-            if w == 0 {
-                w = src_w * h / src_h;
-            }
-            if h == 0 {
-                h = src_h * w / src_w;
-            }
+            // u64 math: `src * target` overflows u32 for large images.
+            let scaled = |src: u32, target: u32, base: u32| {
+                ((src as u64 * target as u64 / base as u64).clamp(1, u32::MAX as u64)) as u32
+            };
+            let w = if self.width == 0 {
+                scaled(src_w, self.height, src_h)
+            } else {
+                self.width
+            };
+            let h = if self.height == 0 {
+                scaled(src_h, self.width, src_w)
+            } else {
+                self.height
+            };
             (w, h)
         };
 
@@ -1152,12 +1592,12 @@ impl FlipProcess {
 impl Process for FlipProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
-        let flipped = if self.horizontal {
-            flip_horizontal(&img.di)
+        // In place, keeping the channel layout (no RGBA copy for opaque images).
+        img.di.apply_orientation(if self.horizontal {
+            Orientation::FlipHorizontal
         } else {
-            flip_vertical(&img.di)
-        };
-        img.di = DynamicImage::ImageRgba8(flipped);
+            Orientation::FlipVertical
+        });
         img.buffer.clear();
         Ok(img)
     }
@@ -1176,13 +1616,14 @@ impl RotateProcess {
 impl Process for RotateProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
-        let rotated = match self.degrees % 360 {
-            90 => rotate90(&img.di),
-            180 => rotate180(&img.di),
-            270 => rotate270(&img.di),
+        let orientation = match self.degrees % 360 {
+            90 => Orientation::Rotate90,
+            180 => Orientation::Rotate180,
+            270 => Orientation::Rotate270,
             _ => return Ok(img),
         };
-        img.di = DynamicImage::ImageRgba8(rotated);
+        // Keeps the channel layout; 180° turns happen in place.
+        img.di.apply_orientation(orientation);
         img.buffer.clear();
         Ok(img)
     }
@@ -1250,14 +1691,41 @@ impl SharpenProcess {
 impl Process for SharpenProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
-        let di = std::mem::take(&mut img.di);
-        img.di = DynamicImage::ImageRgba8(parallel_unsharpen(
-            di.into_rgba8(),
-            self.sigma,
-            self.threshold,
-        ));
+        let (sigma, threshold) = (self.sigma, self.threshold);
+        img.di = map_raw(std::mem::take(&mut img.di), |bytes, w, h, stride| {
+            parallel_unsharpen(bytes, w, h, stride, sigma, threshold)
+        });
         img.buffer.clear();
         Ok(img)
+    }
+}
+
+/// Normalise to RGB8 (opaque variants) or RGBA8 (variants with alpha), the two layouts the
+/// raw-byte pixel loops handle.
+fn rgb_or_rgba(di: DynamicImage) -> DynamicImage {
+    match di {
+        DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => di,
+        other if other.color().has_alpha() => DynamicImage::ImageRgba8(other.into_rgba8()),
+        other => DynamicImage::ImageRgb8(other.into_rgb8()),
+    }
+}
+
+/// Replace the pixels with `f(bytes, width, height, stride)`, keeping the channel layout:
+/// opaque images are processed as 3-byte RGB, images with alpha as 4-byte RGBA.
+fn map_raw(di: DynamicImage, f: impl FnOnce(&[u8], u32, u32, usize) -> Vec<u8>) -> DynamicImage {
+    let di = rgb_or_rgba(di);
+    let (w, h) = (di.width(), di.height());
+    if w == 0 || h == 0 {
+        return di;
+    }
+    match &di {
+        DynamicImage::ImageRgb8(img) => DynamicImage::ImageRgb8(
+            RgbImage::from_raw(w, h, f(img.as_raw(), w, h, 3)).expect("rgb8 output size"),
+        ),
+        DynamicImage::ImageRgba8(img) => DynamicImage::ImageRgba8(
+            RgbaImage::from_raw(w, h, f(img.as_raw(), w, h, 4)).expect("rgba8 output size"),
+        ),
+        _ => unreachable!("normalised to RGB8 / RGBA8 above"),
     }
 }
 
@@ -1276,74 +1744,76 @@ fn gaussian_kernel_1d(sigma: f32) -> Vec<f32> {
     kernel
 }
 
-fn convolve_rows(src: &[u8], dst: &mut [u8], w: u32, _h: u32, kernel: &[f32]) {
+fn convolve_rows(src: &[u8], dst: &mut [u8], w: u32, stride: usize, kernel: &[f32]) {
     let radius = (kernel.len() / 2) as i32;
-    dst.par_chunks_mut(w as usize * 4)
-        .enumerate()
-        .for_each(|(y, row)| {
+    let row_len = w as usize * stride;
+    dst.par_chunks_mut(row_len)
+        .zip(src.par_chunks(row_len))
+        .for_each(|(row, src_row)| {
             for x in 0..w as i32 {
-                let mut rgba = [0.0f32; 4];
+                let mut acc = [0.0f32; 4];
                 for (ki, &kv) in kernel.iter().enumerate() {
-                    let sx = (x + ki as i32 - radius).clamp(0, w as i32 - 1) as u32;
-                    let idx = (y as u32 * w + sx) as usize * 4;
-                    rgba[0] += src[idx] as f32 * kv;
-                    rgba[1] += src[idx + 1] as f32 * kv;
-                    rgba[2] += src[idx + 2] as f32 * kv;
-                    rgba[3] += src[idx + 3] as f32 * kv;
+                    let sx = (x + ki as i32 - radius).clamp(0, w as i32 - 1) as usize;
+                    let px = &src_row[sx * stride..sx * stride + stride];
+                    for c in 0..stride {
+                        acc[c] += px[c] as f32 * kv;
+                    }
                 }
-                let di = x as usize * 4;
-                row[di] = rgba[0].round().clamp(0.0, 255.0) as u8;
-                row[di + 1] = rgba[1].round().clamp(0.0, 255.0) as u8;
-                row[di + 2] = rgba[2].round().clamp(0.0, 255.0) as u8;
-                row[di + 3] = rgba[3].round().clamp(0.0, 255.0) as u8;
+                let di = x as usize * stride;
+                for c in 0..stride {
+                    row[di + c] = acc[c].round().clamp(0.0, 255.0) as u8;
+                }
             }
         });
 }
 
-fn convolve_cols(src: &[u8], dst: &mut [u8], w: u32, h: u32, kernel: &[f32]) {
+fn convolve_cols(src: &[u8], dst: &mut [u8], w: u32, h: u32, stride: usize, kernel: &[f32]) {
     let radius = (kernel.len() / 2) as i32;
-    dst.par_chunks_mut(w as usize * 4)
+    let row_len = w as usize * stride;
+    dst.par_chunks_mut(row_len)
         .enumerate()
         .for_each(|(y, row)| {
-            for x in 0..w {
-                let mut rgba = [0.0f32; 4];
+            for x in 0..w as usize {
+                let mut acc = [0.0f32; 4];
                 for (ki, &kv) in kernel.iter().enumerate() {
-                    let sy = (y as i32 + ki as i32 - radius).clamp(0, h as i32 - 1) as u32;
-                    let idx = (sy * w + x) as usize * 4;
-                    rgba[0] += src[idx] as f32 * kv;
-                    rgba[1] += src[idx + 1] as f32 * kv;
-                    rgba[2] += src[idx + 2] as f32 * kv;
-                    rgba[3] += src[idx + 3] as f32 * kv;
+                    let sy = (y as i32 + ki as i32 - radius).clamp(0, h as i32 - 1) as usize;
+                    let idx = (sy * w as usize + x) * stride;
+                    for c in 0..stride {
+                        acc[c] += src[idx + c] as f32 * kv;
+                    }
                 }
-                let di = x as usize * 4;
-                row[di] = rgba[0].round().clamp(0.0, 255.0) as u8;
-                row[di + 1] = rgba[1].round().clamp(0.0, 255.0) as u8;
-                row[di + 2] = rgba[2].round().clamp(0.0, 255.0) as u8;
-                row[di + 3] = rgba[3].round().clamp(0.0, 255.0) as u8;
+                let di = x * stride;
+                for c in 0..stride {
+                    row[di + c] = acc[c].round().clamp(0.0, 255.0) as u8;
+                }
             }
         });
 }
 
-fn parallel_blur(rgba: &RgbaImage, sigma: f32) -> RgbaImage {
-    let (w, h) = rgba.dimensions();
+/// Separable Gaussian blur over raw RGB (`stride` 3) or RGBA (`stride` 4) bytes.
+fn parallel_blur(bytes: &[u8], w: u32, h: u32, stride: usize, sigma: f32) -> Vec<u8> {
     let kernel = gaussian_kernel_1d(sigma);
-    let mut temp = vec![0u8; (w * h * 4) as usize];
-    let mut out = vec![0u8; (w * h * 4) as usize];
-    convolve_rows(rgba.as_raw(), &mut temp, w, h, &kernel);
-    convolve_cols(&temp, &mut out, w, h, &kernel);
-    RgbaImage::from_raw(w, h, out).unwrap()
+    let mut temp = vec![0u8; bytes.len()];
+    let mut out = vec![0u8; bytes.len()];
+    convolve_rows(bytes, &mut temp, w, stride, &kernel);
+    convolve_cols(&temp, &mut out, w, h, stride, &kernel);
+    out
 }
 
-fn parallel_unsharpen(rgba: RgbaImage, sigma: f32, threshold: i32) -> RgbaImage {
-    let (w, h) = rgba.dimensions();
-    let blurred = parallel_blur(&rgba, sigma);
-    let orig_raw = rgba.into_raw();
-    let blur_raw = blurred.into_raw();
-    let mut dst_raw = vec![0u8; orig_raw.len()];
-    dst_raw
-        .par_chunks_mut(4)
-        .zip(orig_raw.par_chunks(4))
-        .zip(blur_raw.par_chunks(4))
+/// Unsharp mask over raw RGB / RGBA bytes; alpha (when present) is copied unchanged.
+fn parallel_unsharpen(
+    bytes: &[u8],
+    w: u32,
+    h: u32,
+    stride: usize,
+    sigma: f32,
+    threshold: i32,
+) -> Vec<u8> {
+    let blurred = parallel_blur(bytes, w, h, stride, sigma);
+    let mut dst = vec![0u8; bytes.len()];
+    dst.par_chunks_mut(stride)
+        .zip(bytes.par_chunks(stride))
+        .zip(blurred.par_chunks(stride))
         .for_each(|((dst, orig), blur)| {
             for i in 0..3 {
                 let diff = orig[i] as i32 - blur[i] as i32;
@@ -1353,9 +1823,11 @@ fn parallel_unsharpen(rgba: RgbaImage, sigma: f32, threshold: i32) -> RgbaImage 
                     orig[i]
                 };
             }
-            dst[3] = orig[3];
+            if stride == 4 {
+                dst[3] = orig[3];
+            }
         });
-    RgbaImage::from_raw(w, h, dst_raw).unwrap()
+    dst
 }
 
 pub struct BlurProcess {
@@ -1371,8 +1843,10 @@ impl BlurProcess {
 impl Process for BlurProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
-        let di = std::mem::take(&mut img.di);
-        img.di = DynamicImage::ImageRgba8(parallel_blur(&di.into_rgba8(), self.sigma));
+        let sigma = self.sigma;
+        img.di = map_raw(std::mem::take(&mut img.di), |bytes, w, h, stride| {
+            parallel_blur(bytes, w, h, stride, sigma)
+        });
         img.buffer.clear();
         Ok(img)
     }
@@ -1558,20 +2032,15 @@ fn smart_crop_offset(di: &DynamicImage, crop_w: u32, crop_h: u32) -> (u32, u32) 
             ((src_h as f32 * s).round() as u32).max(1),
         )
     };
-    let small = if sw == src_w && sh == src_h {
-        di.to_rgba8()
-    } else {
-        fir_resize(di.to_rgba8(), sw, sh, FirFilter::Bilinear)
-    };
-    let raw = small.as_raw();
+    // Measure on a small copy scaled straight from the borrowed pixels (no full-size copy).
+    let small = fir_resize_view(di, None, sw, sh, FirFilter::Bilinear);
+    let (raw, stride) = pixel_bytes(&small).expect("fir_resize_view yields RGB8 or RGBA8");
     let swu = sw as usize;
     let shu = sh as usize;
 
-    let luma: Vec<f32> = (0..swu * shu)
-        .map(|i| {
-            let p = &raw[i * 4..i * 4 + 3];
-            0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32
-        })
+    let luma: Vec<f32> = raw
+        .chunks_exact(stride)
+        .map(|p| 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32)
         .collect();
 
     // |dL/dx| + |dL/dy| with replicated borders (central difference).
@@ -1649,6 +2118,9 @@ impl Process for ThumbnailProcess {
         }
         let src_w = img.di.width();
         let src_h = img.di.height();
+        if src_w == 0 || src_h == 0 {
+            return Ok(img);
+        }
         let dst_w = self.width;
         let dst_h = self.height;
 
@@ -1656,8 +2128,9 @@ impl Process for ThumbnailProcess {
         // Faster than resize-to-cover then crop: Lanczos3 works on dst_w×dst_h output
         // pixels instead of the slightly larger scaled intermediate.
         let scale = (dst_w as f64 / src_w as f64).max(dst_h as f64 / src_h as f64);
-        let crop_w = (dst_w as f64 / scale).round() as u32;
-        let crop_h = (dst_h as f64 / scale).round() as u32;
+        // Extreme aspect-ratio changes can round the crop window to 0; keep at least 1px.
+        let crop_w = ((dst_w as f64 / scale).round() as u32).clamp(1, src_w);
+        let crop_h = ((dst_h as f64 / scale).round() as u32).clamp(1, src_h);
         let (crop_x, crop_y) = if self.smart {
             smart_crop_offset(&img.di, crop_w, crop_h)
         } else {
@@ -1667,17 +2140,11 @@ impl Process for ThumbnailProcess {
             )
         };
 
-        let source = if crop_w == src_w && crop_h == src_h {
-            std::mem::take(&mut img.di)
-        } else {
-            DynamicImage::ImageRgba8(crop(&mut img.di, crop_x, crop_y, crop_w, crop_h).to_image())
-        };
-        img.di = DynamicImage::ImageRgba8(fir_resize(
-            source.into_rgba8(),
-            dst_w,
-            dst_h,
-            FirFilter::Lanczos3,
-        ));
+        // Resize the crop window directly from the source pixels: no cropped copy, and the
+        // channel layout is kept.
+        let region =
+            (crop_w != src_w || crop_h != src_h).then_some((crop_x, crop_y, crop_w, crop_h));
+        img.di = fir_resize_view(&img.di, region, dst_w, dst_h, FirFilter::Lanczos3);
         img.buffer.clear();
         Ok(img)
     }
@@ -1803,6 +2270,10 @@ impl BackgroundProcess {
 impl Process for BackgroundProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
+        // Nothing to flatten in an image without an alpha channel.
+        if !img.di.color().has_alpha() {
+            return Ok(img);
+        }
         let [bg_r, bg_g, bg_b, bg_a] = self.color.0;
         let bg_af = bg_a as f32 / 255.0;
         let di = std::mem::take(&mut img.di);
@@ -1834,7 +2305,12 @@ impl Process for BackgroundProcess {
                 p[2] = blend(p[2], bg_b);
                 p[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
             });
-        img.di = DynamicImage::ImageRgba8(rgba);
+        // An opaque background leaves every pixel opaque: drop the now-useless alpha plane.
+        img.di = if bg_a == 255 {
+            DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba).into_rgb8())
+        } else {
+            DynamicImage::ImageRgba8(rgba)
+        };
         img.buffer.clear();
         Ok(img)
     }
@@ -1922,18 +2398,17 @@ impl Process for TrimProcess {
         if w == 0 || h == 0 {
             return Ok(img);
         }
-        let di = std::mem::take(&mut img.di);
-        let rgba = di.into_rgba8();
-        let raw = rgba.as_raw();
-        let reference = [raw[0], raw[1], raw[2], raw[3]];
+        // Scan the pixels in their own layout (RGB for opaque images) instead of an RGBA copy.
+        let di = rgb_or_rgba(std::mem::take(&mut img.di));
+        let (raw, stride) = pixel_bytes(&di).expect("normalised to RGB8 or RGBA8");
+        let reference = &raw[..stride];
         let tol = self.tolerance as i32;
         let wu = w as usize;
 
         let is_border = |px: &[u8]| -> bool {
-            (px[0] as i32 - reference[0] as i32).abs() <= tol
-                && (px[1] as i32 - reference[1] as i32).abs() <= tol
-                && (px[2] as i32 - reference[2] as i32).abs() <= tol
-                && (px[3] as i32 - reference[3] as i32).abs() <= tol
+            px.iter()
+                .zip(reference)
+                .all(|(&p, &r)| (p as i32 - r as i32).abs() <= tol)
         };
 
         // For each row, the first/last x holding a non-border pixel (None = all border).
@@ -1943,8 +2418,8 @@ impl Process for TrimProcess {
                 let mut lo: Option<u32> = None;
                 let mut hi = 0u32;
                 for x in 0..wu {
-                    let idx = (y * wu + x) * 4;
-                    if !is_border(&raw[idx..idx + 4]) {
+                    let idx = (y * wu + x) * stride;
+                    if !is_border(&raw[idx..idx + stride]) {
                         if lo.is_none() {
                             lo = Some(x as u32);
                         }
@@ -1957,7 +2432,7 @@ impl Process for TrimProcess {
 
         let Some(min_y) = rows.iter().position(|r| r.is_some()) else {
             // Entire image matches the border color: nothing to trim.
-            img.di = DynamicImage::ImageRgba8(rgba);
+            img.di = di;
             return Ok(img);
         };
         let max_y = rows.iter().rposition(|r| r.is_some()).unwrap();
@@ -1971,12 +2446,10 @@ impl Process for TrimProcess {
         let crop_w = max_x - min_x + 1;
         let crop_h = (max_y - min_y) as u32 + 1;
         if crop_w == w && crop_h == h {
-            img.di = DynamicImage::ImageRgba8(rgba);
+            img.di = di;
             return Ok(img);
         }
-        let mut di = DynamicImage::ImageRgba8(rgba);
-        let cropped = crop(&mut di, min_x, min_y as u32, crop_w, crop_h).to_image();
-        img.di = DynamicImage::ImageRgba8(cropped);
+        img.di = di.crop_imm(min_x, min_y as u32, crop_w, crop_h);
         img.buffer.clear();
         Ok(img)
     }
@@ -2010,16 +2483,28 @@ impl Process for PaddingProcess {
             return Ok(img);
         }
 
-        let mut canvas = RgbaImage::from_pixel(dst_w, dst_h, self.color);
         let x = ((dst_w - src_w) / 2) as i64;
         let y = ((dst_h - src_h) / 2) as i64;
-        overlay(&mut canvas, &img.di, x, y);
-        img.di = DynamicImage::ImageRgba8(canvas);
+        img.di = match &img.di {
+            // Opaque image on an opaque fill: the result is opaque, so stay RGB8.
+            DynamicImage::ImageRgb8(src) if self.color.0[3] == 255 => {
+                let [r, g, b, _] = self.color.0;
+                let mut canvas = RgbImage::from_pixel(dst_w, dst_h, image::Rgb([r, g, b]));
+                overlay(&mut canvas, src, x, y);
+                DynamicImage::ImageRgb8(canvas)
+            }
+            src => {
+                let mut canvas = RgbaImage::from_pixel(dst_w, dst_h, self.color);
+                overlay(&mut canvas, src, x, y);
+                DynamicImage::ImageRgba8(canvas)
+            }
+        };
         img.buffer.clear();
         Ok(img)
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatermarkPosition {
     LeftTop,
     Top,
@@ -2032,9 +2517,10 @@ pub enum WatermarkPosition {
     RightBottom,
 }
 
-impl From<&str> for WatermarkPosition {
-    fn from(value: &str) -> Self {
-        match value {
+impl WatermarkPosition {
+    /// Parse a position name (`leftTop`, `top`, … `rightBottom`); `None` if unknown.
+    pub fn from_name(value: &str) -> Option<Self> {
+        Some(match value {
             "leftTop" => WatermarkPosition::LeftTop,
             "top" => WatermarkPosition::Top,
             "rightTop" => WatermarkPosition::RightTop,
@@ -2043,8 +2529,16 @@ impl From<&str> for WatermarkPosition {
             "right" => WatermarkPosition::Right,
             "leftBottom" => WatermarkPosition::LeftBottom,
             "bottom" => WatermarkPosition::Bottom,
-            _ => WatermarkPosition::RightBottom,
-        }
+            "rightBottom" => WatermarkPosition::RightBottom,
+            _ => return None,
+        })
+    }
+}
+
+impl From<&str> for WatermarkPosition {
+    /// Unknown names fall back to `RightBottom`.
+    fn from(value: &str) -> Self {
+        WatermarkPosition::from_name(value).unwrap_or(WatermarkPosition::RightBottom)
     }
 }
 
@@ -2144,9 +2638,16 @@ impl CropProcess {
 impl Process for CropProcess {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage> {
         let mut img = pi;
-        let mut r = img.di;
-        let result = crop(&mut r, self.x, self.y, self.width, self.height);
-        img.di = DynamicImage::ImageRgba8(result.to_image());
+        // `crop_imm` keeps the channel layout and clamps to the image bounds, so a region
+        // outside the image yields an empty result.
+        let result = img.di.crop_imm(self.x, self.y, self.width, self.height);
+        ensure!(
+            result.width() > 0 && result.height() > 0,
+            ParamsInvalidSnafu {
+                message: "crop region is outside the image",
+            }
+        );
+        img.di = result;
         img.buffer.clear();
         Ok(img)
     }
@@ -2198,34 +2699,43 @@ impl Process for OptimProcess {
         };
         img.ext.clone_from(&actual_ext);
 
-        // GIF encoding reads the original buffer; clone it so img.buffer is preserved
-        // for the fallback case where the optimised GIF is not smaller than the source.
-        let gif_buffer = if actual_ext == IMAGE_TYPE_GIF {
-            img.buffer.clone()
-        } else {
-            Vec::new()
-        };
+        // An untouched GIF source still holds its original (possibly animated) bytes; after
+        // any transform the buffer is cleared and only the current pixels in `info` remain.
+        let gif_source = (original_type == IMAGE_TYPE_GIF && !img.buffer.is_empty())
+            .then_some(img.buffer.as_slice());
 
         // Closure returns (encoded_bytes, info.image) so the pixel data is available
         // for restoring img.di after encoding.
-        let do_encode = move || -> Result<(Vec<u8>, DynamicImage)> {
+        let do_encode = || -> Result<(Vec<u8>, DynamicImage)> {
             let encoded = match actual_ext.as_str() {
-                IMAGE_TYPE_GIF => to_gif(Cursor::new(gif_buffer), speed).context(ImagesSnafu {})?,
+                IMAGE_TYPE_GIF => match gif_source {
+                    Some(buf) => to_gif(Cursor::new(buf), speed),
+                    None => info.to_gif(speed),
+                }
+                .context(ImagesSnafu {})?,
                 IMAGE_TYPE_PNG => info.to_png(quality).context(ImagesSnafu {})?,
                 IMAGE_TYPE_AVIF => info.to_avif(quality, speed).context(ImagesSnafu {})?,
-                IMAGE_TYPE_WEBP => info.to_webp(quality).context(ImagesSnafu {})?,
+                IMAGE_TYPE_WEBP => {
+                    // Keep an animated GIF animated instead of flattening it to one frame.
+                    let animated = match gif_source {
+                        Some(buf) => gif_to_animated_webp(Cursor::new(buf), quality)
+                            .context(ImagesSnafu {})?,
+                        None => None,
+                    };
+                    match animated {
+                        Some(data) => data,
+                        None => info.to_webp(quality).context(ImagesSnafu {})?,
+                    }
+                }
                 IMAGE_TYPE_JXL => info.to_jxl(quality).context(ImagesSnafu {})?,
                 _ => info.to_mozjpeg(quality).context(ImagesSnafu {})?,
             };
             Ok((encoded, info.image))
         };
 
-        // In the CLI (multi-thread Tokio runtime) run encoding in a blocking context so
-        // async I/O for other concurrent tasks can proceed during CPU-heavy encoding.
-        #[cfg(feature = "bin")]
-        let (data, info_image) = tokio::task::block_in_place(do_encode)?;
-        #[cfg(not(feature = "bin"))]
-        let (data, info_image) = do_encode()?;
+        // CPU-heavy: under the CLI's multi-thread runtime this yields the worker thread so
+        // async I/O for other concurrent tasks can proceed.
+        let (data, info_image) = run_blocking(do_encode)?;
 
         if img.ext != original_type || data.len() < original_size || original_size == 0 {
             img.buffer = data;
@@ -2233,18 +2743,7 @@ impl Process for OptimProcess {
             // lossy output. Skip when original is None (no diff task in pipeline) since
             // the round-trip — especially for AVIF — is expensive and serves no purpose.
             if img.support_dssim() && img.original.is_some() {
-                let result = if matches!(img.ext.as_str(), IMAGE_TYPE_AVIF | IMAGE_TYPE_JXL) {
-                    if img.ext == IMAGE_TYPE_AVIF {
-                        avif_decode(&img.buffer).context(ImagesSnafu {})
-                    } else {
-                        jxl_decode(&img.buffer).context(ImagesSnafu {})
-                    }
-                } else {
-                    let c = Cursor::new(&img.buffer);
-                    let format = ImageFormat::from_extension(&img.ext).unwrap_or(ImageFormat::Jpeg);
-                    load(c, format).context(ImageSnafu {})
-                };
-                img.di = result.unwrap_or(info_image);
+                img.di = decode_to_di(&img.buffer, &img.ext).unwrap_or(info_image);
             } else {
                 img.di = info_image;
             }
@@ -2265,8 +2764,9 @@ struct Candidate {
 }
 
 /// Auto optimisation: searches output format and/or quality to meet a perceptual-diff
-/// target while minimising file size. Requires the original RGBA snapshot for scoring,
-/// so the pipeline keeps the original whenever an auto task is present.
+/// target while minimising file size. Candidates are scored against the image being
+/// encoded (not the loaded original), so the target bounds encoding loss alone and the
+/// search still works after a resize, crop or color edit.
 pub struct AutoOptimProcess {
     /// Empty → search across candidate formats; otherwise a fixed output format.
     output_type: String,
@@ -2310,16 +2810,13 @@ impl AutoOptimProcess {
     fn encode_candidate(
         &self,
         info: &ImageInfo,
-        scorer: Option<&DiffScorer>,
+        scorer: &DiffScorer,
         ext: &str,
         quality: u8,
     ) -> Result<Candidate> {
         let buffer = encode_info(info, ext, quality, self.speed)?;
         let di = decode_to_di(&buffer, ext)?;
-        let diff = match scorer {
-            Some(s) => s.score(&di),
-            None => -1.0,
-        };
+        let diff = scorer.score(&di);
         Ok(Candidate {
             ext: ext.to_string(),
             buffer,
@@ -2339,9 +2836,10 @@ impl AutoOptimProcess {
         let mut lo = AUTO_MIN_QUALITY;
         let mut hi = AUTO_MAX_QUALITY;
         let mut best: Option<Candidate> = None;
+        let mut max_probe: Option<Candidate> = None;
         while lo <= hi {
             let mid = lo + (hi - lo) / 2;
-            let cand = self.encode_candidate(info, Some(scorer), ext, mid)?;
+            let cand = self.encode_candidate(info, scorer, ext, mid)?;
             if cand.diff >= 0.0 && cand.diff <= self.target_diff {
                 // Meets the target — record it and try an even lower quality for a smaller file.
                 best = Some(cand);
@@ -2350,31 +2848,33 @@ impl AutoOptimProcess {
                 }
                 hi = mid - 1;
             } else {
+                if mid == AUTO_MAX_QUALITY {
+                    max_probe = Some(cand);
+                }
                 lo = mid + 1;
             }
         }
-        match best {
+        // When nothing meets the target the search climbs all the way to the maximum
+        // quality, so reuse that probe instead of encoding it a second time.
+        match best.or(max_probe) {
             Some(c) => Ok(c),
-            None => self.encode_candidate(info, Some(scorer), ext, AUTO_MAX_QUALITY),
+            None => self.encode_candidate(info, scorer, ext, AUTO_MAX_QUALITY),
         }
     }
 
-    fn best_candidate(&self, info: &ImageInfo, original: Option<&RgbaImage>) -> Result<Candidate> {
+    fn best_candidate(&self, info: &ImageInfo) -> Result<Candidate> {
         let formats = self.candidate_formats(info);
-        // Prepare the original's DSSIM pyramids once and reuse across every format and
-        // every quality probe (instead of re-preprocessing it on each comparison).
-        let scorer = original.map(DiffScorer::new);
-        let scorer = scorer.as_ref();
-        let mut candidates = Vec::with_capacity(formats.len());
-        for ext in &formats {
-            let cand = match (self.quality, scorer) {
-                (None, Some(s)) => self.search_quality(info, s, ext)?,
-                // No original to score against: fall back to a single high-quality encode.
-                (None, None) => self.encode_candidate(info, None, ext, AUTO_MAX_QUALITY)?,
-                (Some(q), _) => self.encode_candidate(info, scorer, ext, q)?,
-            };
-            candidates.push(cand);
-        }
+        // Prepare the reference DSSIM pyramids once and reuse them across every format and
+        // every quality probe (instead of re-preprocessing on each comparison).
+        let scorer = DiffScorer::from_dynamic(&info.image);
+        // Formats are independent searches, so run them concurrently (order is preserved).
+        let candidates = formats
+            .par_iter()
+            .map(|ext| match self.quality {
+                None => self.search_quality(info, &scorer, ext),
+                Some(q) => self.encode_candidate(info, &scorer, ext, q),
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(pick_candidate(candidates, self.target_diff))
     }
 }
@@ -2413,16 +2913,8 @@ impl Process for AutoOptimProcess {
         let di = std::mem::take(&mut img.di);
         let info: ImageInfo = di.into();
 
-        let cand = {
-            let original = img.original.as_ref();
-            // Encoding/decoding/scoring is CPU-heavy; run it in a blocking context under the
-            // CLI's multi-thread runtime so other async tasks keep progressing.
-            #[cfg(feature = "bin")]
-            let c = tokio::task::block_in_place(|| self.best_candidate(&info, original))?;
-            #[cfg(not(feature = "bin"))]
-            let c = self.best_candidate(&info, original)?;
-            c
-        };
+        // Encoding/decoding/scoring is CPU-heavy; see `run_blocking`.
+        let cand = run_blocking(|| self.best_candidate(&info))?;
 
         img.ext = cand.ext;
         img.buffer = cand.buffer;
@@ -2473,19 +2965,65 @@ mod tests {
         );
     }
 
+    /// Hits a public URL, so it is opt-in: `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "requires network access"]
+    #[cfg(feature = "network")]
+    fn test_load_process_http() {
+        let p = LoaderProcess::new(
+            "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png",
+            "",
+        );
+        let result = tokio_test::block_on(p.fetch_data()).unwrap();
+        assert_ne!(result.buffer.len(), 0);
+        assert_eq!(result.ext, "png");
+    }
+
+    #[test]
+    #[cfg(feature = "network")]
+    fn test_ext_from_content_type() {
+        use super::ext_from_content_type;
+        assert_eq!(ext_from_content_type("image/png").as_deref(), Some("png"));
+        assert_eq!(
+            ext_from_content_type("image/PNG; charset=binary").as_deref(),
+            Some("png")
+        );
+        assert_eq!(ext_from_content_type("nonsense"), None);
+    }
+
+    #[test]
+    fn test_load_options() {
+        use super::LoadOptions;
+        let file = format!(
+            "file://{}/assets/rust-logo.png",
+            std::env::current_dir().unwrap().to_string_lossy()
+        );
+        let mut p = LoaderProcess::new(&file, "");
+        p.options = LoadOptions {
+            allow_file: false,
+            ..Default::default()
+        };
+        assert!(tokio_test::block_on(p.fetch_data()).is_err());
+
+        p.options = LoadOptions {
+            max_bytes: 100,
+            ..Default::default()
+        };
+        assert!(tokio_test::block_on(p.fetch_data()).is_err());
+
+        let data = include_bytes!("../assets/rust-logo.png");
+        let mut p = LoaderProcess::new(&general_purpose::STANDARD.encode(data), "png");
+        p.options.max_bytes = 100;
+        assert!(tokio_test::block_on(p.fetch_data()).is_err());
+
+        let mut p = LoaderProcess::new("http://127.0.0.1:1/a.png", "");
+        p.options.allow_http = false;
+        let err = tokio_test::block_on(p.fetch_data()).err().unwrap();
+        assert!(err.to_string().contains("disabled"), "{err}");
+    }
+
     #[test]
     fn test_load_process() {
-        #[cfg(feature = "network")]
-        {
-            let p = LoaderProcess::new(
-                "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png",
-                "",
-            );
-            let result = tokio_test::block_on(p.fetch_data()).unwrap();
-            assert_ne!(result.buffer.len(), 0);
-            assert_eq!(result.ext, "png");
-        }
-
         let file = format!(
             "file://{}/assets/rust-logo.png",
             std::env::current_dir().unwrap().to_string_lossy()
@@ -2608,8 +3146,10 @@ mod tests {
         assert_eq!(result.di.width(), 144);
         assert_eq!(result.di.height(), 144);
 
-        // Flattening onto an opaque background makes every pixel fully opaque.
-        let rgba = result.di.as_rgba8().unwrap();
+        // Flattening onto an opaque background makes every pixel opaque, so the alpha
+        // plane is dropped entirely.
+        assert!(matches!(result.di, image::DynamicImage::ImageRgb8(_)));
+        let rgba = result.di.to_rgba8();
         assert!(rgba.pixels().all(|p| p.0[3] == 255));
 
         // A formerly transparent pixel takes the exact background color.
@@ -2621,7 +3161,13 @@ mod tests {
         // Empty color defaults to opaque white.
         let white =
             tokio_test::block_on(BackgroundProcess::new("").process(new_process_image())).unwrap();
-        assert!(white.di.as_rgba8().unwrap().pixels().all(|p| p.0[3] == 255));
+        assert!(white.di.to_rgba8().pixels().all(|p| p.0[3] == 255));
+
+        // A semi-transparent background keeps the alpha channel.
+        let tinted =
+            tokio_test::block_on(BackgroundProcess::new("#ff000080").process(new_process_image()))
+                .unwrap();
+        assert!(matches!(tinted.di, image::DynamicImage::ImageRgba8(_)));
     }
 
     #[test]
@@ -2919,7 +3465,7 @@ mod tests {
         img.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
         let di = DynamicImage::ImageRgba8(img);
         ProcessImage {
-            original: Some(di.to_rgba8()),
+            original: Some(std::sync::Arc::new(di.to_rgba8())),
             di,
             diff: -1.0,
             original_size: 0,
@@ -2963,7 +3509,7 @@ mod tests {
         img.put_pixel(0, 0, Rgba([255, 0, 0, 128]));
         let di = DynamicImage::ImageRgba8(img);
         let pi = ProcessImage {
-            original: Some(di.to_rgba8()),
+            original: Some(std::sync::Arc::new(di.to_rgba8())),
             di,
             diff: -1.0,
             original_size: 0,
@@ -3122,7 +3668,7 @@ mod tests {
         let result =
             tokio_test::block_on(OpacityProcess::new(0.5).process(new_red_pixel())).unwrap();
         let a = result.di.as_rgba8().unwrap().get_pixel(0, 0).0[3];
-        assert!(a >= 127 && a <= 128);
+        assert!((127..=128).contains(&a));
 
         // RGB channels are unaffected
         let result =
@@ -3153,7 +3699,7 @@ mod tests {
             img.put_pixel(0, 0, Rgba([128, 128, 128, 200]));
             let di = DynamicImage::ImageRgba8(img);
             ProcessImage {
-                original: Some(di.to_rgba8()),
+                original: Some(std::sync::Arc::new(di.to_rgba8())),
                 di,
                 diff: -1.0,
                 original_size: 0,
@@ -3175,7 +3721,7 @@ mod tests {
             img.put_pixel(0, 0, Rgba([128, 128, 128, 255]));
             let di = DynamicImage::ImageRgba8(img);
             ProcessImage {
-                original: Some(di.to_rgba8()),
+                original: Some(std::sync::Arc::new(di.to_rgba8())),
                 di,
                 diff: -1.0,
                 original_size: 0,
@@ -3194,8 +3740,10 @@ mod tests {
         let result =
             tokio_test::block_on(OptimProcess::new("png", 70, 0).process(new_process_image()))
                 .unwrap();
+        // Byte counts are not asserted exactly: they change with encoder releases.
+        let source_len = include_bytes!("../assets/rust-logo.png").len();
         assert_eq!(result.ext, "png");
-        assert_eq!(result.buffer.len(), 1463);
+        assert!(!result.buffer.is_empty() && result.buffer.len() < source_len);
         assert_ne!(result.get_diff(), 0.0_f64);
         assert_ne!(result.get_diff(), -1.0_f64);
 
@@ -3203,17 +3751,17 @@ mod tests {
             tokio_test::block_on(OptimProcess::new("avif", 70, 0).process(new_process_image()))
                 .unwrap();
         assert_eq!(result.ext, "avif");
-        assert_eq!(result.buffer.len(), 2367);
+        assert!(!result.buffer.is_empty());
         assert_ne!(result.get_diff(), 0.0_f64);
         assert_ne!(result.get_diff(), -1.0_f64);
 
         // lossless webp (quality >= 100)
-        let result =
+        let lossless =
             tokio_test::block_on(OptimProcess::new("webp", 100, 0).process(new_process_image()))
                 .unwrap();
-        assert_eq!(result.ext, "webp");
-        assert_eq!(result.buffer.len(), 2764);
-        assert_eq!(result.get_diff(), 0.0);
+        assert_eq!(lossless.ext, "webp");
+        assert!(!lossless.buffer.is_empty());
+        assert_eq!(lossless.get_diff(), 0.0);
 
         // lossy webp
         let result =
@@ -3221,14 +3769,14 @@ mod tests {
                 .unwrap();
         assert_eq!(result.ext, "webp");
         assert_ne!(result.buffer.len(), 0);
-        assert!(result.buffer.len() < 2764);
+        assert!(result.buffer.len() < lossless.buffer.len());
         assert!(result.get_diff() >= 0.0);
 
         let result =
             tokio_test::block_on(OptimProcess::new("jpeg", 70, 0).process(new_process_image()))
                 .unwrap();
         assert_eq!(result.ext, "jpeg");
-        assert_eq!(result.buffer.len(), 392);
+        assert!(!result.buffer.is_empty());
         assert_ne!(result.get_diff(), 0.0_f64);
         assert_ne!(result.get_diff(), -1.0_f64);
 
@@ -3321,6 +3869,76 @@ mod tests {
     }
 
     #[test]
+    fn test_auto_quality_after_resize() {
+        // The loaded original is 144×144 but the encoder sees 72×72; scoring must use the
+        // encoder input, otherwise every probe is "not comparable" and the search silently
+        // degrades to the maximum quality.
+        let resized =
+            tokio_test::block_on(ResizeProcess::new(72, 72).process(new_process_image())).unwrap();
+        let target = 10.0;
+        let result =
+            tokio_test::block_on(AutoOptimProcess::new("webp", None, 0, target).process(resized))
+                .unwrap();
+        assert!(result.diff >= 0.0, "diff was not computed: {}", result.diff);
+        assert!(result.diff <= target);
+    }
+
+    #[test]
+    fn test_new_without_original() {
+        let data = include_bytes!("../assets/rust-logo.png");
+        let img = ProcessImage::new_without_original(data.to_vec(), "png").unwrap();
+        assert!(img.original.is_none());
+        assert_eq!(img.get_size(), (144, 144));
+        assert_eq!(img.get_diff(), -1.0);
+    }
+
+    #[test]
+    fn test_run_rejects_invalid_tasks() {
+        use super::run_with_image;
+        let run = |tasks: Vec<Vec<&str>>| {
+            let tasks = tasks
+                .into_iter()
+                .map(|t| t.into_iter().map(String::from).collect())
+                .collect();
+            tokio_test::block_on(run_with_image(new_process_image(), tasks))
+        };
+        // Missing load source used to panic with an index out of bounds.
+        assert!(run(vec![vec!["load"]]).is_err());
+        // Misspelt task names are reported instead of silently skipped.
+        assert!(run(vec![vec!["resise", "10", "10"]]).is_err());
+        // Present-but-malformed optional params are errors, not silent defaults.
+        assert!(run(vec![vec!["rotate", "abc"]]).is_err());
+        assert!(run(vec![vec!["blur", "x"]]).is_err());
+        assert!(run(vec![vec!["optim", "webp", "auto", "0", "nope"]]).is_err());
+        assert!(run(vec![vec!["rotate", "45"]]).is_err());
+        // Missing or empty optional params still fall back to their defaults.
+        assert_eq!(run(vec![vec!["rotate"]]).unwrap().get_size(), (144, 144));
+        assert_eq!(run(vec![vec!["blur", ""]]).unwrap().get_size(), (144, 144));
+    }
+
+    #[test]
+    fn test_extreme_aspect_ratio_never_zero() {
+        use image::{DynamicImage, RgbImage};
+        let wide = || ProcessImage {
+            di: DynamicImage::ImageRgb8(RgbImage::new(4000, 3)),
+            ..Default::default()
+        };
+        let fit = tokio_test::block_on(ResizeProcess::new_fit(100, 0).process(wide())).unwrap();
+        assert_eq!(fit.get_size(), (100, 1));
+        let exact = tokio_test::block_on(ResizeProcess::new(1, 0).process(wide())).unwrap();
+        assert_eq!(exact.get_size(), (1, 1));
+        let thumb = tokio_test::block_on(ThumbnailProcess::new(10, 100).process(wide())).unwrap();
+        assert_eq!(thumb.get_size(), (10, 100));
+    }
+
+    #[test]
+    fn test_crop_outside_image() {
+        let result =
+            tokio_test::block_on(CropProcess::new(500, 500, 10, 10).process(new_process_image()));
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_opaque_rgb_fast_path() {
         use image::DynamicImage;
         // A fully opaque RGB8 image stays RGB8 through point ops and resize — no alpha
@@ -3355,10 +3973,282 @@ mod tests {
         assert!(is_rgb(&resized));
         assert_eq!((resized.di.width(), resized.di.height()), (3, 2));
 
+        // Geometry and convolution ops keep the RGB layout too.
+        let rotated = tokio_test::block_on(RotateProcess::new(90).process(rgb())).unwrap();
+        assert!(is_rgb(&rotated));
+        assert_eq!(rotated.get_size(), (4, 6));
+        assert!(is_rgb(
+            &tokio_test::block_on(FlipProcess::new("v").process(rgb())).unwrap()
+        ));
+        let cropped = tokio_test::block_on(CropProcess::new(1, 1, 3, 2).process(rgb())).unwrap();
+        assert!(is_rgb(&cropped));
+        assert_eq!(cropped.get_size(), (3, 2));
+        let thumb = tokio_test::block_on(ThumbnailProcess::new(2, 2).process(rgb())).unwrap();
+        assert!(is_rgb(&thumb));
+        assert_eq!(thumb.get_size(), (2, 2));
+        let smart = tokio_test::block_on(ThumbnailProcess::new_smart(2, 2).process(rgb())).unwrap();
+        assert!(is_rgb(&smart));
+        assert!(is_rgb(
+            &tokio_test::block_on(BlurProcess::new(1.0).process(rgb())).unwrap()
+        ));
+        assert!(is_rgb(
+            &tokio_test::block_on(SharpenProcess::new(1.0, 0).process(rgb())).unwrap()
+        ));
+        assert!(is_rgb(
+            &tokio_test::block_on(TrimProcess::new(0).process(rgb())).unwrap()
+        ));
+        let padded =
+            tokio_test::block_on(PaddingProcess::new(8, 8, "#ffffff").process(rgb())).unwrap();
+        assert!(is_rgb(&padded));
+        assert_eq!(padded.get_size(), (8, 8));
+        assert!(is_rgb(
+            &tokio_test::block_on(BackgroundProcess::new("#ffffff").process(rgb())).unwrap()
+        ));
+        assert!(is_rgb(&ProcessImage {
+            di: super::apply_orientation(rgb().di, 6),
+            ..Default::default()
+        }));
+
         // An image with transparency keeps its alpha channel (rust-logo is RGBA8).
         let out =
             tokio_test::block_on(BrightenProcess::new(20).process(new_process_image())).unwrap();
         assert!(matches!(out.di, DynamicImage::ImageRgba8(_)));
+    }
+
+    #[test]
+    fn test_blur_matches_between_layouts() {
+        use image::DynamicImage;
+        // The RGB and RGBA convolution paths must produce the same color channels.
+        let rgb = image::RgbImage::from_fn(9, 7, |x, y| {
+            image::Rgb([(x * 30) as u8, (y * 35) as u8, ((x + y) * 12) as u8])
+        });
+        let rgba = DynamicImage::ImageRgb8(rgb.clone()).to_rgba8();
+        let blur = |di: DynamicImage| {
+            tokio_test::block_on(BlurProcess::new(1.5).process(ProcessImage {
+                di,
+                ..Default::default()
+            }))
+            .unwrap()
+            .di
+            .to_rgb8()
+        };
+        assert_eq!(
+            blur(DynamicImage::ImageRgb8(rgb)),
+            blur(DynamicImage::ImageRgba8(rgba))
+        );
+    }
+
+    #[test]
+    fn test_gif_output_after_transform() {
+        use super::run_with_image;
+        use image::{codecs::gif::GifEncoder, Delay, Frame, Rgba, RgbaImage};
+        let task = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // A GIF source that was resized used to fail: its original buffer is gone.
+        let frame = |v: u8| {
+            Frame::from_parts(
+                RgbaImage::from_pixel(40, 30, Rgba([v, 40, 90, 255])),
+                0,
+                0,
+                Delay::from_numer_denom_ms(80, 1),
+            )
+        };
+        let mut gif = Vec::new();
+        GifEncoder::new(&mut gif)
+            .encode_frames([frame(10), frame(220)])
+            .unwrap();
+        let resized = tokio_test::block_on(run_with_image(
+            ProcessImage::new(gif.clone(), "gif").unwrap(),
+            vec![
+                task(&["resize", "20", "0"]),
+                task(&["optim", "gif", "80", "0"]),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(resized.ext, "gif");
+        let decoded = image::load_from_memory(&resized.get_buffer().unwrap()).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (20, 15));
+
+        // Converting a non-GIF source to GIF used to fail the same way.
+        let png = tokio_test::block_on(run_with_image(
+            new_process_image(),
+            vec![task(&["optim", "gif", "80", "0"])],
+        ))
+        .unwrap();
+        assert_eq!(png.ext, "gif");
+        assert!(image::load_from_memory(&png.get_buffer().unwrap()).is_ok());
+
+        // An untouched animated GIF converts to an animated WebP, keeping its frames.
+        let webp = tokio_test::block_on(run_with_image(
+            ProcessImage::new(gif, "gif").unwrap(),
+            vec![task(&["optim", "webp", "80", "0"])],
+        ))
+        .unwrap();
+        assert_eq!(webp.ext, "webp");
+        let anim = webp::AnimDecoder::new(&webp.get_buffer().unwrap())
+            .decode()
+            .unwrap();
+        assert_eq!(anim.len(), 2);
+    }
+
+    /// Minimal ICC v2 display profile: sRGB primaries (D50) with a *linear* tone curve.
+    fn linear_rgb_icc() -> Vec<u8> {
+        let s15 = |v: f64| ((v * 65536.0).round() as i32).to_be_bytes();
+        let xyz = |x: f64, y: f64, z: f64| {
+            let mut t = b"XYZ \0\0\0\0".to_vec();
+            for v in [x, y, z] {
+                t.extend(s15(v));
+            }
+            t
+        };
+        // curv with one entry: gamma 1.0 as u8Fixed8, padded to 4 bytes.
+        let curv = || b"curv\0\0\0\0\0\0\0\x01\x01\x00\0\0".to_vec();
+        let tags: Vec<(&[u8; 4], Vec<u8>)> = vec![
+            (b"wtpt", xyz(0.9642, 1.0, 0.8249)),
+            (b"rXYZ", xyz(0.4361, 0.2225, 0.0139)),
+            (b"gXYZ", xyz(0.3851, 0.7169, 0.0971)),
+            (b"bXYZ", xyz(0.1431, 0.0606, 0.7141)),
+            (b"rTRC", curv()),
+            (b"gTRC", curv()),
+            (b"bTRC", curv()),
+        ];
+        let mut offset = 128 + 4 + 12 * tags.len();
+        let mut table = (tags.len() as u32).to_be_bytes().to_vec();
+        let mut data = Vec::new();
+        for (sig, body) in &tags {
+            table.extend(*sig);
+            table.extend((offset as u32).to_be_bytes());
+            table.extend((body.len() as u32).to_be_bytes());
+            offset += body.len();
+            data.extend(body);
+        }
+        let mut header = vec![0u8; 128];
+        header[0..4].copy_from_slice(&(offset as u32).to_be_bytes());
+        header[8..12].copy_from_slice(&[2, 0x10, 0, 0]);
+        header[12..16].copy_from_slice(b"mntr");
+        header[16..20].copy_from_slice(b"RGB ");
+        header[20..24].copy_from_slice(b"XYZ ");
+        header[36..40].copy_from_slice(b"acsp");
+        header[68..72].copy_from_slice(&s15(0.9642));
+        header[72..76].copy_from_slice(&s15(1.0));
+        header[76..80].copy_from_slice(&s15(0.8249));
+        [header, table, data].concat()
+    }
+
+    #[test]
+    fn test_icc_profile_converted_to_srgb() {
+        use img_parts::{png::Png, Bytes, ImageICC};
+        // Mid-gray stored in linear light: in sRGB it must be re-encoded much brighter.
+        let di = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            4,
+            4,
+            image::Rgb([128, 128, 128]),
+        ));
+        let mut png = Vec::new();
+        di.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let plain = ProcessImage::new(png.clone(), "png").unwrap();
+        assert_eq!(plain.di.to_rgb8().get_pixel(0, 0).0, [128, 128, 128]);
+
+        let mut tagged = Png::from_bytes(Bytes::from(png)).unwrap();
+        tagged.set_icc_profile(Some(Bytes::from(linear_rgb_icc())));
+        let tagged = ProcessImage::new(tagged.encoder().bytes().to_vec(), "png").unwrap();
+        let [r, g, b] = tagged.di.to_rgb8().get_pixel(0, 0).0;
+        assert!(
+            r > 180 && r == g && g == b,
+            "expected ~188 gray, got {r},{g},{b}"
+        );
+    }
+
+    #[test]
+    fn test_decode_size_limit() {
+        // PNG whose header declares 60000×60000 (14.4 GB as RGBA) with no pixel data.
+        let crc32 = |data: &[u8]| {
+            let mut crc = 0xffff_ffffu32;
+            for &byte in data {
+                crc ^= byte as u32;
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xedb8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        };
+        let chunk = |kind: &[u8; 4], body: &[u8]| {
+            let mut c = (body.len() as u32).to_be_bytes().to_vec();
+            let typed = [kind.as_slice(), body].concat();
+            c.extend(&typed);
+            c.extend(crc32(&typed).to_be_bytes());
+            c
+        };
+        let ihdr = [
+            60000u32.to_be_bytes().as_slice(),
+            60000u32.to_be_bytes().as_slice(),
+            &[8, 6, 0, 0, 0],
+        ]
+        .concat();
+        let png = [
+            b"\x89PNG\r\n\x1a\n".to_vec(),
+            chunk(b"IHDR", &ihdr),
+            chunk(b"IEND", &[]),
+        ]
+        .concat();
+        assert!(ProcessImage::new(png, "png").is_err());
+
+        // Bare JXL codestream header declaring 100000×100000: rejected before decoding.
+        let mut bits: Vec<bool> = Vec::new();
+        let mut push = |v: u32, n: usize| (0..n).for_each(|i| bits.push((v >> i) & 1 == 1));
+        push(0, 1); // div8 = false
+        push(3, 2); // U32 selector → Bits(30)
+        push(99_999, 30); // height - 1
+        push(1, 3); // ratio 1:1
+        let mut jxl = vec![0xff, 0x0a];
+        jxl.extend(bits.chunks(8).map(|byte| {
+            byte.iter()
+                .enumerate()
+                .fold(0u8, |acc, (i, &b)| acc | ((b as u8) << i))
+        }));
+        assert_eq!(super::jxl_dimensions(&jxl), Some((100_000, 100_000)));
+        let err = ProcessImage::new(jxl, "jxl").err().unwrap();
+        assert!(err.to_string().contains("decode limit"), "{err}");
+    }
+
+    #[test]
+    fn test_tasks_validated_before_running() {
+        use super::{run_with_image, Task};
+        let task = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The load would fail with an IO error; the malformed resize after it must be
+        // reported first, proving nothing ran.
+        let err = tokio_test::block_on(run_with_image(
+            ProcessImage::default(),
+            vec![
+                task(&["load", "file:///definitely/missing.png"]),
+                task(&["resize", "abc", "1"]),
+            ],
+        ))
+        .err()
+        .unwrap();
+        assert!(
+            matches!(err, super::ImageProcessingError::ParseInt { .. }),
+            "{err}"
+        );
+
+        assert!(Task::parse(&task(&["background", "#12345"])).is_err());
+        assert!(Task::parse(&task(&["flip", "diagonal"])).is_err());
+        assert!(Task::parse(&task(&["normalize", "hsv"])).is_err());
+        assert!(Task::parse(&task(&["watermark", "file:///w.png", "middle"])).is_err());
+        assert_eq!(
+            Task::parse(&task(&["optim", "auto", "auto", "3"])).unwrap(),
+            Task::AutoOptim {
+                output_type: String::new(),
+                quality: None,
+                speed: 3,
+                target: 1.0,
+            }
+        );
     }
 
     #[test]
