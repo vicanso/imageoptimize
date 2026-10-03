@@ -6,6 +6,9 @@ hooks:
 test:
 	cargo test
 
+bench:
+	cargo bench
+
 lint-fix:
 	cargo clippy --fix --allow-staged
 lint:

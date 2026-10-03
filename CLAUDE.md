@@ -6,6 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 make test       # cargo test
+make bench      # cargo bench (criterion; `cargo bench -- encode` runs one group)
 make lint       # cargo clippy
 make lint-fix   # cargo clippy --fix --allow-staged
 make fmt        # cargo fmt --all --
@@ -32,6 +33,7 @@ cargo build --features bin
 - `src/images.rs` — per-format encoders/decoders (JPEG via mozjpeg, PNG via imagequant+lodepng, AVIF, WebP, GIF)
 - `src/lib.rs` — re-exports only
 - `bin/imageoptimize.rs` — CLI (clap, glob, batch processing); compiled only with `--features bin`
+- `benches/pipeline.rs` — criterion benchmarks for decode / transform / encode / auto-quality / diff
 
 ### Pipeline pattern
 
