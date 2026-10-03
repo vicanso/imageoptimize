@@ -67,7 +67,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--png-quality <N>` | 90 | PNG 编码质量（0–100） |
 | `--avif-quality <N>` | 80 | AVIF 编码质量（0–100） |
 | `--webp-quality <N>` | 80 | WebP 编码质量（0–99 有损，≥100 无损） |
-| `--jxl-quality <N>` | 80 | JPEG XL 编码质量（0–99 有损，≥100 无损）；用于 `--convert *-jxl`，保留透明通道 |
+| `--jxl-quality <N>` | 80 | JPEG XL 编码质量（0–99 有损，≥100 无损）；用于 `--convert *-jxl`，保留透明通道。≥100 时 JPEG 源会被无损转码（体积小约 20%，可逐位还原原 JPEG） |
 | `--lossless` | false | 以最高保真编码（将所有质量强制为 100）。WebP 为真正无损；AVIF 仅视觉上接近无损（rav1e 编码器没有比特精确模式）；JPEG 为最高质量有损（该格式没有无损模式）；PNG 使用其最高质量调色板。覆盖各格式的质量参数；不能与 `--auto-quality` / `--auto-format` 同用 |
 | `-t, --threads <N>` | CPU 核心数 | 并行工作线程数 |
 | `--dry-run` | false | 预览结果但不写入任何文件 |
@@ -75,7 +75,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--exclude <GLOB>` | — | 排除匹配该 glob 模式的文件（可重复使用） |
 | `-q, --quiet` | false | 仅输出最终汇总，不打印每个文件的处理结果 |
 | `--resize <WxH>` | — | 编码前将超出尺寸的图片缩放至指定范围内，小图不受影响（如 `1920x1080`、`1920x0`） |
-| `--strip-exif` | false | 从输出文件中移除 EXIF 元数据（含 GPS 定位），无需重新编码 |
+| `--strip-exif` | false | 从输出文件中移除 EXIF 元数据（含 GPS 定位），无需重新编码（JPEG、PNG、WebP、JPEG XL） |
 | `--avif-speed <N>` | 4 | AVIF 编码速度（0 = 最慢/最佳质量，10 = 最快/较低质量） |
 | `--incremental` | false | 跳过所有输出文件均比源文件新的图片（仅适用于 `--output` 模式）。支持 `--auto-format`（任一候选扩展名的输出均算数）和 `--widths` / `--densities`（所有应生成的变体都需是最新的） |
 | `--no-diff` | false | 跳过 DSSIM 评分；避免为算分而二次解码 AVIF/JXL（DIFF 列显示 `—`） |
@@ -133,6 +133,12 @@ imageoptimize /path/to/source --output /path/to/output \
 
 ```bash
 imageoptimize /path/to/source --output /path/to/output --convert png-webp --lossless
+```
+
+`--lossless` 下 JPEG → JPEG XL 会直接对 JPEG 的原始数据做无损转码，而不是重新编码像素：输出比 JPEG 小约 20%，并且可以逐位还原出原文件：
+
+```bash
+imageoptimize /path/to/source --output /path/to/output --convert jpeg-jxl --lossless
 ```
 
 **试运行** — 预览压缩结果，不写入任何文件：
@@ -290,7 +296,7 @@ let result = run_with_options(ProcessImage::default(), tasks, &options).await?;
 | `strip` | `new_strip_task()` | — | 从编码后的缓冲区移除 EXIF 元数据，无需重新编码（支持 JPEG、PNG、WebP） |
 | `padding` | `new_padding_task(w, h, color)` | 宽度、高度、十六进制颜色（`#rrggbb` / `#rrggbbaa`，默认透明） | 扩展画布并居中图片 |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url、位置、左边距、上边距 | 叠加水印 |
-| `optim` | `new_optim_task(fmt, quality, speed)` | 格式（`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`）、质量 0–100、速度 | 编码并压缩。未经变换的动态 GIF 输出为 `gif` 或 `webp` 时保持动画；经过变换（缩放、裁剪等）或由其他格式转换时，`gif` 输出为单帧 |
+| `optim` | `new_optim_task(fmt, quality, speed)` | 格式（`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`）、质量 0–100、速度 | 编码并压缩。未经变换的动态 GIF 输出为 `gif` 或 `webp` 时保持动画；经过变换（缩放、裁剪等）或由其他格式转换时，`gif` 输出为单帧。未经变换的 JPEG 以质量 ≥100 输出为 `jxl` 时做无损转码 |
 | `optim`（自动质量） | `new_auto_quality_task(fmt, speed, target)` | 格式、速度、目标 DSSIM ×1000 | 二分搜索使感知差异保持在 `target` 内的最低质量 |
 | `optim`（自动格式） | `new_auto_format_task(quality, speed, target)` | 质量 0–100、速度、目标 DSSIM ×1000 | 编码多个候选格式（按是否含透明：webp/avif/png 或 webp/avif/jpeg），保留满足 `target` 的最小者 |
 | `optim`（全自动） | `new_auto_task(speed, target)` | 速度、目标 DSSIM ×1000 | 同时搜索格式与质量，取满足 `target` 的最小输出 |

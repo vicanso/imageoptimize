@@ -237,41 +237,105 @@ fn gif_speed(speed: u8) -> i32 {
     speed.clamp(1, 30) as i32
 }
 
+/// Signature box that opens a JPEG XL ISOBMFF container.
+const JXL_CONTAINER_SIG: &[u8] = &[
+    0, 0, 0, 0x0c, b'J', b'X', b'L', b' ', 0x0d, 0x0a, 0x87, 0x0a,
+];
+
+/// One box of a JPEG XL container: its 4-byte type, payload, and the whole box as stored.
+struct JxlBox<'a> {
+    kind: &'a [u8],
+    payload: &'a [u8],
+    raw: &'a [u8],
+}
+
+/// The boxes following the signature of a JPEG XL container, or `None` when `data` is not
+/// one (e.g. a bare codestream). A box running past the end of the data is clamped to it.
+fn jxl_boxes(data: &[u8]) -> Option<impl Iterator<Item = JxlBox<'_>>> {
+    let mut rest = data.strip_prefix(JXL_CONTAINER_SIG)?;
+    Some(std::iter::from_fn(move || {
+        if rest.len() < 8 {
+            return None;
+        }
+        let size = u32::from_be_bytes(rest[0..4].try_into().ok()?) as usize;
+        let (header, size) = match size {
+            1 => (
+                16,
+                usize::try_from(u64::from_be_bytes(rest.get(8..16)?.try_into().ok()?)).ok()?,
+            ),
+            0 => (8, rest.len()),
+            n => (8, n),
+        };
+        let end = size.max(header).min(rest.len());
+        let jxl_box = JxlBox {
+            kind: &rest[4..8],
+            payload: rest.get(header..end)?,
+            raw: &rest[..end],
+        };
+        rest = &rest[end..];
+        Some(jxl_box)
+    }))
+}
+
+/// Remove the metadata boxes of a JPEG XL container: `Exif`, `xml ` (XMP), their brotli-
+/// compressed `brob` form, and `jbrd` — the JPEG reconstruction data, which also carries the
+/// source JPEG's other APP markers and can't rebuild the file once its EXIF is gone. The
+/// image itself is untouched. Returns `None` when there is nothing to remove (bare
+/// codestreams included).
+pub(crate) fn strip_jxl_metadata(data: &[u8]) -> Option<Vec<u8>> {
+    const METADATA: [&[u8]; 3] = [b"Exif", b"xml ", b"jbrd"];
+    let is_metadata = |b: &JxlBox| {
+        METADATA.contains(&b.kind)
+            || (b.kind == b"brob" && b.payload.get(..4).is_some_and(|t| METADATA.contains(&t)))
+    };
+    if !jxl_boxes(data)?.any(|b| is_metadata(&b)) {
+        return None;
+    }
+    let mut out = JXL_CONTAINER_SIG.to_vec();
+    for b in jxl_boxes(data)?.filter(|b| !is_metadata(b)) {
+        out.extend_from_slice(b.raw);
+    }
+    Some(out)
+}
+
+/// Losslessly recompress a JPEG as JPEG XL, typically ~20% smaller. The JPEG's DCT
+/// coefficients are kept as they are, so the decoded pixels match the JPEG's, and the stored
+/// reconstruction data lets the original file be rebuilt bit for bit. EXIF/XMP are carried
+/// over; [`strip_exif_bytes`](crate::strip_exif_bytes) with `"jxl"` removes them.
+#[cfg(feature = "jxl")]
+pub fn jpeg_to_jxl(data: &[u8]) -> Result<Vec<u8>> {
+    let mut encoder = jpegxl_rs::encoder_builder()
+        .use_container(true)
+        .build()
+        .map_err(|_| ImageError::Unknown)?;
+    let result = encoder.encode_jpeg(data).map_err(|e| ImageError::Encode {
+        category: "jxl_transcode".to_string(),
+        message: format!("{e:?}"),
+    })?;
+    Ok(result.data)
+}
+
+/// Stub used when the `jxl` feature is disabled.
+#[cfg(not(feature = "jxl"))]
+pub fn jpeg_to_jxl(_data: &[u8]) -> Result<Vec<u8>> {
+    Err(ImageError::Unsupported {
+        message: "JXL encoding requires the `jxl` feature".to_string(),
+    })
+}
+
 /// Width and height from a JPEG XL header (bare codestream or ISOBMFF container), read
 /// without decoding so oversized images can be rejected before libjxl allocates for them.
 /// Returns `None` when the header can't be parsed.
 pub(crate) fn jxl_dimensions(data: &[u8]) -> Option<(u32, u32)> {
-    const CONTAINER_SIG: &[u8] = &[
-        0, 0, 0, 0x0c, b'J', b'X', b'L', b' ', 0x0d, 0x0a, 0x87, 0x0a,
-    ];
     let codestream = if data.starts_with(&[0xff, 0x0a]) {
         data
-    } else if data.starts_with(CONTAINER_SIG) {
-        let mut rest = &data[CONTAINER_SIG.len()..];
-        loop {
-            if rest.len() < 8 {
-                return None;
-            }
-            let size = u32::from_be_bytes(rest[0..4].try_into().ok()?) as usize;
-            let kind = &rest[4..8];
-            let (header, size) = match size {
-                1 => (
-                    16,
-                    u64::from_be_bytes(rest.get(8..16)?.try_into().ok()?) as usize,
-                ),
-                0 => (8, rest.len()),
-                n => (8, n),
-            };
-            let payload = rest.get(header..size.min(rest.len()))?;
-            match kind {
-                b"jxlc" => break payload,
-                // Partial codestream boxes carry a 4-byte index before the data.
-                b"jxlp" => break payload.get(4..)?,
-                _ => rest = rest.get(size.max(header)..)?,
-            }
-        }
     } else {
-        return None;
+        jxl_boxes(data)?.find_map(|b| match b.kind {
+            b"jxlc" => Some(b.payload),
+            // Partial codestream boxes carry a 4-byte index before the data.
+            b"jxlp" => b.payload.get(4..),
+            _ => None,
+        })?
     };
     if !codestream.starts_with(&[0xff, 0x0a]) {
         return None;
@@ -676,6 +740,41 @@ mod tests {
             assert_eq!(super::jxl_dimensions(&jxl), Some((w, h)), "{w}x{h}");
         }
         assert_eq!(super::jxl_dimensions(b"not a jxl"), None);
+    }
+    #[test]
+    #[cfg(feature = "jxl")]
+    fn test_jpeg_to_jxl() {
+        use img_parts::{jpeg::Jpeg, ImageEXIF};
+        // A JPEG carrying EXIF (a minimal little-endian TIFF header with an empty IFD).
+        let jpeg = load_image().to_mozjpeg(90).unwrap();
+        let mut parts = Jpeg::from_bytes(jpeg.into()).unwrap();
+        parts.set_exif(Some(b"II*\0\x08\0\0\0\0\0\0\0\0\0".to_vec().into()));
+        let jpeg = parts.encoder().bytes().to_vec();
+
+        let jxl = super::jpeg_to_jxl(&jpeg).unwrap();
+        assert_eq!(super::jxl_dimensions(&jxl), Some((144, 144)));
+        let has_box = |data: &[u8], kind: &[u8]| {
+            super::jxl_boxes(data).is_some_and(|mut boxes| {
+                boxes.any(|b| b.kind == kind || (b.kind == b"brob" && b.payload.starts_with(kind)))
+            })
+        };
+        // Reconstruction data and the EXIF block are carried over.
+        assert!(has_box(&jxl, b"jbrd"));
+        assert!(has_box(&jxl, b"Exif"));
+
+        let stripped = super::strip_jxl_metadata(&jxl).unwrap();
+        assert!(!has_box(&stripped, b"jbrd") && !has_box(&stripped, b"Exif"));
+        assert!(stripped.len() < jxl.len());
+        // Still the same image, and nothing left to strip.
+        let decoded = super::jxl_decode(&stripped).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (144, 144));
+        assert_eq!(super::jxl_dimensions(&stripped), Some((144, 144)));
+        assert_eq!(super::strip_jxl_metadata(&stripped), None);
+        // A bare codestream has no boxes to strip.
+        assert_eq!(
+            super::strip_jxl_metadata(&load_image().to_jxl(80).unwrap()),
+            None
+        );
     }
     #[test]
     #[cfg(feature = "jxl")]

@@ -1,5 +1,6 @@
 use super::images::{
-    avif_decode, gif_to_animated_webp, jxl_decode, jxl_dimensions, to_gif, ImageError, ImageInfo,
+    avif_decode, gif_to_animated_webp, jpeg_to_jxl, jxl_decode, jxl_dimensions, strip_jxl_metadata,
+    to_gif, ImageError, ImageInfo,
 };
 use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
@@ -227,13 +228,14 @@ pub fn new_blur_task(sigma: f32) -> Vec<String> {
 }
 
 /// Strip EXIF metadata (including GPS) from the encoded buffer without re-encoding.
-/// Supports JPEG, PNG, and WebP. Other formats are returned unchanged.
+/// Supports JPEG, PNG, WebP and JPEG XL. Other formats are returned unchanged.
 pub fn new_strip_task() -> Vec<String> {
     vec![PROCESS_STRIP.to_string()]
 }
 
 /// Strip EXIF metadata from raw image bytes without re-encoding.
-/// `ext` is the format extension (`"jpeg"`, `"jpg"`, `"png"`, `"webp"`).
+/// `ext` is the format extension (`"jpeg"`, `"jpg"`, `"png"`, `"webp"`, `"jxl"`).
+/// For JPEG XL, XMP and the JPEG reconstruction data go too (see `strip_jxl_metadata`).
 /// Formats that are not supported are returned unchanged.
 pub fn strip_exif_bytes(data: Vec<u8>, ext: &str) -> Vec<u8> {
     let b = Bytes::from(data);
@@ -259,6 +261,7 @@ pub fn strip_exif_bytes(data: Vec<u8>, ext: &str) -> Vec<u8> {
                 img.set_exif(None);
                 Some(img.encoder().bytes())
             }),
+        "jxl" => strip_jxl_metadata(&b).map(Bytes::from),
         _ => None,
     };
     stripped.unwrap_or(b).to_vec()
@@ -2703,6 +2706,11 @@ impl Process for OptimProcess {
         // any transform the buffer is cleared and only the current pixels in `info` remain.
         let gif_source = (original_type == IMAGE_TYPE_GIF && !img.buffer.is_empty())
             .then_some(img.buffer.as_slice());
+        // Likewise an untouched JPEG: a lossless JXL request recompresses its DCT data
+        // directly — smaller than the source and bit-exact — rather than re-encoding pixels,
+        // which would come out larger than the JPEG.
+        let jpeg_source = (quality >= 100 && img.buffer.starts_with(&[0xff, 0xd8, 0xff]))
+            .then_some(img.buffer.as_slice());
 
         // Closure returns (encoded_bytes, info.image) so the pixel data is available
         // for restoring img.di after encoding.
@@ -2727,7 +2735,14 @@ impl Process for OptimProcess {
                         None => info.to_webp(quality).context(ImagesSnafu {})?,
                     }
                 }
-                IMAGE_TYPE_JXL => info.to_jxl(quality).context(ImagesSnafu {})?,
+                IMAGE_TYPE_JXL => {
+                    // libjxl rejects a few JPEG flavours (e.g. arithmetic-coded); those fall
+                    // back to the pixel encoder.
+                    match jpeg_source.and_then(|buf| jpeg_to_jxl(buf).ok()) {
+                        Some(data) => data,
+                        None => info.to_jxl(quality).context(ImagesSnafu {})?,
+                    }
+                }
                 _ => info.to_mozjpeg(quality).context(ImagesSnafu {})?,
             };
             Ok((encoded, info.image))
@@ -3377,6 +3392,41 @@ mod tests {
             .zip(result.di.as_rgba8().unwrap().pixels())
             .any(|(a, b)| a != b);
         assert!(any_different);
+    }
+
+    #[test]
+    #[cfg(feature = "jxl")]
+    fn test_optim_jpeg_to_jxl() {
+        let info: crate::ImageInfo = new_process_image().di.into();
+        let jpeg = info.to_mozjpeg(90).unwrap();
+        let jpeg_image = || ProcessImage::new(jpeg.clone(), "jpeg").unwrap();
+        // libjxl's JPEG reconstruction box marks a lossless recompression.
+        let transcoded = |buf: &[u8]| buf.windows(4).any(|w| w == b"jbrd");
+
+        // Lossless request on an untouched JPEG: its DCT data is recompressed directly.
+        let out =
+            tokio_test::block_on(OptimProcess::new("jxl", 100, 0).process(jpeg_image())).unwrap();
+        assert_eq!(out.ext, "jxl");
+        assert!(transcoded(&out.buffer));
+        assert_eq!(out.get_size(), (144, 144));
+        assert!(out.get_diff() >= 0.0);
+
+        // Stripping metadata drops the reconstruction data along with the EXIF.
+        let stripped = tokio_test::block_on(StripProcess::new().process(out)).unwrap();
+        assert!(!transcoded(&stripped.buffer));
+        assert!(crate::jxl_decode(&stripped.buffer).is_ok());
+
+        // Lossy quality: the pixel encoder.
+        let out =
+            tokio_test::block_on(OptimProcess::new("jxl", 80, 0).process(jpeg_image())).unwrap();
+        assert!(!out.buffer.is_empty() && !transcoded(&out.buffer));
+
+        // After a pixel edit the JPEG bytes are stale: the pixel encoder again.
+        let resized =
+            tokio_test::block_on(ResizeProcess::new(72, 0).process(jpeg_image())).unwrap();
+        let out = tokio_test::block_on(OptimProcess::new("jxl", 100, 0).process(resized)).unwrap();
+        assert!(!transcoded(&out.buffer));
+        assert_eq!(out.get_size(), (72, 72));
     }
 
     #[test]

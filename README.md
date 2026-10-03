@@ -68,7 +68,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--png-quality <N>` | 90 | PNG encode quality (0–100) |
 | `--avif-quality <N>` | 80 | AVIF encode quality (0–100) |
 | `--webp-quality <N>` | 80 | WebP encode quality (0–99 lossy, ≥100 lossless) |
-| `--jxl-quality <N>` | 80 | JPEG XL encode quality (0–99 lossy, ≥100 lossless); used by `--convert *-jxl`. Alpha is preserved |
+| `--jxl-quality <N>` | 80 | JPEG XL encode quality (0–99 lossy, ≥100 lossless); used by `--convert *-jxl`. Alpha is preserved. At ≥100 a JPEG source is recompressed losslessly (~20% smaller, original JPEG rebuildable bit-exact) |
 | `--lossless` | false | Encode at maximum fidelity (forces every quality to 100). WebP becomes truly lossless; AVIF is only visually near-lossless (the rav1e encoder has no bit-exact mode); JPEG is max-quality lossy (no lossless mode); PNG uses its top palette. Overrides the per-format quality flags; cannot combine with `--auto-quality` / `--auto-format` |
 | `-t, --threads <N>` | CPU count | Number of parallel worker threads |
 | `--dry-run` | false | Preview results without writing any files |
@@ -76,7 +76,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--exclude <GLOB>` | — | Exclude files matching this glob pattern (repeatable) |
 | `-q, --quiet` | false | Suppress per-file output; print only the final summary |
 | `--resize <WxH>` | — | Resize images to fit within WxH before encoding; smaller images are untouched (e.g. `1920x1080`, `1920x0`) |
-| `--strip-exif` | false | Strip EXIF metadata (including GPS) from output files without re-encoding |
+| `--strip-exif` | false | Strip EXIF metadata (including GPS) from output files without re-encoding (JPEG, PNG, WebP, JPEG XL) |
 | `--avif-speed <N>` | 4 | AVIF encoder speed (0 = slowest/best quality, 10 = fastest/lower quality) |
 | `--incremental` | false | Skip images whose every output file is already newer than the source; only applies with `--output`. Understands `--auto-format` (any candidate extension counts) and `--widths` / `--densities` (every expected variant must be fresh) |
 | `--no-diff` | false | Skip the DSSIM diff metric; avoids re-decoding AVIF/JXL output just to score it (DIFF column shows `—`) |
@@ -136,6 +136,14 @@ mode). Equivalent to passing `--webp-quality 100`:
 
 ```bash
 imageoptimize /path/to/source --output /path/to/output --convert png-webp --lossless
+```
+
+JPEG → JPEG XL under `--lossless` recompresses the JPEG's own data instead of re-encoding
+pixels: the output is ~20% smaller than the JPEG and the original file can be rebuilt from it
+bit for bit:
+
+```bash
+imageoptimize /path/to/source --output /path/to/output --convert jpeg-jxl --lossless
 ```
 
 **Dry run** — preview compression results without writing any files:
@@ -293,7 +301,7 @@ The processors are CPU-bound; on an async server, run the pipeline via your runt
 | `strip` | `new_strip_task()` | — | Strip EXIF metadata from the encoded buffer without re-encoding (JPEG, PNG, WebP) |
 | `padding` | `new_padding_task(w, h, color)` | width, height, hex color (`#rrggbb` / `#rrggbbaa`, default transparent) | Extend canvas, center image |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url, position, margin-left, margin-top | Overlay watermark |
-| `optim` | `new_optim_task(fmt, quality, speed)` | format (`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`), quality 0–100, speed | Encode & compress. An untouched animated GIF stays animated as `gif` or `webp`; after a transform (resize, crop, …) or from another format, `gif` output is a single frame |
+| `optim` | `new_optim_task(fmt, quality, speed)` | format (`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`), quality 0–100, speed | Encode & compress. An untouched animated GIF stays animated as `gif` or `webp`; after a transform (resize, crop, …) or from another format, `gif` output is a single frame. An untouched JPEG encoded as `jxl` at quality ≥100 is recompressed losslessly |
 | `optim` (auto-quality) | `new_auto_quality_task(fmt, speed, target)` | format, speed, target DSSIM ×1000 | Binary-search the lowest quality whose perceptual diff stays within `target` |
 | `optim` (auto-format) | `new_auto_format_task(quality, speed, target)` | quality 0–100, speed, target DSSIM ×1000 | Encode candidate formats (alpha-aware: webp/avif/png or webp/avif/jpeg) and keep the smallest within `target` |
 | `optim` (full auto) | `new_auto_task(speed, target)` | speed, target DSSIM ×1000 | Search both format and quality for the smallest output within `target` |

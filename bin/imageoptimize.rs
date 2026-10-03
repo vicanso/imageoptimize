@@ -309,7 +309,8 @@ struct Args {
     webp_quality: u8,
 
     /// JXL quality (0-99 lossy, >=100 lossless). Applies to `--convert jpeg-jxl / png-jxl`
-    /// output, which needs the `jxl` build feature (enabled by default).
+    /// output, which needs the `jxl` build feature (enabled by default). At >=100 a JPEG
+    /// source is recompressed losslessly: ~20% smaller, and the JPEG can be rebuilt bit-exact.
     #[arg(long, default_value = "80")]
     jxl_quality: u8,
 
