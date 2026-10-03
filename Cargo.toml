@@ -51,12 +51,12 @@ network = ["reqwest", "dep:tokio"]
 jxl = ["jpegxl-rs"]
 
 [dependencies]
-avif-decode = "1.0.2"
+avif-decode = "3.0.0"
 avif-parse = "2.1.0"
 base64 = "0.23.1"
 bytes = "1.12.1"
 kamadak-exif = "0.6.1"
-clap = { version = "4.6.6", features = ["derive"], optional = true }
+clap = { version = "4.6.7", features = ["derive"], optional = true }
 dssim-core = "3.5.1"
 glob = { version = "0.3.4", optional = true }
 image = { version = "0.25.10", default-features = false, features = [
