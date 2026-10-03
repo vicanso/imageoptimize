@@ -292,7 +292,7 @@ struct Args {
     )]
     convert: Option<Vec<ConvertFormat>>,
 
-    /// PNG quality
+    /// PNG quality (0-99 quantizes to a palette of at most 256 colors, >=100 lossless)
     #[arg(long, default_value = "90")]
     png_quality: u8,
 
@@ -314,11 +314,11 @@ struct Args {
     #[arg(long, default_value = "80")]
     jxl_quality: u8,
 
-    /// Encode at maximum fidelity (forces every per-format quality to 100). WebP becomes
-    /// truly lossless; AVIF is visually near-lossless only (the rav1e encoder has no
-    /// bit-exact mode); JPEG is max-quality lossy (the format has no lossless mode); PNG
-    /// uses its highest-quality palette. Overrides the per-format quality flags. Cannot be
-    /// combined with --auto-quality / --auto-format.
+    /// Encode at maximum fidelity (forces every per-format quality to 100). WebP and PNG
+    /// become truly lossless; AVIF is visually near-lossless only (the rav1e encoder has no
+    /// bit-exact mode); JPEG is max-quality lossy (the format has no lossless mode).
+    /// Overrides the per-format quality flags. Cannot be combined with --auto-quality /
+    /// --auto-format.
     #[arg(long)]
     lossless: bool,
 
@@ -883,9 +883,8 @@ async fn main() {
         }
     }
 
-    // --lossless forces every per-format quality to 100. WebP (and JXL) treat >=100 as a
-    // true lossless encode; AVIF/JPEG have no lossless mode so 100 is best-effort, and PNG
-    // encodes at its top palette quality.
+    // --lossless forces every per-format quality to 100. WebP, PNG (and JXL) treat >=100 as
+    // a true lossless encode; AVIF/JPEG have no lossless mode so 100 is best-effort.
     let quality_of = |fixed: u8| if args.lossless { 100 } else { fixed };
     let qualities = ImageQualities {
         avif: quality_of(args.avif_quality),

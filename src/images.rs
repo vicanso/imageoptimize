@@ -481,13 +481,25 @@ impl ImageInfo {
         Ok(w)
     }
 
-    /// Optimize image to png, the quality is min 0, max 100, which means best effort,
-    /// and never aborts the process.
+    /// Optimize image to png. `quality` below 100 quantizes to a palette of at most 256
+    /// colors (lossy, best effort: it never aborts); `quality` >= 100 encodes losslessly.
     pub fn to_png(&self, quality: u8) -> Result<Vec<u8>> {
         let rgba = self.rgba_bytes();
         let pixels: &[RGBA8] = rgba.as_rgba();
         let width = self.width();
         let height = self.height();
+
+        if quality >= 100 {
+            // No quantization. lodepng still picks the smallest color type that holds every
+            // pixel exactly (palette for <= 256 colors, gray, no alpha when opaque, …).
+            // Maximum deflate effort and entropy-based filters trade encode time for size.
+            let mut enc = lodepng::Encoder::new();
+            enc.settings_mut().set_level(9);
+            enc.set_filter_strategy(lodepng::FilterStrategy::ENTROPY, true);
+            return enc.encode(pixels, width, height).context(LodePNGSnafu {
+                category: "png_encode",
+            });
+        }
 
         let mut liq = imagequant::new();
         liq.set_quality(0, quality).context(ImageQuantSnafu {
@@ -669,9 +681,19 @@ mod tests {
     #[test]
     fn test_to_png() {
         let img = load_image();
+        let source = include_bytes!("../assets/rust-logo.png");
+        // Quantized to a palette: smaller, but not pixel-exact (the logo's anti-aliased edges
+        // hold more than 256 colors).
         let result = img.to_png(90).unwrap();
-        assert_decodes(&result);
-        assert!(result.len() < include_bytes!("../assets/rust-logo.png").len());
+        let decoded = assert_decodes(&result);
+        assert!(result.len() < source.len());
+        assert_ne!(decoded.to_rgba8(), img.image.to_rgba8());
+        // Quality 100 is lossless, and still beats the unoptimized source.
+        let lossless = img.to_png(100).unwrap();
+        let decoded = assert_decodes(&lossless);
+        assert_eq!(decoded.to_rgba8(), img.image.to_rgba8());
+        assert!(lossless.len() < source.len());
+        assert!(lossless.len() > result.len());
     }
     #[test]
     fn test_to_webp() {

@@ -64,11 +64,11 @@ imageoptimize [OPTIONS] <SOURCE>
 | `-f, --format <FMT>` | jpeg,jpg,png | 仅处理指定格式（`jpeg`、`jpg`、`png`、`webp`）；扩展名不区分大小写，`IMG_0001.JPG` 也会被处理 |
 | `--convert <CONV>` | 全部四种 | 生成的格式转换类型（`jpeg-avif`、`jpeg-webp`、`png-avif`、`png-webp`、`jpeg-jxl`、`png-jxl`、`disable`）。JXL 为可选项（不在默认集合内），需要 `jxl` 构建特性 |
 | `--jpeg-quality <N>` | 80 | JPEG 编码质量（0–100） |
-| `--png-quality <N>` | 90 | PNG 编码质量（0–100） |
+| `--png-quality <N>` | 90 | PNG 编码质量（0–99 量化为不超过 256 色的调色板，≥100 无损） |
 | `--avif-quality <N>` | 80 | AVIF 编码质量（0–100） |
 | `--webp-quality <N>` | 80 | WebP 编码质量（0–99 有损，≥100 无损） |
 | `--jxl-quality <N>` | 80 | JPEG XL 编码质量（0–99 有损，≥100 无损）；用于 `--convert *-jxl`，保留透明通道。≥100 时 JPEG 源会被无损转码（体积小约 20%，可逐位还原原 JPEG） |
-| `--lossless` | false | 以最高保真编码（将所有质量强制为 100）。WebP 为真正无损；AVIF 仅视觉上接近无损（rav1e 编码器没有比特精确模式）；JPEG 为最高质量有损（该格式没有无损模式）；PNG 使用其最高质量调色板。覆盖各格式的质量参数；不能与 `--auto-quality` / `--auto-format` 同用 |
+| `--lossless` | false | 以最高保真编码（将所有质量强制为 100）。WebP 与 PNG 为真正无损；AVIF 仅视觉上接近无损（rav1e 编码器没有比特精确模式）；JPEG 为最高质量有损（该格式没有无损模式）。覆盖各格式的质量参数；不能与 `--auto-quality` / `--auto-format` 同用 |
 | `-t, --threads <N>` | CPU 核心数 | 并行工作线程数 |
 | `--dry-run` | false | 预览结果但不写入任何文件 |
 | `--min-size <KB>` | — | 跳过小于该大小（KB）的文件 |
@@ -129,7 +129,7 @@ imageoptimize /path/to/source --output /path/to/output \
   --jpeg-quality 75 --png-quality 85 --avif-quality 70 --webp-quality 75
 ```
 
-**无损** — 用于截图、线稿、UI 素材等不适合有损的场景。WebP 编码为真正无损；AVIF 退化为视觉上接近无损（rav1e 编码器没有比特精确模式）。等价于传入 `--webp-quality 100`：
+**无损** — 用于截图、线稿、UI 素材等不适合有损的场景。WebP 与 PNG 编码为真正无损；AVIF 退化为视觉上接近无损（rav1e 编码器没有比特精确模式）。等价于传入 `--webp-quality 100 --png-quality 100`：
 
 ```bash
 imageoptimize /path/to/source --output /path/to/output --convert png-webp --lossless

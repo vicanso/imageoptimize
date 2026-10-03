@@ -65,11 +65,11 @@ imageoptimize [OPTIONS] <SOURCE>
 | `-f, --format <FMT>` | jpeg,jpg,png | Only process these formats (`jpeg`, `jpg`, `png`, `webp`); extensions match case-insensitively, so `IMG_0001.JPG` is included |
 | `--convert <CONV>` | all four | Format conversions to generate (`jpeg-avif`, `jpeg-webp`, `png-avif`, `png-webp`, `jpeg-jxl`, `png-jxl`, `disable`). JXL is opt-in (not in the default set) and needs the `jxl` build feature |
 | `--jpeg-quality <N>` | 80 | JPEG encode quality (0–100) |
-| `--png-quality <N>` | 90 | PNG encode quality (0–100) |
+| `--png-quality <N>` | 90 | PNG encode quality (0–99 quantizes to a palette of ≤256 colors, ≥100 lossless) |
 | `--avif-quality <N>` | 80 | AVIF encode quality (0–100) |
 | `--webp-quality <N>` | 80 | WebP encode quality (0–99 lossy, ≥100 lossless) |
 | `--jxl-quality <N>` | 80 | JPEG XL encode quality (0–99 lossy, ≥100 lossless); used by `--convert *-jxl`. Alpha is preserved. At ≥100 a JPEG source is recompressed losslessly (~20% smaller, original JPEG rebuildable bit-exact) |
-| `--lossless` | false | Encode at maximum fidelity (forces every quality to 100). WebP becomes truly lossless; AVIF is only visually near-lossless (the rav1e encoder has no bit-exact mode); JPEG is max-quality lossy (no lossless mode); PNG uses its top palette. Overrides the per-format quality flags; cannot combine with `--auto-quality` / `--auto-format` |
+| `--lossless` | false | Encode at maximum fidelity (forces every quality to 100). WebP and PNG become truly lossless; AVIF is only visually near-lossless (the rav1e encoder has no bit-exact mode); JPEG is max-quality lossy (no lossless mode). Overrides the per-format quality flags; cannot combine with `--auto-quality` / `--auto-format` |
 | `-t, --threads <N>` | CPU count | Number of parallel worker threads |
 | `--dry-run` | false | Preview results without writing any files |
 | `--min-size <KB>` | — | Skip files smaller than this size in KB |
@@ -130,9 +130,9 @@ imageoptimize /path/to/source --output /path/to/output \
   --jpeg-quality 75 --png-quality 85 --avif-quality 70 --webp-quality 75
 ```
 
-**Lossless** — for screenshots, line art, and UI assets where lossy is wrong. WebP encodes
-truly lossless; AVIF falls back to visually near-lossless (the rav1e encoder has no bit-exact
-mode). Equivalent to passing `--webp-quality 100`:
+**Lossless** — for screenshots, line art, and UI assets where lossy is wrong. WebP and PNG
+encode truly lossless; AVIF falls back to visually near-lossless (the rav1e encoder has no
+bit-exact mode). Equivalent to passing `--webp-quality 100 --png-quality 100`:
 
 ```bash
 imageoptimize /path/to/source --output /path/to/output --convert png-webp --lossless
