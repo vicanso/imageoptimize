@@ -16,6 +16,8 @@ use rgb::FromSlice;
 use snafu::{ensure, ResultExt, Snafu};
 use std::borrow::Cow;
 use std::io::Cursor;
+#[cfg(feature = "network")]
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 #[cfg(feature = "network")]
 use std::sync::OnceLock;
@@ -69,10 +71,147 @@ const AVIF_SEARCH_SPEED: u8 = 10;
 
 #[cfg(feature = "network")]
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+/// The client behind `LoadOptions::allow_private_hosts == false`.
+#[cfg(feature = "network")]
+static PUBLIC_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+/// Redirect hops followed in public-hosts-only mode (reqwest's own default limit).
+#[cfg(feature = "network")]
+const MAX_REDIRECTS: usize = 10;
 
 #[cfg(feature = "network")]
 fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// An HTTP client that only ever connects to public addresses. Hostnames go through
+/// [`PublicResolver`]; IP-literal hosts are checked on every redirect hop (the caller checks
+/// the first URL). Proxy settings from the environment are ignored: a proxy would resolve
+/// the name itself, out of reach of these checks.
+#[cfg(feature = "network")]
+fn public_http_client() -> Result<&'static reqwest::Client> {
+    if let Some(client) = PUBLIC_HTTP_CLIENT.get() {
+        return Ok(client);
+    }
+    let redirects = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        match check_public_host(attempt.url()) {
+            Ok(()) => attempt.follow(),
+            Err(message) => attempt.error(message),
+        }
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .dns_resolver(PublicResolver)
+        .redirect(redirects)
+        .build()
+        .context(ReqwestSnafu {})?;
+    Ok(PUBLIC_HTTP_CLIENT.get_or_init(|| client))
+}
+
+/// Resolves hostnames with the system resolver and keeps only the public addresses. The
+/// connection is made to exactly those, so a name can't pass the check and then resolve to
+/// something internal when it is connected to (DNS rebinding).
+#[cfg(feature = "network")]
+struct PublicResolver;
+
+#[cfg(feature = "network")]
+impl reqwest::dns::Resolve for PublicResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // getaddrinfo blocks: keep it off the async threads.
+            let lookup = tokio::task::spawn_blocking(move || {
+                std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), 0))
+                    .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
+            });
+            let addrs: Vec<SocketAddr> = lookup
+                .await??
+                .into_iter()
+                .filter(|addr| is_public_ip(addr.ip()))
+                .collect();
+            if addrs.is_empty() {
+                return Err("host does not resolve to a public address".into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// The address a URL names directly, when its host is an IP literal rather than a name.
+/// The URL parser has already normalised the odd IPv4 spellings (`2130706433`, `0x7f.1`).
+#[cfg(feature = "network")]
+fn url_host_ip(url: &reqwest::Url) -> Option<IpAddr> {
+    let host = url.host_str()?;
+    // IPv6 literals keep their brackets in `host_str`.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse().ok()
+}
+
+/// Reject a URL whose host is a non-public IP literal. Hostnames pass here: what they
+/// resolve to is vetted by [`PublicResolver`].
+#[cfg(feature = "network")]
+fn check_public_host(url: &reqwest::Url) -> std::result::Result<(), String> {
+    match url_host_ip(url) {
+        Some(ip) if !is_public_ip(ip) => Err(format!(
+            "loading images from the non-public address {ip} is disabled"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Whether `ip` is a publicly routable address. Everything a server could use to reach
+/// itself or its own network — loopback, private, link-local (cloud metadata endpoints),
+/// carrier-grade NAT — is not, and neither are the reserved and multicast ranges.
+#[cfg(feature = "network")]
+fn is_public_ip(ip: IpAddr) -> bool {
+    let v6 = match ip {
+        IpAddr::V4(v4) => return is_public_ipv4(v4),
+        IpAddr::V6(v6) => v6,
+    };
+    let seg = v6.segments();
+    let embedded =
+        |hi: u16, lo: u16| is_public_ipv4(Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo)));
+    // An IPv4 address carried inside an IPv6 one is judged as that IPv4 address.
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return is_public_ipv4(v4);
+    }
+    if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return embedded(seg[6], seg[7]); // NAT64, 64:ff9b::/96
+    }
+    if seg[0] == 0x2002 {
+        return embedded(seg[1], seg[2]); // 6to4, 2002::/16
+    }
+    let internal = [
+        seg[..6] == [0; 6],                  // ::, ::1 and IPv4-compatible ::/96
+        v6.is_multicast(),                   // ff00::/8
+        (seg[0] & 0xfe00) == 0xfc00,         // unique local, fc00::/7
+        (seg[0] & 0xffc0) == 0xfe80,         // link-local, fe80::/10
+        seg[0] == 0x2001 && seg[1] == 0,     // Teredo, 2001::/32 (embeds IPv4)
+        seg[0] == 0x2001 && seg[1] == 0xdb8, // documentation, 2001:db8::/32
+    ];
+    !internal.contains(&true)
+}
+
+#[cfg(feature = "network")]
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    let internal = [
+        a == 0,                       // "this network", 0.0.0.0/8
+        ip.is_loopback(),             // 127.0.0.0/8
+        ip.is_private(),              // 10/8, 172.16/12, 192.168/16
+        ip.is_link_local(),           // 169.254.0.0/16
+        a == 100 && (b & 0xc0) == 64, // carrier-grade NAT, 100.64.0.0/10
+        a == 192 && b == 0 && c == 0, // IETF protocol assignments, 192.0.0.0/24
+        ip.is_documentation(),        // 192.0.2/24, 198.51.100/24, 203.0.113/24
+        a == 198 && (b & 0xfe) == 18, // benchmarking, 198.18.0.0/15
+        a >= 224,                     // multicast, reserved and broadcast
+    ];
+    !internal.contains(&true)
 }
 
 #[derive(Debug, Snafu)]
@@ -483,14 +622,21 @@ fn check_hex_color(color: &str) -> Result<()> {
 /// inline base64).
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 200 * 1024 * 1024;
 
-/// Where `load` / `watermark` tasks may read image data from. The default allows HTTP(S),
-/// `file://` and inline base64. Services that run user-supplied tasks should turn off
-/// `allow_file` (arbitrary local file reads) and consider `allow_http` (requests to
-/// internal hosts).
+/// Where `load` / `watermark` tasks may read image data from. The default allows HTTP(S)
+/// to any host, `file://` and inline base64. Services that run user-supplied tasks should
+/// turn off `allow_file` (arbitrary local file reads) and `allow_private_hosts` (requests to
+/// internal hosts), or `allow_http` altogether.
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
     pub allow_http: bool,
     pub allow_file: bool,
+    /// Whether HTTP(S) loads may reach non-public addresses: loopback, private and
+    /// link-local ranges (cloud metadata endpoints), carrier-grade NAT and the like. Turn it
+    /// off so a user-supplied URL can't be pointed at the internal network (SSRF). The check
+    /// covers IP-literal hosts, every address a hostname resolves to (the connection is made
+    /// to the vetted addresses only), and each redirect hop. Proxy settings from the
+    /// environment are ignored in that mode.
+    pub allow_private_hosts: bool,
     /// Maximum encoded input size in bytes.
     pub max_bytes: usize,
 }
@@ -500,6 +646,7 @@ impl Default for LoadOptions {
         LoadOptions {
             allow_http: true,
             allow_file: true,
+            allow_private_hosts: true,
             max_bytes: DEFAULT_MAX_INPUT_BYTES,
         }
     }
@@ -1453,8 +1600,19 @@ fn ext_from_content_type(content_type: &str) -> Option<String> {
 /// the Content-Type header. Error statuses fail instead of decoding the error page, and
 /// the body is read incrementally so an oversized response stops at `max_bytes`.
 #[cfg(feature = "network")]
-async fn http_get(url: &str, max_bytes: usize) -> Result<(Vec<u8>, Option<String>)> {
-    let mut resp = get_http_client()
+async fn http_get(
+    url: &str,
+    max_bytes: usize,
+    allow_private_hosts: bool,
+) -> Result<(Vec<u8>, Option<String>)> {
+    let client = if allow_private_hosts {
+        get_http_client()
+    } else {
+        let parsed = reqwest::Url::parse(url).or_else(|e| invalid(format!("invalid url: {e}")))?;
+        check_public_host(&parsed).or_else(invalid)?;
+        public_http_client()?
+    };
+    let mut resp = client
         .get(url)
         .timeout(Duration::from_secs(5 * 60))
         .send()
@@ -1485,7 +1643,11 @@ async fn http_get(url: &str, max_bytes: usize) -> Result<(Vec<u8>, Option<String
 
 /// Stub used when the `network` feature is disabled: HTTP URLs report a clear error.
 #[cfg(not(feature = "network"))]
-async fn http_get(_url: &str, _max_bytes: usize) -> Result<(Vec<u8>, Option<String>)> {
+async fn http_get(
+    _url: &str,
+    _max_bytes: usize,
+    _allow_private_hosts: bool,
+) -> Result<(Vec<u8>, Option<String>)> {
     Err(ImageProcessingError::ParamsInvalid {
         message: "HTTP image loading requires the `network` feature".to_string(),
     })
@@ -1518,7 +1680,8 @@ impl LoaderProcess {
             if !self.options.allow_http {
                 return invalid("loading images over HTTP is disabled".to_string());
             }
-            let (raw, detected_ext) = http_get(data, max_bytes).await?;
+            let (raw, detected_ext) =
+                http_get(data, max_bytes, self.options.allow_private_hosts).await?;
             if let Some(t) = detected_ext {
                 ext = t;
             }
@@ -3149,6 +3312,22 @@ mod tests {
         assert_eq!(result.ext, "png");
     }
 
+    /// Public hosts still load when internal ones are refused. Opt-in like the test above; it
+    /// also fails behind a fake-IP DNS proxy, which resolves every name into 198.18.0.0/15.
+    #[test]
+    #[ignore = "requires network access"]
+    #[cfg(feature = "network")]
+    fn test_load_process_http_public_only() {
+        let mut p = LoaderProcess::new(
+            "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png",
+            "",
+        );
+        p.options.allow_private_hosts = false;
+        let result = tokio_test::block_on(p.fetch_data()).unwrap();
+        assert_ne!(result.buffer.len(), 0);
+        assert_eq!(result.ext, "png");
+    }
+
     #[test]
     #[cfg(feature = "network")]
     fn test_ext_from_content_type() {
@@ -3190,6 +3369,118 @@ mod tests {
         p.options.allow_http = false;
         let err = tokio_test::block_on(p.fetch_data()).err().unwrap();
         assert!(err.to_string().contains("disabled"), "{err}");
+    }
+
+    #[test]
+    #[cfg(feature = "network")]
+    fn test_is_public_ip() {
+        use super::is_public_ip;
+        let public = [
+            "8.8.8.8",
+            "93.184.216.34",
+            "172.32.0.1",  // just past 172.16.0.0/12
+            "100.128.0.1", // just past 100.64.0.0/10
+            "2606:4700:4700::1111",
+            "::ffff:8.8.8.8",
+            "64:ff9b::808:808", // NAT64 of 8.8.8.8
+        ];
+        for ip in public {
+            assert!(is_public_ip(ip.parse().unwrap()), "{ip} should be public");
+        }
+        let internal = [
+            "0.0.0.0",
+            "0.1.2.3",
+            "127.0.0.1",
+            "127.255.255.254",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254", // cloud metadata
+            "100.64.0.1",
+            "100.100.100.200", // cloud metadata inside the CGNAT range
+            "192.0.0.1",
+            "192.0.2.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::7f00:1", // IPv4-compatible 127.0.0.1
+            "fe80::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "ff02::1",
+            "2001:db8::1",
+            "2001:0:4136:e378::1", // Teredo
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:169.254.169.254",
+            "64:ff9b::7f00:1", // NAT64 of 127.0.0.1
+            "2002:7f00:1::1",  // 6to4 of 127.0.0.1
+        ];
+        for ip in internal {
+            assert!(
+                !is_public_ip(ip.parse().unwrap()),
+                "{ip} should not be public"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "network")]
+    fn test_public_hosts_only() {
+        use super::check_public_host;
+        let blocked = |url: &str| check_public_host(&reqwest::Url::parse(url).unwrap()).is_err();
+        // Every spelling of an internal address, as normalised by the URL parser.
+        for url in [
+            "http://127.0.0.1/a.png",
+            "http://2130706433/a.png",
+            "http://0x7f.0.0.1/a.png",
+            "http://0177.0.0.1/a.png",
+            "http://127.1/a.png",
+            "http://[::1]/a.png",
+            "http://[::ffff:10.0.0.1]/a.png",
+            "http://169.254.169.254/latest/meta-data/",
+            "https://192.168.0.1:8443/a.png",
+        ] {
+            assert!(blocked(url), "{url} should be blocked");
+        }
+        // Public IP literals and hostnames (vetted when resolved) pass this check.
+        for url in [
+            "http://8.8.8.8/a.png",
+            "http://[2606:4700:4700::1111]/a.png",
+            "https://example.com/a.png",
+        ] {
+            assert!(!blocked(url), "{url} should pass");
+        }
+
+        // The loader refuses an internal IP literal outright...
+        let mut p = LoaderProcess::new("http://127.0.0.1:1/a.png", "");
+        p.options.allow_private_hosts = false;
+        let err = tokio_test::block_on(p.fetch_data()).err().unwrap();
+        assert!(
+            err.to_string().contains("non-public address 127.0.0.1"),
+            "{err}"
+        );
+
+        // ...and a name that resolves to one is stopped by the resolver, before connecting.
+        let mut p = LoaderProcess::new("http://localhost:1/a.png", "");
+        p.options.allow_private_hosts = false;
+        let err = tokio_test::block_on(p.fetch_data()).err().unwrap();
+        let mut chain = String::new();
+        let mut source: Option<&dyn std::error::Error> = Some(&err);
+        while let Some(e) = source {
+            chain.push_str(&format!("{e}; "));
+            source = e.source();
+        }
+        assert!(
+            chain.contains("does not resolve to a public address"),
+            "{chain}"
+        );
     }
 
     #[test]

@@ -260,9 +260,16 @@ let bytes = result.get_buffer()?;
 ```rust
 use imageoptimize::{run_with_options, LoadOptions, ProcessImage};
 
-let options = LoadOptions { allow_file: false, max_bytes: 20 * 1024 * 1024, ..Default::default() };
+let options = LoadOptions {
+    allow_file: false,
+    allow_private_hosts: false,
+    max_bytes: 20 * 1024 * 1024,
+    ..Default::default()
+};
 let result = run_with_options(ProcessImage::default(), tasks, &options).await?;
 ```
+
+`allow_private_hosts: false` 可防止用户提交的 URL 访问内网（SSRF）：回环、私有、链路本地（云厂商元数据服务）等非公网地址都会被拒绝——包括 URL 中直接写的 IP、域名解析出的每一个地址（只连接校验过的地址，DNS rebinding 无法绕过），以及每一跳重定向。此模式下会忽略环境变量中的代理设置；若 DNS 前有 fake-IP 代理（把所有域名解析到 `198.18.0.0/15`），所有域名都会被拒绝。
 
 解码时会拒绝像素缓冲超过 512 MB 的图片（在分配内存前根据文件头判断，AVIF 与 JPEG XL 同样生效）；带嵌入 ICC 配置文件的图片（如手机拍摄的 Display P3 照片）会在加载时转换为 sRGB，重新编码后颜色保持正确。
 

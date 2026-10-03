@@ -265,9 +265,16 @@ Every task is parsed and validated before the first one runs, so an unknown task
 ```rust
 use imageoptimize::{run_with_options, LoadOptions, ProcessImage};
 
-let options = LoadOptions { allow_file: false, max_bytes: 20 * 1024 * 1024, ..Default::default() };
+let options = LoadOptions {
+    allow_file: false,
+    allow_private_hosts: false,
+    max_bytes: 20 * 1024 * 1024,
+    ..Default::default()
+};
 let result = run_with_options(ProcessImage::default(), tasks, &options).await?;
 ```
+
+`allow_private_hosts: false` keeps a user-supplied URL from reaching the internal network (SSRF): loopback, private, link-local (cloud metadata) and other non-public addresses are refused — for IP-literal hosts, for every address a hostname resolves to (the connection is made to the vetted addresses only, so DNS rebinding doesn't get around it) and on each redirect hop. Proxy settings from the environment are ignored in this mode, and behind a fake-IP DNS proxy (which resolves every name into `198.18.0.0/15`) all hostnames are refused.
 
 Decoding also refuses images whose pixel buffer would exceed 512 MB (checked from the header before allocating, including AVIF and JPEG XL), and images with an embedded ICC profile (e.g. Display P3 phone photos) are converted to sRGB on load so colors stay correct after re-encoding.
 
