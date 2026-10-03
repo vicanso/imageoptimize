@@ -805,28 +805,32 @@ async fn main() {
     }
 
     let mut image_optimize_params = vec![];
-    for ext in extensions {
-        let pattern = format!("{source}/**/*.{ext}");
+    {
+        // The tree is walked once and filtered by extension, rather than once per extension.
+        let pattern = format!("{source}/**/*");
         if !quiet {
             println!(
                 "Searching pattern: {}",
-                LightCyan.paint(relative(&pattern, &base))
+                LightCyan.paint(format!(
+                    "{}.{{{}}}",
+                    relative(&pattern, &base),
+                    extensions.join(",")
+                ))
             );
         }
-        // Case-insensitive so camera exports like `IMG_0001.JPG` are found too.
         let options = MatchOptions {
             case_sensitive: false,
             ..MatchOptions::new()
         };
         let entries = match glob_with(&pattern, options) {
-            Ok(entries) => entries,
+            Ok(entries) => Some(entries),
             Err(e) => {
                 println!("{}", LightRed.paint(format!("Error reading path: {e}")));
-                continue;
+                None
             }
         };
 
-        for entry in entries {
+        for entry in entries.into_iter().flatten() {
             let path = match entry {
                 Ok(path) => path,
                 Err(e) => {
@@ -834,6 +838,15 @@ async fn main() {
                     continue;
                 }
             };
+            // Lowercased so camera exports like `IMG_0001.JPG` are found too.
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !extensions.contains(&ext.as_str()) || !path.is_file() {
+                continue;
+            }
             // min-size filter
             if let Some(min_bytes) = min_size_bytes {
                 let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -850,11 +863,6 @@ async fn main() {
                 }
             }
 
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
             let image_type = match ext.as_str() {
                 "png" => IMAGE_PNG,
                 "webp" => IMAGE_WEBP,
