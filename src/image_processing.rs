@@ -1496,6 +1496,11 @@ impl ProcessImage {
         if !self.support_dssim() {
             return -1.0;
         }
+        // Not comparable after a resize or crop: say so before paying for the original's
+        // DSSIM pyramids.
+        if original.dimensions() != (self.di.width(), self.di.height()) {
+            return -1.0;
+        }
         dssim_score(original, &self.di)
     }
 }
@@ -4653,6 +4658,17 @@ mod tests {
             assert_eq!(result.ext, "webp");
             assert!(result.diff >= 0.0);
         }
+    }
+
+    #[test]
+    fn test_diff_needs_matching_dimensions() {
+        // Unchanged pixels compare equal to the snapshot taken at load.
+        assert_eq!(new_process_image().get_diff(), 0.0);
+        // After a resize the snapshot (144×144) no longer matches: not comparable, and
+        // reported as such without building the original's DSSIM pyramids.
+        let resized =
+            tokio_test::block_on(ResizeProcess::new(72, 0).process(new_process_image())).unwrap();
+        assert_eq!(resized.get_diff(), -1.0);
     }
 
     #[test]
