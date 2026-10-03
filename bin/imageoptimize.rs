@@ -21,7 +21,7 @@ use imageoptimize::{
 };
 use nu_ansi_term::Color::{LightCyan, LightGreen, LightRed, LightYellow};
 use snafu::{ResultExt, Snafu};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -462,6 +462,73 @@ struct EncodeFlags {
     auto_format: bool,
 }
 
+/// What encoding one output produced.
+#[derive(Debug)]
+struct Encoded {
+    /// Size of the output in bytes (the source's size when the original was kept).
+    size: usize,
+    original_size: usize,
+    /// DSSIM ×1000; negative when it was not computed.
+    diff: f64,
+    /// The output path already existed.
+    existed: bool,
+    /// The original was kept: re-encoding it did not make it smaller.
+    skipped: bool,
+    /// The path actually written when it is not the requested target (auto-format picks
+    /// the extension).
+    path: Option<String>,
+}
+
+/// One output of a source file: where it was to go, how long it took and how it went.
+struct Outcome {
+    target: String,
+    /// Set for srcset / density outputs.
+    variant: Option<Variant>,
+    millis: u128,
+    result: Result<Encoded>,
+}
+
+impl Outcome {
+    /// An output that was never attempted because its source could not be prepared.
+    fn failed(target: String, variant: Option<Variant>, message: &str) -> Self {
+        Outcome {
+            target,
+            variant,
+            millis: 0,
+            result: Err(Error::Common {
+                message: message.to_string(),
+            }),
+        }
+    }
+}
+
+/// Settings shared by every per-source task.
+struct Job {
+    qualities: ImageQualities,
+    /// Fit-resize applied before encoding in normal mode.
+    resize: Option<(u32, u32)>,
+    /// srcset / density variants; empty in normal mode.
+    variants: Vec<Variant>,
+    srcset_pattern: String,
+    /// Flags for normal-mode outputs; variants derive theirs in [`Job::variant_flags`].
+    flags: EncodeFlags,
+    /// Keep the original RGBA snapshot, which only feeds the explicit diff task.
+    keep_original: bool,
+    /// Placeholder width when `--lqip` is set.
+    lqip_width: Option<u32>,
+}
+
+impl Job {
+    fn variant_flags(&self) -> EncodeFlags {
+        EncodeFlags {
+            is_variant: true,
+            // srcset variants are per-format derivatives; never auto-pick their format.
+            auto_format: false,
+            ..self.flags
+        }
+    }
+}
+
 /// Decode and EXIF-orient a source file exactly once, applying the optional resize.
 /// The returned `ProcessImage` is cloned per target instead of re-decoding the source.
 /// `keep_original` retains the original RGBA snapshot so each output can compute its own
@@ -501,15 +568,13 @@ async fn load_base(
 }
 
 /// Encode an already-decoded `base` image to a single target format and write it out.
-/// The trailing `Option<String>` is the actual written path when it differs from `target`
-/// (auto-format chooses the output extension); `None` means `target` was used as-is.
 async fn encode_target(
     base: ProcessImage,
     file: &str,
     target: &str,
     qualities: &ImageQualities,
     flags: EncodeFlags,
-) -> Result<(usize, usize, f64, bool, bool, Option<String>)> {
+) -> Result<Encoded> {
     // Lowercased so `IMG_0001.PNG` is encoded as PNG rather than falling through to JPEG.
     let placeholder_type = target
         .split('.')
@@ -633,14 +698,14 @@ async fn encode_target(
                         .context(WriteFileSnafu)?;
                 }
             }
-            return Ok((
-                img.original_size,
-                img.original_size,
-                img.diff,
+            return Ok(Encoded {
+                size: img.original_size,
+                original_size: img.original_size,
+                diff: img.diff,
                 existed,
-                true,
-                out_path,
-            ));
+                skipped: true,
+                path: out_path,
+            });
         }
     }
 
@@ -652,7 +717,499 @@ async fn encode_target(
             .await
             .context(WriteFileSnafu)?;
     }
-    Ok((size, img.original_size, img.diff, existed, false, out_path))
+    Ok(Encoded {
+        size,
+        original_size: img.original_size,
+        diff: img.diff,
+        existed,
+        skipped: false,
+        path: out_path,
+    })
+}
+
+/// Encode `image` to each of `targets`, timing every output. The decoded image is moved
+/// into the final encode and cloned for the rest.
+async fn encode_all(
+    image: ProcessImage,
+    file: &str,
+    targets: Vec<String>,
+    variant: Option<Variant>,
+    qualities: &ImageQualities,
+    flags: EncodeFlags,
+) -> Vec<Outcome> {
+    let mut image = Some(image);
+    let last = targets.len().saturating_sub(1);
+    let mut outcomes = Vec::with_capacity(targets.len());
+    for (i, target) in targets.into_iter().enumerate() {
+        let img = if i == last {
+            image.take().unwrap()
+        } else {
+            image.as_ref().unwrap().clone()
+        };
+        let start = Instant::now();
+        let result = encode_target(img, file, &target, qualities, flags).await;
+        outcomes.push(Outcome {
+            target,
+            variant,
+            millis: start.elapsed().as_millis(),
+            result,
+        });
+    }
+    outcomes
+}
+
+/// Process one source file: decode it once, then encode every output it produces. Returns
+/// the outcomes and, with `--lqip`, the placeholder data URI.
+async fn process_source(
+    file: &str,
+    targets: Vec<String>,
+    job: &Job,
+) -> (Vec<Outcome>, Option<String>) {
+    if job.variants.is_empty() {
+        encode_formats(file, targets, job).await
+    } else {
+        encode_variants(file, targets, job).await
+    }
+}
+
+/// Normal mode: decode + resize once, then encode each target format.
+async fn encode_formats(
+    file: &str,
+    targets: Vec<String>,
+    job: &Job,
+) -> (Vec<Outcome>, Option<String>) {
+    let base = match load_base(file, job.resize, job.keep_original).await {
+        Ok(base) => base,
+        Err(e) => {
+            let message = e.to_string();
+            let failed = targets
+                .into_iter()
+                .map(|target| Outcome::failed(target, None, &message))
+                .collect();
+            return (failed, None);
+        }
+    };
+    let lqip = job.lqip_width.and_then(|w| base.lqip_data_uri(w).ok());
+    let outcomes = encode_all(base, file, targets, None, &job.qualities, job.flags).await;
+    (outcomes, lqip)
+}
+
+/// srcset / density mode: decode once (no resize here), then every variant × format.
+async fn encode_variants(
+    file: &str,
+    targets: Vec<String>,
+    job: &Job,
+) -> (Vec<Outcome>, Option<String>) {
+    let variant_paths = |variant: Variant| -> Vec<String> {
+        targets
+            .iter()
+            .map(|target| srcset_path(target, &job.srcset_pattern, variant))
+            .collect()
+    };
+    let base = match load_base(file, None, false).await {
+        Ok(base) => base,
+        Err(e) => {
+            let message = e.to_string();
+            let failed = targets
+                .iter()
+                .flat_map(|target| {
+                    job.variants.iter().map(|&variant| {
+                        let path = srcset_path(target, &job.srcset_pattern, variant);
+                        Outcome::failed(path, Some(variant), &message)
+                    })
+                })
+                .collect();
+            return (failed, None);
+        }
+    };
+    let lqip = job.lqip_width.and_then(|w| base.lqip_data_uri(w).ok());
+    let src_w = base.get_size().0;
+    let mut outcomes = Vec::new();
+    for &variant in &job.variants {
+        let w = variant.pixel_width();
+        if w >= src_w {
+            continue; // never upscale
+        }
+        // Resize the decoded image to this width once, reused for all formats.
+        let resize = vec![vec!["resize".to_string(), w.to_string(), "0".to_string()]];
+        match run_with_image(base.clone(), resize).await {
+            Ok(resized) => {
+                let encoded = encode_all(
+                    resized,
+                    file,
+                    variant_paths(variant),
+                    Some(variant),
+                    &job.qualities,
+                    job.variant_flags(),
+                )
+                .await;
+                outcomes.extend(encoded);
+            }
+            Err(e) => {
+                let message = e.to_string();
+                outcomes.extend(
+                    variant_paths(variant)
+                        .into_iter()
+                        .map(|path| Outcome::failed(path, Some(variant), &message)),
+                );
+            }
+        }
+    }
+    (outcomes, lqip)
+}
+
+/// Report a usage error and exit.
+fn usage_error(message: &str) -> ! {
+    println!("imageoptimize: {message}");
+    std::process::exit(1);
+}
+
+/// The responsive variants asked for by `--widths` (`Nw`) or `--densities` × `--base-width`
+/// (`Nx`); empty when neither is given.
+fn parse_variants(
+    widths: Option<&str>,
+    densities: Option<&str>,
+    base_width: Option<u32>,
+) -> std::result::Result<Vec<Variant>, String> {
+    if let Some(s) = widths {
+        let widths =
+            parse_u32_list(s, "width", "320,640,1280").map_err(|e| format!("--widths {e}"))?;
+        return Ok(widths.into_iter().map(Variant::Width).collect());
+    }
+    let Some(s) = densities else {
+        return Ok(Vec::new());
+    };
+    let base_width = base_width.ok_or("--densities requires --base-width")?;
+    let densities =
+        parse_u32_list(s, "density", "1,2,3").map_err(|e| format!("--densities {e}"))?;
+    Ok(densities
+        .into_iter()
+        .map(|density| Variant::Density {
+            px: base_width.saturating_mul(density),
+            density,
+        })
+        .collect())
+}
+
+/// The extra output formats each source type is converted to, from `--convert`.
+fn convert_targets(formats: &[ConvertFormat]) -> HashMap<&'static str, Vec<&'static str>> {
+    let mut targets: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
+    for item in formats {
+        let (source, target) = match item {
+            ConvertFormat::JpegAvif => (IMAGE_JPEG, IMAGE_AVIF),
+            ConvertFormat::JpegWebp => (IMAGE_JPEG, IMAGE_WEBP),
+            ConvertFormat::PngAvif => (IMAGE_PNG, IMAGE_AVIF),
+            ConvertFormat::PngWebp => (IMAGE_PNG, IMAGE_WEBP),
+            ConvertFormat::JpegJxl => (IMAGE_JPEG, IMAGE_JXL),
+            ConvertFormat::PngJxl => (IMAGE_PNG, IMAGE_JXL),
+            ConvertFormat::Disable => continue,
+        };
+        targets.entry(source).or_default().push(target);
+    }
+    targets
+}
+
+/// Walk the tree matched by `pattern` once and return the image files to process: those
+/// with one of `extensions`, at least `min_size` bytes, and not excluded.
+fn find_sources(
+    pattern: &str,
+    extensions: &[&str],
+    min_size: Option<u64>,
+    exclude: &[Pattern],
+) -> Vec<PathBuf> {
+    let options = MatchOptions {
+        case_sensitive: false,
+        ..MatchOptions::new()
+    };
+    let entries = match glob_with(pattern, options) {
+        Ok(entries) => Some(entries),
+        Err(e) => {
+            println!("{}", LightRed.paint(format!("Error reading path: {e}")));
+            None
+        }
+    };
+    let mut sources = Vec::new();
+    for entry in entries.into_iter().flatten() {
+        let path = match entry {
+            Ok(path) => path,
+            Err(e) => {
+                println!("{}", LightRed.paint(format!("Error reading path: {e}")));
+                continue;
+            }
+        };
+        // Lowercased so camera exports like `IMG_0001.JPG` are found too.
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !extensions.contains(&ext.as_str()) || !path.is_file() {
+            continue;
+        }
+        if let Some(min_bytes) = min_size {
+            let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if file_size < min_bytes {
+                continue;
+            }
+        }
+        let path_str = path.to_string_lossy();
+        if exclude.iter().any(|p| p.matches(&path_str)) {
+            continue;
+        }
+        sources.push(path);
+    }
+    sources
+}
+
+/// The output paths one source produces: its `--convert` formats, then the same-format
+/// target. Auto-format emits a single best-format output per source, so the conversion
+/// matrix is skipped and only the placeholder target is queued.
+fn output_targets(
+    path: &Path,
+    source: &str,
+    output: &str,
+    convert: &HashMap<&'static str, Vec<&'static str>>,
+    auto_format: bool,
+) -> Vec<String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let image_type = match ext.as_str() {
+        "png" => IMAGE_PNG,
+        "webp" => IMAGE_WEBP,
+        _ => IMAGE_JPEG,
+    };
+    let target = output_path(path, source, output);
+    let mut targets = Vec::new();
+    if !auto_format {
+        for ext in convert.get(image_type).into_iter().flatten() {
+            targets.push(target.with_extension(ext));
+        }
+    }
+    targets.push(target);
+    targets
+        .into_iter()
+        .map(|t| t.to_string_lossy().into_owned())
+        .collect()
+}
+
+const KB: usize = 1024;
+const MB: usize = KB * 1024;
+// Column widths of the per-output table: fixed upper bounds.
+const PCT_COL: usize = 4; // "100%"
+const DIFF_COL: usize = 6; // "(0.00)"
+const SIZE_COL: usize = 5; // "999kb"
+const TIME_COL: usize = 6; // "1000ms"
+
+fn print_table_header() {
+    println!(
+        "{:>PCT_COL$}  {:>DIFF_COL$}  {:>SIZE_COL$}  {:>TIME_COL$}  FILE",
+        "PCT", "DIFF", "SIZE", "TIME",
+    );
+    println!(
+        "{}  {}  {}  {}  ----",
+        "-".repeat(PCT_COL),
+        "-".repeat(DIFF_COL),
+        "-".repeat(SIZE_COL),
+        "-".repeat(TIME_COL),
+    );
+}
+
+/// Print one output's row. Failures are printed even in quiet mode.
+fn print_row(target: &str, millis: u128, result: &Result<Encoded>, base: &Path, quiet: bool) {
+    let encoded = match result {
+        Ok(encoded) => encoded,
+        Err(e) => {
+            println!(
+                "{}",
+                LightRed.paint(format!("{}: {e}", relative(target, base)))
+            );
+            return;
+        }
+    };
+    if quiet {
+        return;
+    }
+    let duration = if millis < 1000 {
+        format!("{millis}ms")
+    } else {
+        format!("{:.1}s", millis as f64 / 1000.0)
+    };
+    if encoded.skipped {
+        println!(
+            "{:>PCT_COL$}  {:>DIFF_COL$}  {:>SIZE_COL$}  {:>TIME_COL$}  {} {}",
+            LightYellow.paint("SKIP"),
+            "",
+            "",
+            duration,
+            relative(target, base),
+            LightYellow.paint("(-)"),
+        );
+        return;
+    }
+    let size = encoded.size;
+    let size_str = if size >= MB {
+        format!("{}mb", size / MB)
+    } else if size >= KB {
+        format!("{}kb", size / KB)
+    } else {
+        format!("{size}b")
+    };
+    // diff < 0 means "not computed" (--no-diff, after a resize, or GIF).
+    let diff = encoded.diff;
+    let diff_inner = if diff < 0.0 {
+        format!("{:>4}", "—")
+    } else {
+        let diff_num = format!("{diff:>4.2}");
+        if diff > 1.0 {
+            LightYellow.paint(&diff_num).to_string()
+        } else {
+            LightGreen.paint(&diff_num).to_string()
+        }
+    };
+    let percent = (size * 100).checked_div(encoded.original_size).unwrap_or(0);
+    let status = if encoded.existed {
+        LightYellow.paint("(U)").to_string()
+    } else {
+        LightGreen.paint("(N)").to_string()
+    };
+    println!(
+        "{:>PCT_COL$}  ({diff_inner})  {:>SIZE_COL$}  {:>TIME_COL$}  {} {status}",
+        format!("{percent}%"),
+        size_str,
+        duration,
+        relative(target, base),
+    );
+}
+
+/// Size for the summary lines, with one decimal.
+fn format_size(size: usize) -> String {
+    if size >= MB {
+        format!("{:.1}mb", size as f64 / MB as f64)
+    } else if size >= KB {
+        format!("{:.1}kb", size as f64 / KB as f64)
+    } else {
+        format!("{size}b")
+    }
+}
+
+/// Totals over every output of the run.
+#[derive(Default)]
+struct Summary {
+    /// Bytes before / after for the outputs that replace their source.
+    original: usize,
+    optimized: usize,
+    count: usize,
+    /// Sources kept as they were.
+    skipped: usize,
+    /// Failed outputs of any kind.
+    errors: usize,
+    /// srcset / density derivatives, tallied separately from the savings.
+    variants: usize,
+    variant_bytes: usize,
+}
+
+impl Summary {
+    fn error_note(&self) -> String {
+        if self.errors > 0 {
+            format!(", {} failed", LightRed.paint(format!("{}", self.errors)))
+        } else {
+            String::new()
+        }
+    }
+
+    fn print_variants(&self, dry_run: bool) {
+        if self.variants == 0 && self.errors == 0 {
+            return;
+        }
+        println!();
+        let verb = if dry_run {
+            "Would generate"
+        } else {
+            "Generated"
+        };
+        println!(
+            "{}",
+            LightCyan.paint(format!(
+                "{verb} {} variant{} ({} total){}",
+                self.variants,
+                if self.variants == 1 { "" } else { "s" },
+                format_size(self.variant_bytes),
+                self.error_note(),
+            ))
+        );
+    }
+
+    fn print_savings(&self, dry_run: bool) {
+        if self.count == 0 && self.skipped == 0 && self.errors == 0 {
+            return;
+        }
+        let saved = self.original.saturating_sub(self.optimized);
+        let saved_pct = (saved * 100).checked_div(self.original).unwrap_or(0);
+        let skipped_note = if self.skipped > 0 {
+            format!(
+                ", {} unchanged",
+                LightYellow.paint(format!("{}", self.skipped))
+            )
+        } else {
+            String::new()
+        };
+        println!();
+        let verb = if dry_run {
+            "Would optimize"
+        } else {
+            "Optimized"
+        };
+        println!(
+            "{}",
+            LightCyan.paint(format!(
+                "{verb} {} file{}: {} → {}, saved {} ({saved_pct}%){skipped_note}{}",
+                self.count,
+                if self.count == 1 { "" } else { "s" },
+                format_size(self.original),
+                format_size(self.optimized),
+                LightGreen.paint(format_size(saved)),
+                self.error_note(),
+            ))
+        );
+    }
+}
+
+/// `--emit-html`: one `<source srcset>` line per format for each source, with its LQIP as
+/// a comment when there is one. `html` maps a source to (variant path, variant, extension).
+fn print_html(
+    html: BTreeMap<String, Vec<(String, Variant, String)>>,
+    lqips: &BTreeMap<String, String>,
+    base: &Path,
+) {
+    if html.is_empty() {
+        return;
+    }
+    println!();
+    for (file, variants) in html {
+        println!(
+            "{}",
+            LightCyan.paint(format!("<!-- {} -->", relative(&file, base)))
+        );
+        let mut by_ext: BTreeMap<String, Vec<(String, Variant)>> = BTreeMap::new();
+        for (path, variant, ext) in variants {
+            by_ext.entry(ext).or_default().push((path, variant));
+        }
+        for (ext, mut list) in by_ext {
+            list.sort_by_key(|(_, v)| v.pixel_width());
+            let srcset = list
+                .iter()
+                .map(|(p, v)| format!("{p} {}", v.descriptor()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("  <source type=\"image/{ext}\" srcset=\"{srcset}\">");
+        }
+        if let Some(uri) = lqips.get(&file) {
+            println!("  <!-- LQIP: {uri} -->");
+        }
+    }
 }
 
 #[tokio::main]
@@ -660,74 +1217,35 @@ async fn main() {
     let args = Args::parse();
 
     let Some(source) = args.source.or(args.source_arg) else {
-        println!(
-            "imageoptimize: try 'imageoptimize -h' or 'imageoptimize --help' for more information"
-        );
-        std::process::exit(1);
+        usage_error("try 'imageoptimize -h' or 'imageoptimize --help' for more information");
     };
-
-    let output = args.output.unwrap_or_else(|| {
-        if args.overwrite {
-            source.clone()
-        } else {
-            "".to_string()
-        }
-    });
+    let output = match args.output {
+        Some(output) => output,
+        None if args.overwrite => source.clone(),
+        None => String::new(),
+    };
     if output.is_empty() {
-        println!("imageoptimize: output path is empty");
-        std::process::exit(1);
+        usage_error("output path is empty");
     }
-
-    let dry_run = args.dry_run;
-    let quiet = args.quiet;
-    let resize = args.resize;
-    let strip_exif = args.strip_exif;
-    let incremental = args.incremental;
-    let no_diff = args.no_diff;
     if args.widths.is_some() && args.densities.is_some() {
-        println!("imageoptimize: use either --widths or --densities, not both");
-        std::process::exit(1);
+        usage_error("use either --widths or --densities, not both");
     }
     // --lossless pins the per-format quality to 100; the auto modes search quality instead,
     // so the two are mutually exclusive rather than silently ignoring one.
     if args.lossless && (args.auto_quality || args.auto_format) {
-        println!(
-            "imageoptimize: --lossless cannot be combined with --auto-quality / --auto-format"
-        );
-        std::process::exit(1);
+        usage_error("--lossless cannot be combined with --auto-quality / --auto-format");
     }
-    // Build the responsive variant list from either widths (Nw) or densities × base-width (Nx).
-    let variants: Vec<Variant> = if let Some(s) = args.widths.as_deref() {
-        match parse_u32_list(s, "width", "320,640,1280") {
-            Ok(ws) => ws.into_iter().map(Variant::Width).collect(),
-            Err(e) => {
-                println!("imageoptimize: --widths {e}");
-                std::process::exit(1);
-            }
-        }
-    } else if let Some(s) = args.densities.as_deref() {
-        let Some(base_width) = args.base_width else {
-            println!("imageoptimize: --densities requires --base-width");
-            std::process::exit(1);
-        };
-        match parse_u32_list(s, "density", "1,2,3") {
-            Ok(ds) => ds
-                .into_iter()
-                .map(|d| Variant::Density {
-                    px: base_width.saturating_mul(d),
-                    density: d,
-                })
-                .collect(),
-            Err(e) => {
-                println!("imageoptimize: --densities {e}");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        Vec::new()
-    };
+    let variants = parse_variants(
+        args.widths.as_deref(),
+        args.densities.as_deref(),
+        args.base_width,
+    )
+    .unwrap_or_else(|message| usage_error(&message));
+
+    let dry_run = args.dry_run;
+    let quiet = args.quiet;
+    let emit_html = args.emit_html;
     let srcset_mode = !variants.is_empty();
-    let density_mode = args.densities.is_some();
     // Auto-format produces one best-format output per source; it is mutually exclusive with
     // srcset (which is inherently per-format) and takes no effect there.
     let auto_format_mode = args.auto_format && !srcset_mode;
@@ -738,15 +1256,13 @@ async fn main() {
         );
     }
     // Default the filename pattern to a width- or density-appropriate template.
-    let srcset_pattern = args.srcset_pattern.clone().unwrap_or_else(|| {
-        if density_mode {
+    let srcset_pattern = args.srcset_pattern.unwrap_or_else(|| {
+        if args.densities.is_some() {
             "{name}@{x}x.{ext}".to_string()
         } else {
             "{name}-{w}w.{ext}".to_string()
         }
     });
-    let emit_html = args.emit_html;
-    let min_size_bytes = args.min_size.map(|kb| kb * 1024);
     let exclude_patterns: Vec<Pattern> = args
         .exclude
         .unwrap_or_default()
@@ -765,12 +1281,9 @@ async fn main() {
 
     let base = PathBuf::from(&output);
 
-    //  glob patterns
     let formats = args
         .format
         .unwrap_or_else(|| vec![ImageFormat::Jpeg, ImageFormat::Jpg, ImageFormat::Png]);
-
-    // sort and ded
     let mut extensions: Vec<&str> = formats
         .iter()
         .flat_map(|format| format.extensions())
@@ -778,142 +1291,45 @@ async fn main() {
     extensions.sort();
     extensions.dedup();
 
-    let convert_formats = args.convert.unwrap_or_else(|| {
+    let convert = convert_targets(&args.convert.unwrap_or_else(|| {
         vec![
             ConvertFormat::JpegAvif,
             ConvertFormat::JpegWebp,
             ConvertFormat::PngAvif,
             ConvertFormat::PngWebp,
         ]
-    });
-    let mut convert_extensions: HashMap<String, Vec<String>> = HashMap::new();
-    for item in convert_formats.iter() {
-        let (source, target) = match item {
-            ConvertFormat::JpegAvif => (IMAGE_JPEG, IMAGE_AVIF),
-            ConvertFormat::JpegWebp => (IMAGE_JPEG, IMAGE_WEBP),
-            ConvertFormat::PngAvif => (IMAGE_PNG, IMAGE_AVIF),
-            ConvertFormat::PngWebp => (IMAGE_PNG, IMAGE_WEBP),
-            ConvertFormat::JpegJxl => (IMAGE_JPEG, IMAGE_JXL),
-            ConvertFormat::PngJxl => (IMAGE_PNG, IMAGE_JXL),
-            ConvertFormat::Disable => continue,
-        };
-        if let Some(targets) = convert_extensions.get_mut(source) {
-            targets.push(target.to_string());
-        } else {
-            convert_extensions.insert(source.to_string(), vec![target.to_string()]);
-        }
-    }
+    }));
 
+    // The tree is walked once and filtered by extension, rather than once per extension.
+    let pattern = format!("{source}/**/*");
+    if !quiet {
+        println!(
+            "Searching pattern: {}",
+            LightCyan.paint(format!(
+                "{}.{{{}}}",
+                relative(&pattern, &base),
+                extensions.join(",")
+            ))
+        );
+    }
+    let min_size_bytes = args.min_size.map(|kb| kb * 1024);
     let mut image_optimize_params = vec![];
-    {
-        // The tree is walked once and filtered by extension, rather than once per extension.
-        let pattern = format!("{source}/**/*");
-        if !quiet {
-            println!(
-                "Searching pattern: {}",
-                LightCyan.paint(format!(
-                    "{}.{{{}}}",
-                    relative(&pattern, &base),
-                    extensions.join(",")
-                ))
-            );
-        }
-        let options = MatchOptions {
-            case_sensitive: false,
-            ..MatchOptions::new()
-        };
-        let entries = match glob_with(&pattern, options) {
-            Ok(entries) => Some(entries),
-            Err(e) => {
-                println!("{}", LightRed.paint(format!("Error reading path: {e}")));
-                None
-            }
-        };
-
-        for entry in entries.into_iter().flatten() {
-            let path = match entry {
-                Ok(path) => path,
-                Err(e) => {
-                    println!("{}", LightRed.paint(format!("Error reading path: {e}")));
-                    continue;
-                }
-            };
-            // Lowercased so camera exports like `IMG_0001.JPG` are found too.
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if !extensions.contains(&ext.as_str()) || !path.is_file() {
-                continue;
-            }
-            // min-size filter
-            if let Some(min_bytes) = min_size_bytes {
-                let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                if file_size < min_bytes {
-                    continue;
-                }
-            }
-
-            // exclude filter
-            if !exclude_patterns.is_empty() {
-                let path_str = path.to_string_lossy();
-                if exclude_patterns.iter().any(|p| p.matches(&path_str)) {
-                    continue;
-                }
-            }
-
-            let image_type = match ext.as_str() {
-                "png" => IMAGE_PNG,
-                "webp" => IMAGE_WEBP,
-                _ => IMAGE_JPEG,
-            };
-            let file = path.to_string_lossy().to_string();
-            let target = output_path(&path, &source, &output);
-            let mut targets = vec![];
-            // Auto-format emits a single best-format output per source, so the fixed
-            // conversion matrix is skipped — only the placeholder target is queued.
-            if !auto_format_mode {
-                if let Some(extensions) = convert_extensions.get(image_type) {
-                    for item in extensions {
-                        let new_target = target.clone().with_extension(item);
-                        targets.push(new_target);
-                    }
-                }
-            }
-            targets.push(target);
-            for target in targets {
-                image_optimize_params.push(ImageOptimizeParams {
-                    file: file.clone(),
-                    target: target.to_string_lossy().into_owned(),
-                });
-            }
+    for path in find_sources(&pattern, &extensions, min_size_bytes, &exclude_patterns) {
+        let file = path.to_string_lossy().to_string();
+        for target in output_targets(&path, &source, &output, &convert, auto_format_mode) {
+            image_optimize_params.push(ImageOptimizeParams {
+                file: file.clone(),
+                target,
+            });
         }
     }
-
-    // --lossless forces every per-format quality to 100. WebP, PNG (and JXL) treat >=100 as
-    // a true lossless encode; AVIF/JPEG have no lossless mode so 100 is best-effort.
-    let quality_of = |fixed: u8| if args.lossless { 100 } else { fixed };
-    let qualities = ImageQualities {
-        avif: quality_of(args.avif_quality),
-        avif_speed: args.avif_speed,
-        webp: quality_of(args.webp_quality),
-        png: quality_of(args.png_quality),
-        jpeg: quality_of(args.jpeg_quality),
-        jxl: quality_of(args.jxl_quality),
-        target_diff: args.target_diff,
-    };
-
-    let kb: usize = 1024;
-    let mb = kb * 1024;
 
     // Total unique source images found (before incremental filter).
     let total_source_count = image_optimize_params
         .iter()
         .map(|i| i.file.as_str())
-        .collect::<std::collections::HashSet<_>>()
+        .collect::<HashSet<_>>()
         .len();
-
     if total_source_count == 0 {
         println!("{}", LightYellow.paint("No images found."));
         return;
@@ -921,7 +1337,7 @@ async fn main() {
 
     // --incremental: drop targets whose output is already newer than the source.
     let mut incremental_skipped = 0usize;
-    if incremental && source != output {
+    if args.incremental && source != output {
         let mode = if srcset_mode {
             IncrementalMode::Srcset {
                 variants: &variants,
@@ -933,7 +1349,7 @@ async fn main() {
             IncrementalMode::Fixed
         };
         image_optimize_params.retain(|item| !is_up_to_date(&item.file, &item.target, mode));
-        let remaining: std::collections::HashSet<&str> = image_optimize_params
+        let remaining: HashSet<&str> = image_optimize_params
             .iter()
             .map(|i| i.file.as_str())
             .collect();
@@ -942,8 +1358,7 @@ async fn main() {
 
     // Group every output target under its source file so each source is decoded once
     // and reused across all its output formats.
-    let mut grouped: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     for item in image_optimize_params {
         grouped.entry(item.file).or_default().push(item.target);
     }
@@ -962,7 +1377,6 @@ async fn main() {
         if total_source_count == 1 { "" } else { "s" },
         incremental_note,
     );
-
     if grouped.is_empty() {
         return;
     }
@@ -973,260 +1387,60 @@ async fn main() {
             LightYellow.paint("[DRY RUN] No files will be written.")
         );
     }
-    // Other columns: fixed upper bounds.
-    let pct_col = 4.max("PCT".len()); // "100%" = 4
-    let diff_col = 6.max("DIFF".len()); // "(0.00)" = 6
-    let size_col = 5.max("SIZE".len()); // "999kb" ≤ 5
-    let dur_col = 6.max("TIME".len()); // "1000ms" = 6
     if !quiet {
-        println!(
-            "{:>pct_col$}  {:>diff_col$}  {:>size_col$}  {:>dur_col$}  FILE",
-            "PCT", "DIFF", "SIZE", "TIME",
-        );
-        println!(
-            "{}  {}  {}  {}  ----",
-            "-".repeat(pct_col),
-            "-".repeat(diff_col),
-            "-".repeat(size_col),
-            "-".repeat(dur_col),
-        );
+        print_table_header();
     }
 
-    // One task per source file: decode once, then encode each output. The variant is set
-    // for srcset/density outputs (None in normal mode). Each task returns all its outcomes.
-    type TargetOutcome = (
-        String,
-        Option<Variant>,
-        u128,
-        Result<(usize, usize, f64, bool, bool, Option<String>)>,
-    );
-    let concurrency = args.threads.unwrap_or_else(num_cpus::get);
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let normal_flags = EncodeFlags {
+    // --lossless forces every per-format quality to 100. WebP, PNG (and JXL) treat >=100 as
+    // a true lossless encode; AVIF/JPEG have no lossless mode so 100 is best-effort.
+    let quality_of = |fixed: u8| if args.lossless { 100 } else { fixed };
+    let flags = EncodeFlags {
         dry_run,
-        strip_exif,
-        no_diff,
+        strip_exif: args.strip_exif,
+        no_diff: args.no_diff,
         is_variant: false,
         auto_quality: args.auto_quality,
         auto_format: auto_format_mode,
     };
-    let variant_flags = EncodeFlags {
-        is_variant: true,
-        // srcset variants are per-format derivatives; never auto-pick their format.
-        auto_format: false,
-        ..normal_flags
-    };
-    // The original snapshot only feeds the explicit diff task: auto modes score against
-    // their own encoder input, and srcset variants are always resized (so never comparable).
-    let keep_original = !no_diff && !normal_flags.auto_quality && !normal_flags.auto_format;
-    let lqip_enabled = args.lqip;
-    let lqip_width = args.lqip_width;
-    let mut join_set: JoinSet<(String, Vec<TargetOutcome>, Option<String>)> = JoinSet::new();
+    let job = Arc::new(Job {
+        qualities: ImageQualities {
+            avif: quality_of(args.avif_quality),
+            avif_speed: args.avif_speed,
+            webp: quality_of(args.webp_quality),
+            png: quality_of(args.png_quality),
+            jpeg: quality_of(args.jpeg_quality),
+            jxl: quality_of(args.jxl_quality),
+            target_diff: args.target_diff,
+        },
+        resize: args.resize,
+        variants,
+        srcset_pattern,
+        flags,
+        // The original snapshot only feeds the explicit diff task: auto modes score against
+        // their own encoder input, and srcset variants are always resized (never comparable).
+        keep_original: !flags.no_diff && !flags.auto_quality && !flags.auto_format,
+        lqip_width: args.lqip.then_some(args.lqip_width),
+    });
+
+    // One task per source file, at most `--threads` of them at a time.
+    let concurrency = args.threads.unwrap_or_else(num_cpus::get);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut join_set: JoinSet<(String, Vec<Outcome>, Option<String>)> = JoinSet::new();
     for (file, targets) in grouped {
-        let qualities = qualities.clone();
+        let job = job.clone();
         let sem = semaphore.clone();
-        let variants = variants.clone();
-        let srcset_pattern = srcset_pattern.clone();
         join_set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            let mut outcomes: Vec<TargetOutcome> = Vec::new();
-            let mut lqip: Option<String> = None;
-
-            if variants.is_empty() {
-                // Normal mode: decode + resize once, encode each target format.
-                match load_base(&file, resize, keep_original).await {
-                    Ok(base) => {
-                        if lqip_enabled {
-                            lqip = base.lqip_data_uri(lqip_width).ok();
-                        }
-                        let mut base = Some(base);
-                        let last = targets.len().saturating_sub(1);
-                        for (i, target) in targets.iter().enumerate() {
-                            // Move the decoded image into the final encode; clone for the rest.
-                            let b = if i == last {
-                                base.take().unwrap()
-                            } else {
-                                base.as_ref().unwrap().clone()
-                            };
-                            let start = Instant::now();
-                            let res =
-                                encode_target(b, &file, target, &qualities, normal_flags).await;
-                            outcomes.push((target.clone(), None, start.elapsed().as_millis(), res));
-                        }
-                    }
-                    Err(e) => {
-                        let message = format!("{e}");
-                        for target in targets {
-                            outcomes.push((
-                                target,
-                                None,
-                                0,
-                                Err(Error::Common {
-                                    message: message.clone(),
-                                }),
-                            ));
-                        }
-                    }
-                }
-            } else {
-                // srcset / density mode: decode once (no resize here), then variant × format.
-                match load_base(&file, None, false).await {
-                    Ok(base) => {
-                        if lqip_enabled {
-                            lqip = base.lqip_data_uri(lqip_width).ok();
-                        }
-                        let src_w = base.get_size().0;
-                        for &variant in &variants {
-                            let w = variant.pixel_width();
-                            if w >= src_w {
-                                continue; // never upscale
-                            }
-                            // Resize the decoded image to this width once, reused for all formats.
-                            let resized = match run_with_image(
-                                base.clone(),
-                                vec![vec!["resize".to_string(), w.to_string(), "0".to_string()]],
-                            )
-                            .await
-                            {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    let message = format!("{e}");
-                                    for target in &targets {
-                                        let path = srcset_path(target, &srcset_pattern, variant);
-                                        outcomes.push((
-                                            path,
-                                            Some(variant),
-                                            0,
-                                            Err(Error::Common {
-                                                message: message.clone(),
-                                            }),
-                                        ));
-                                    }
-                                    continue;
-                                }
-                            };
-                            let mut resized = Some(resized);
-                            let last = targets.len().saturating_sub(1);
-                            for (i, target) in targets.iter().enumerate() {
-                                let b = if i == last {
-                                    resized.take().unwrap()
-                                } else {
-                                    resized.as_ref().unwrap().clone()
-                                };
-                                let path = srcset_path(target, &srcset_pattern, variant);
-                                let start = Instant::now();
-                                let res =
-                                    encode_target(b, &file, &path, &qualities, variant_flags).await;
-                                outcomes.push((
-                                    path,
-                                    Some(variant),
-                                    start.elapsed().as_millis(),
-                                    res,
-                                ));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let message = format!("{e}");
-                        for target in &targets {
-                            for &variant in &variants {
-                                let path = srcset_path(target, &srcset_pattern, variant);
-                                outcomes.push((
-                                    path,
-                                    Some(variant),
-                                    0,
-                                    Err(Error::Common {
-                                        message: message.clone(),
-                                    }),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
+            let (outcomes, lqip) = process_source(&file, targets, &job).await;
             (file, outcomes, lqip)
         });
     }
 
-    let print_row =
-        |target: &str,
-         duration: u128,
-         res: Result<(usize, usize, f64, bool, bool, Option<String>)>| {
-            match res {
-                Ok((size, original_size, diff, existed, skipped, _)) => {
-                    if quiet {
-                        return;
-                    }
-                    let duration_str = if duration < 1000 {
-                        format!("{}ms", duration)
-                    } else {
-                        format!("{:.1}s", duration as f64 / 1000.0)
-                    };
-                    if skipped {
-                        println!(
-                            "{:>pct_col$}  {:>diff_col$}  {:>size_col$}  {:>dur_col$}  {} {}",
-                            LightYellow.paint("SKIP"),
-                            "",
-                            "",
-                            duration_str,
-                            relative(target, &base),
-                            LightYellow.paint("(-)"),
-                        );
-                        return;
-                    }
-                    let size_str = if size >= mb {
-                        format!("{}mb", size / mb)
-                    } else if size >= kb {
-                        format!("{}kb", size / kb)
-                    } else {
-                        format!("{}b", size)
-                    };
-                    // diff < 0 means "not computed" (--no-diff, after a resize, or GIF).
-                    let diff_inner = if diff < 0.0 {
-                        format!("{:>4}", "—")
-                    } else {
-                        let diff_num = format!("{diff:>4.2}");
-                        if diff > 1.0 {
-                            LightYellow.paint(&diff_num).to_string()
-                        } else {
-                            LightGreen.paint(&diff_num).to_string()
-                        }
-                    };
-                    let percent = (size * 100).checked_div(original_size).unwrap_or(0);
-                    let status = if existed {
-                        LightYellow.paint("(U)").to_string()
-                    } else {
-                        LightGreen.paint("(N)").to_string()
-                    };
-                    println!(
-                        "{:>pct_col$}  ({diff_inner})  {:>size_col$}  {:>dur_col$}  {} {status}",
-                        format!("{percent}%"),
-                        size_str,
-                        duration_str,
-                        relative(target, &base),
-                    );
-                }
-                Err(e) => {
-                    println!(
-                        "{}",
-                        LightRed.paint(format!("{}: {e}", relative(target, &base)))
-                    );
-                }
-            }
-        };
-
-    let mut summary_original: usize = 0;
-    let mut summary_optimized: usize = 0;
-    let mut summary_count: usize = 0;
-    let mut summary_skipped: usize = 0;
-    let mut summary_errors: usize = 0;
-    let mut summary_variants: usize = 0;
-    let mut summary_variant_bytes: usize = 0;
+    let mut summary = Summary::default();
     // For --emit-html: source file -> (relative variant path, variant, ext).
-    let mut html: std::collections::BTreeMap<String, Vec<(String, Variant, String)>> =
-        std::collections::BTreeMap::new();
+    let mut html: BTreeMap<String, Vec<(String, Variant, String)>> = BTreeMap::new();
     // For --lqip: source file -> data: URI placeholder.
-    let mut lqips: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut lqips: BTreeMap<String, String> = BTreeMap::new();
 
     while let Some(task) = join_set.join_next().await {
         let (file, outcomes, lqip) = task.expect("task panicked");
@@ -1237,146 +1451,62 @@ async fn main() {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        for (target, width, duration, result) in outcomes {
+        for outcome in outcomes {
             // Auto-format writes a different extension than the placeholder target carried;
             // use the encoder's actual output path for display and accounting.
-            let effective_target = match &result {
-                Ok((.., Some(actual))) => actual.clone(),
-                _ => target,
+            let target = match &outcome.result {
+                Ok(Encoded {
+                    path: Some(actual), ..
+                }) => actual.clone(),
+                _ => outcome.target,
             };
-            let tgt_ext = Path::new(&effective_target)
+            let tgt_ext = Path::new(&target)
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_string();
-            // Every failed output counts, conversions included: they aren't summed into the
-            // savings, but a failure must still be reported and fail the run.
-            if result.is_err() {
-                summary_errors += 1;
-            }
-            match width {
+            match (&outcome.result, outcome.variant) {
+                // Every failed output counts, conversions included: they aren't summed into
+                // the savings, but a failure must still be reported and fail the run.
+                (Err(_), _) => summary.errors += 1,
                 // Normal mode: only count same-format optimisation toward the savings
                 // summary; avif/webp conversions are reported per row but not summed.
                 // Auto-format always yields a single replacement output, so it counts too.
-                None => {
+                (Ok(encoded), None) => {
                     if auto_format_mode || src_ext.eq_ignore_ascii_case(&tgt_ext) {
-                        if let Ok((size, original_size, _, _, skipped, _)) = &result {
-                            if *skipped {
-                                summary_skipped += 1;
-                            } else {
-                                summary_original += original_size;
-                                summary_optimized += size;
-                                summary_count += 1;
-                            }
+                        if encoded.skipped {
+                            summary.skipped += 1;
+                        } else {
+                            summary.original += encoded.original_size;
+                            summary.optimized += encoded.size;
+                            summary.count += 1;
                         }
                     }
                 }
                 // srcset/density variant: a derivative output, tallied separately from "saved".
-                Some(variant) => {
-                    if let Ok((size, _, _, _, _, _)) = &result {
-                        summary_variants += 1;
-                        summary_variant_bytes += size;
-                        if emit_html {
-                            html.entry(file.clone()).or_default().push((
-                                relative(&effective_target, &base),
-                                variant,
-                                tgt_ext.clone(),
-                            ));
-                        }
+                (Ok(encoded), Some(variant)) => {
+                    summary.variants += 1;
+                    summary.variant_bytes += encoded.size;
+                    if emit_html {
+                        html.entry(file.clone()).or_default().push((
+                            relative(&target, &base),
+                            variant,
+                            tgt_ext,
+                        ));
                     }
                 }
             }
-            print_row(&effective_target, duration, result);
+            print_row(&target, outcome.millis, &outcome.result, &base, quiet);
         }
     }
 
-    let format_size = |size: usize| {
-        if size >= mb {
-            format!("{:.1}mb", size as f64 / mb as f64)
-        } else if size >= kb {
-            format!("{:.1}kb", size as f64 / kb as f64)
-        } else {
-            format!("{}b", size)
-        }
-    };
-    let error_note = if summary_errors > 0 {
-        format!(", {} failed", LightRed.paint(format!("{summary_errors}")))
-    } else {
-        String::new()
-    };
-
     if srcset_mode {
-        if summary_variants > 0 || summary_errors > 0 {
-            println!();
-            let verb = if dry_run {
-                "Would generate"
-            } else {
-                "Generated"
-            };
-            println!(
-                "{}",
-                LightCyan.paint(format!(
-                    "{verb} {summary_variants} variant{} ({} total){error_note}",
-                    if summary_variants == 1 { "" } else { "s" },
-                    format_size(summary_variant_bytes),
-                ))
-            );
+        summary.print_variants(dry_run);
+        if emit_html {
+            print_html(html, &lqips, &base);
         }
-
-        // One <source> srcset line per format, per source.
-        if emit_html && !html.is_empty() {
-            println!();
-            for (file, variants) in html {
-                println!(
-                    "{}",
-                    LightCyan.paint(format!("<!-- {} -->", relative(&file, &base)))
-                );
-                let mut by_ext: std::collections::BTreeMap<String, Vec<(String, Variant)>> =
-                    std::collections::BTreeMap::new();
-                for (path, variant, ext) in variants {
-                    by_ext.entry(ext).or_default().push((path, variant));
-                }
-                for (ext, mut list) in by_ext {
-                    list.sort_by_key(|(_, v)| v.pixel_width());
-                    let srcset = list
-                        .iter()
-                        .map(|(p, v)| format!("{p} {}", v.descriptor()))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    println!("  <source type=\"image/{ext}\" srcset=\"{srcset}\">");
-                }
-                if let Some(uri) = lqips.get(&file) {
-                    println!("  <!-- LQIP: {uri} -->");
-                }
-            }
-        }
-    } else if summary_count > 0 || summary_skipped > 0 || summary_errors > 0 {
-        let saved = summary_original.saturating_sub(summary_optimized);
-        let saved_pct = (saved * 100).checked_div(summary_original).unwrap_or(0);
-        let skipped_note = if summary_skipped > 0 {
-            format!(
-                ", {} unchanged",
-                LightYellow.paint(format!("{summary_skipped}"))
-            )
-        } else {
-            String::new()
-        };
-        println!();
-        let verb = if dry_run {
-            "Would optimize"
-        } else {
-            "Optimized"
-        };
-        println!(
-            "{}",
-            LightCyan.paint(format!(
-                "{verb} {summary_count} file{}: {} → {}, saved {} ({saved_pct}%){skipped_note}{error_note}",
-                if summary_count == 1 { "" } else { "s" },
-                format_size(summary_original),
-                format_size(summary_optimized),
-                LightGreen.paint(format_size(saved)),
-            ))
-        );
+    } else {
+        summary.print_savings(dry_run);
     }
 
     // --lqip: print the placeholder data URIs. --emit-html already embeds them as comments
@@ -1391,7 +1521,7 @@ async fn main() {
     }
 
     // A non-zero exit lets scripts and CI notice that some outputs could not be produced.
-    if summary_errors > 0 {
+    if summary.errors > 0 {
         std::process::exit(1);
     }
 }
@@ -1399,9 +1529,103 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_up_to_date, output_path, parse_u32_list, srcset_path, IncrementalMode, Variant,
+        convert_targets, find_sources, format_size, is_up_to_date, output_path, output_targets,
+        parse_u32_list, parse_variants, srcset_path, ConvertFormat, IncrementalMode, Variant,
     };
+    use glob::Pattern;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn test_parse_variants() {
+        assert!(parse_variants(None, None, None).unwrap().is_empty());
+        let widths = parse_variants(Some("640,320"), None, None).unwrap();
+        let px: Vec<u32> = widths.iter().map(|v| v.pixel_width()).collect();
+        assert_eq!(px, [320, 640]);
+        assert_eq!(widths[0].descriptor(), "320w");
+        // Densities multiply the base width.
+        let densities = parse_variants(None, Some("1,2"), Some(50)).unwrap();
+        let px: Vec<u32> = densities.iter().map(|v| v.pixel_width()).collect();
+        assert_eq!(px, [50, 100]);
+        assert_eq!(densities[1].descriptor(), "2x");
+        // Errors name the flag at fault.
+        let err = parse_variants(None, Some("1,2"), None).unwrap_err();
+        assert_eq!(err, "--densities requires --base-width");
+        assert!(parse_variants(Some("0"), None, None)
+            .unwrap_err()
+            .starts_with("--widths "));
+    }
+
+    #[test]
+    fn test_output_targets() {
+        let convert = convert_targets(&[
+            ConvertFormat::JpegAvif,
+            ConvertFormat::Disable,
+            ConvertFormat::JpegWebp,
+            ConvertFormat::PngWebp,
+        ]);
+        assert_eq!(convert["jpeg"], ["avif", "webp"]);
+        assert_eq!(convert["png"], ["webp"]);
+
+        // Conversions first, then the same-format target; `.JPG` counts as JPEG.
+        let targets = output_targets(Path::new("in/a/IMG.JPG"), "in", "out", &convert, false);
+        assert_eq!(
+            targets,
+            ["out/a/IMG.avif", "out/a/IMG.webp", "out/a/IMG.JPG"]
+        );
+        // A WebP source has no conversions.
+        let targets = output_targets(Path::new("in/w.webp"), "in", "out", &convert, false);
+        assert_eq!(targets, ["out/w.webp"]);
+        // Auto-format queues only the placeholder target.
+        let targets = output_targets(Path::new("in/p.png"), "in", "out", &convert, true);
+        assert_eq!(targets, ["out/p.png"]);
+    }
+
+    #[test]
+    fn test_find_sources() {
+        let dir = std::env::temp_dir().join(format!("imageoptimize-find-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub/dir.png")).unwrap();
+        for (name, len) in [
+            ("a.jpg", 10),
+            ("B.JPG", 10),
+            ("small.png", 2),
+            ("sub/c.png", 10),
+            ("sub/dir.png/d.jpg", 10),
+            ("notes.txt", 10),
+        ] {
+            std::fs::write(dir.join(name), vec![0u8; len]).unwrap();
+        }
+        let pattern = format!("{}/**/*", dir.to_string_lossy());
+        let find = |extensions: &[&str], min_size, exclude: &[Pattern]| {
+            let mut found: Vec<String> = find_sources(&pattern, extensions, min_size, exclude)
+                .iter()
+                .map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().into_owned())
+                .collect();
+            found.sort();
+            found
+        };
+        // Extensions match case-insensitively; a directory named like an image is skipped.
+        assert_eq!(
+            find(&["jpg", "png"], None, &[]),
+            [
+                "B.JPG",
+                "a.jpg",
+                "small.png",
+                "sub/c.png",
+                "sub/dir.png/d.jpg"
+            ]
+        );
+        assert_eq!(find(&["png"], Some(5), &[]), ["sub/c.png"]);
+        let exclude = [Pattern::new("**/sub/**").unwrap()];
+        assert_eq!(find(&["jpg", "png"], Some(5), &exclude), ["B.JPG", "a.jpg"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_format_size() {
+        assert_eq!(format_size(512), "512b");
+        assert_eq!(format_size(1536), "1.5kb");
+        assert_eq!(format_size(5 * 1024 * 1024 / 2), "2.5mb");
+    }
 
     #[test]
     fn test_output_path() {
