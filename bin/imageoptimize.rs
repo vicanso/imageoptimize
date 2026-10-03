@@ -280,7 +280,7 @@ struct Args {
     )]
     format: Option<Vec<ImageFormat>>,
 
-    /// Override quality
+    /// Write optimized files back to the source directory (used when --output is not given)
     #[arg(short, long)]
     overwrite: bool,
 
@@ -1201,7 +1201,7 @@ async fn main() {
                 Err(e) => {
                     println!(
                         "{}",
-                        LightRed.paint(format!("{}: {e:?}", relative(target, &base)))
+                        LightRed.paint(format!("{}: {e}", relative(target, &base)))
                     );
                 }
             }
@@ -1241,29 +1241,31 @@ async fn main() {
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_string();
+            // Every failed output counts, conversions included: they aren't summed into the
+            // savings, but a failure must still be reported and fail the run.
+            if result.is_err() {
+                summary_errors += 1;
+            }
             match width {
                 // Normal mode: only count same-format optimisation toward the savings
                 // summary; avif/webp conversions are reported per row but not summed.
                 // Auto-format always yields a single replacement output, so it counts too.
                 None => {
                     if auto_format_mode || src_ext.eq_ignore_ascii_case(&tgt_ext) {
-                        match &result {
-                            Ok((size, original_size, _, _, skipped, _)) => {
-                                if *skipped {
-                                    summary_skipped += 1;
-                                } else {
-                                    summary_original += original_size;
-                                    summary_optimized += size;
-                                    summary_count += 1;
-                                }
+                        if let Ok((size, original_size, _, _, skipped, _)) = &result {
+                            if *skipped {
+                                summary_skipped += 1;
+                            } else {
+                                summary_original += original_size;
+                                summary_optimized += size;
+                                summary_count += 1;
                             }
-                            Err(_) => summary_errors += 1,
                         }
                     }
                 }
                 // srcset/density variant: a derivative output, tallied separately from "saved".
-                Some(variant) => match &result {
-                    Ok((size, _, _, _, _, _)) => {
+                Some(variant) => {
+                    if let Ok((size, _, _, _, _, _)) = &result {
                         summary_variants += 1;
                         summary_variant_bytes += size;
                         if emit_html {
@@ -1274,8 +1276,7 @@ async fn main() {
                             ));
                         }
                     }
-                    Err(_) => summary_errors += 1,
-                },
+                }
             }
             print_row(&effective_target, duration, result);
         }
@@ -1379,6 +1380,11 @@ async fn main() {
         for (file, uri) in &lqips {
             println!("  {}  {}", relative(file, &base), uri);
         }
+    }
+
+    // A non-zero exit lets scripts and CI notice that some outputs could not be produced.
+    if summary_errors > 0 {
+        std::process::exit(1);
     }
 }
 

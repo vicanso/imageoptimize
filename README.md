@@ -238,7 +238,7 @@ A summary line is printed after all files are processed:
 Optimized 12 files: 8.4mb → 5.1mb, saved 3.3mb (39%), 2 unchanged
 ```
 
-If any files fail to process, the count is shown in red at the end of the summary: `, 1 failed`.
+If any output fails (format conversions included), the count is shown in red at the end of the summary: `, 1 failed`, and the process exits with status 1 so scripts and CI can detect it.
 
 In `--dry-run` mode the header shows `[DRY RUN]` and the summary reads `Would optimize …`.
 

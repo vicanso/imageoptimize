@@ -233,7 +233,7 @@ SKIP                   2.8s  asset/image/line_mixin.jpeg (-)
 Optimized 12 files: 8.4mb → 5.1mb, saved 3.3mb (39%), 2 unchanged
 ```
 
-如有文件处理失败，汇总行末尾会以红色显示失败数量，如 `, 1 failed`。
+如有任何输出处理失败（包括格式转换），汇总行末尾会以红色显示失败数量，如 `, 1 failed`，且进程以状态码 1 退出，便于脚本和 CI 察觉。
 
 `--dry-run` 模式下，标题显示 `[DRY RUN]`，汇总行读作 `Would optimize …`。
 
