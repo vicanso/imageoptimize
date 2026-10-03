@@ -391,6 +391,20 @@ fn invalid<T>(message: String) -> Result<T> {
     ParamsInvalidSnafu { message }.fail()
 }
 
+/// Accept an output format `optim` can encode, or an empty one (keep the source format).
+/// Anything else is rejected: it would otherwise be encoded as JPEG without a word.
+fn check_output_type(output_type: &str, allow_gif: bool) -> Result<()> {
+    match output_type {
+        "" | "jpg" | IMAGE_TYPE_JPEG | IMAGE_TYPE_PNG | IMAGE_TYPE_WEBP | IMAGE_TYPE_AVIF
+        | IMAGE_TYPE_JXL => Ok(()),
+        IMAGE_TYPE_GIF if allow_gif => Ok(()),
+        IMAGE_TYPE_GIF => invalid("gif has no quality setting to tune automatically".to_string()),
+        other => invalid(format!(
+            "unknown output format '{other}', expected jpeg, png, webp, avif, jxl or gif"
+        )),
+    }
+}
+
 /// Accept an empty color (the task's default) or `#rrggbb` / `#rrggbbaa`.
 fn check_hex_color(color: &str) -> Result<()> {
     let hex = color.trim_start_matches('#');
@@ -637,17 +651,21 @@ impl Task {
             }
             PROCESS_OPTIM => {
                 ensure!(sub.len() >= 3, he);
-                let output_type = &sub[0];
+                let output_type = sub[0].to_ascii_lowercase();
                 let quality_field = &sub[1];
                 let speed = int_param::<u8>(sub, 2)?;
                 let auto_format = output_type == "auto";
                 let auto_quality = quality_field == "auto";
+                if !auto_format {
+                    // GIF has no quality to tune, so the auto modes can't target it.
+                    check_output_type(&output_type, !auto_quality)?;
+                }
                 if auto_format || auto_quality {
                     Task::AutoOptim {
                         output_type: if auto_format {
                             String::new()
                         } else {
-                            output_type.clone()
+                            output_type
                         },
                         quality: if auto_quality {
                             None
@@ -660,7 +678,7 @@ impl Task {
                     }
                 } else {
                     Task::Optim {
-                        output_type: output_type.clone(),
+                        output_type,
                         quality: int_param(sub, 1)?,
                         speed,
                     }
@@ -4459,6 +4477,34 @@ mod tests {
         assert!(Task::parse(&task(&["flip", "diagonal"])).is_err());
         assert!(Task::parse(&task(&["normalize", "hsv"])).is_err());
         assert!(Task::parse(&task(&["watermark", "file:///w.png", "middle"])).is_err());
+
+        // A misspelt output format used to be encoded as JPEG without a word.
+        let err = Task::parse(&task(&["optim", "wepb", "80", "0"]))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("wepb"), "{err}");
+        // GIF has no quality to search.
+        assert!(Task::parse(&task(&["optim", "gif", "auto", "0"])).is_err());
+        assert!(Task::parse(&task(&["optim", "gif", "80", "0"])).is_ok());
+        // Empty keeps the source format; names are case-insensitive.
+        assert!(Task::parse(&task(&["optim", "", "80", "0"])).is_ok());
+        assert_eq!(
+            Task::parse(&task(&["optim", "WebP", "80", "0"])).unwrap(),
+            Task::Optim {
+                output_type: "webp".to_string(),
+                quality: 80,
+                speed: 0,
+            }
+        );
+        assert_eq!(
+            Task::parse(&task(&["optim", "JPG", "auto", "0"])).unwrap(),
+            Task::AutoOptim {
+                output_type: "jpg".to_string(),
+                quality: None,
+                speed: 0,
+                target: 1.0,
+            }
+        );
         assert_eq!(
             Task::parse(&task(&["optim", "auto", "auto", "3"])).unwrap(),
             Task::AutoOptim {
