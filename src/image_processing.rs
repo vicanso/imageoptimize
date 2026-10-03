@@ -1,6 +1,7 @@
 use super::images::{
-    avif_decode, avif_speed, gif_to_animated_webp, jpeg_to_jxl, jxl_decode, jxl_dimensions,
-    strip_jxl_metadata, to_gif, ImageError, ImageInfo,
+    avif_color_profile, avif_decode, avif_speed, gif_to_animated_webp, jpeg_to_jxl,
+    jxl_decode_with_profile, jxl_dimensions, strip_jxl_metadata, to_gif, ColorProfile, ImageError,
+    ImageInfo,
 };
 use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
@@ -1114,13 +1115,14 @@ fn avif_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     Some((meta.max_frame_width.get(), meta.max_frame_height.get()))
 }
 
-/// Decode encoded bytes into pixels plus any embedded ICC profile, refusing images whose
-/// decoded buffer would exceed [`MAX_DECODE_BYTES`] before allocating for them.
-fn decode_image(data: &[u8], ext: &str) -> Result<(DynamicImage, Option<Vec<u8>>)> {
+/// Decode encoded bytes into pixels plus the color profile they are tagged with, refusing
+/// images whose decoded buffer would exceed [`MAX_DECODE_BYTES`] before allocating for them.
+fn decode_image(data: &[u8], ext: &str) -> Result<(DynamicImage, Option<ColorProfile>)> {
     let jxl_dims = jxl_dimensions(data);
     if ext == IMAGE_TYPE_JXL || jxl_dims.is_some() {
         ensure_decode_size(jxl_dims)?;
-        return Ok((jxl_decode(data).context(ImagesSnafu {})?, None));
+        let (di, icc) = jxl_decode_with_profile(data).context(ImagesSnafu {})?;
+        return Ok((di, icc.map(ColorProfile::Icc)));
     }
     let format = image::guess_format(data).or_else(|_| {
         ImageFormat::from_extension(ext).ok_or(ImageProcessingError::ParamsInvalid {
@@ -1131,7 +1133,8 @@ fn decode_image(data: &[u8], ext: &str) -> Result<(DynamicImage, Option<Vec<u8>>
     // decoder rather than image::load (which would error).
     if format == ImageFormat::Avif {
         ensure_decode_size(avif_dimensions(data))?;
-        return Ok((avif_decode(data).context(ImagesSnafu {})?, None));
+        let di = avif_decode(data).context(ImagesSnafu {})?;
+        return Ok((di, avif_color_profile(data)));
     }
     let mut decoder = ImageReader::with_format(Cursor::new(data), format)
         .into_decoder()
@@ -1142,15 +1145,53 @@ fn decode_image(data: &[u8], ext: &str) -> Result<(DynamicImage, Option<Vec<u8>>
         .context(ImageSnafu {})?;
     let icc = decoder.icc_profile().ok().flatten();
     let di = DynamicImage::from_decoder(decoder).context(ImageSnafu {})?;
-    Ok((di, icc))
+    Ok((di, icc.map(ColorProfile::Icc)))
 }
 
-/// Convert pixels tagged with an embedded ICC profile (e.g. Display P3 from phone cameras)
-/// to sRGB. None of the encoders carry the profile over, so without this, wide-gamut images
-/// would display with dull, shifted colors. Profiles qcms can't apply to the pixel layout
-/// (gray, CMYK, malformed) leave the image untouched.
-fn icc_to_srgb(di: DynamicImage, icc: Option<&[u8]>) -> DynamicImage {
-    let Some(input) = icc.and_then(|icc| qcms::Profile::new_from_slice(icc, false)) else {
+/// The qcms profile for CICP code points (ITU-T H.273), or `None` when they already mean
+/// sRGB or can't be converted here. "Unspecified" is read as sRGB, and so are the
+/// BT.709-family transfer curves — still images tagged with them are sRGB-encoded in
+/// practice. HDR transfers (PQ, HLG) would need tone mapping and are left alone. The code
+/// points come from the file, so only values qcms has a model for are passed on: it panics
+/// on the reserved ones.
+fn cicp_profile(primaries: u8, transfer: u8) -> Option<Box<qcms::Profile>> {
+    const BT709: u8 = 1;
+    const UNSPECIFIED: u8 = 2;
+    const SRGB_TRANSFER: u8 = 13;
+    let primaries = match primaries {
+        UNSPECIFIED => BT709,
+        // BT.709, BT.470M/BG, BT.601, SMPTE 240M, film, BT.2020, DCI-P3, Display P3, EBU 3213
+        1 | 4..=9 | 11 | 12 | 22 => primaries,
+        _ => return None,
+    };
+    let transfer = match transfer {
+        // Unspecified, BT.709, BT.601, BT.2020 10/12-bit
+        UNSPECIFIED | 1 | 6 | 14 | 15 => SRGB_TRANSFER,
+        // Gamma 2.2, gamma 2.8, linear, sRGB
+        4 | 5 | 8 | SRGB_TRANSFER => transfer,
+        _ => return None,
+    };
+    if (primaries, transfer) == (BT709, SRGB_TRANSFER) {
+        return None;
+    }
+    qcms::Profile::new_cicp(primaries.into(), transfer.into())
+}
+
+/// Convert pixels tagged with a color profile — an embedded ICC profile (e.g. Display P3
+/// from phone cameras) or, for AVIF, CICP code points — to sRGB. None of the encoders carry
+/// the profile over, so without this, wide-gamut images would display with dull, shifted
+/// colors. Profiles qcms can't apply to the pixel layout (gray, CMYK, malformed) leave the
+/// image untouched.
+fn to_srgb(di: DynamicImage, profile: Option<&ColorProfile>) -> DynamicImage {
+    let input = match profile {
+        Some(ColorProfile::Icc(icc)) => qcms::Profile::new_from_slice(icc, false),
+        Some(&ColorProfile::Cicp {
+            primaries,
+            transfer,
+        }) => cicp_profile(primaries, transfer),
+        None => None,
+    };
+    let Some(input) = input else {
         return di;
     };
     let mut output = qcms::Profile::new_sRGB();
@@ -1384,8 +1425,8 @@ impl ProcessImage {
     }
 
     fn new_impl(data: Vec<u8>, ext: &str, keep_original: bool) -> Result<Self> {
-        let (di, icc) = decode_image(&data, ext)?;
-        let di = icc_to_srgb(di, icc.as_deref());
+        let (di, profile) = decode_image(&data, ext)?;
+        let di = to_srgb(di, profile.as_ref());
         let orientation = get_exif_orientation(&data);
         let di = apply_orientation(di, orientation);
         let original_size = data.len();
@@ -1548,7 +1589,12 @@ fn encode_info(info: &ImageInfo, ext: &str, quality: u8, speed: u8) -> Result<Ve
 fn decode_to_di(buffer: &[u8], ext: &str) -> Result<DynamicImage> {
     match ext {
         IMAGE_TYPE_AVIF => avif_decode(buffer).context(ImagesSnafu {}),
-        IMAGE_TYPE_JXL => jxl_decode(buffer).context(ImagesSnafu {}),
+        // A JXL transcoded from a JPEG keeps that JPEG's profile: bring it to sRGB like the
+        // loaded original it is scored against.
+        IMAGE_TYPE_JXL => {
+            let (di, icc) = jxl_decode_with_profile(buffer).context(ImagesSnafu {})?;
+            Ok(to_srgb(di, icc.map(ColorProfile::Icc).as_ref()))
+        }
         _ => {
             let format = ImageFormat::from_extension(ext).unwrap_or(ImageFormat::Jpeg);
             load(Cursor::new(buffer), format).context(ImageSnafu {})
@@ -4884,6 +4930,83 @@ mod tests {
             r > 180 && r == g && g == b,
             "expected ~188 gray, got {r},{g},{b}"
         );
+    }
+
+    #[test]
+    fn test_cicp_to_srgb() {
+        use super::{cicp_profile, to_srgb, ColorProfile};
+        // Already sRGB, or read as sRGB: nothing to convert.
+        for (primaries, transfer) in [(1, 13), (2, 2), (1, 1), (2, 13), (1, 6), (1, 14)] {
+            assert!(cicp_profile(primaries, transfer).is_none());
+        }
+        // HDR transfers, XYZ and unsupported or reserved code points are left alone. The
+        // reserved ones must never reach qcms, which panics on them.
+        for (primaries, transfer) in [
+            (9, 16),
+            (9, 18),
+            (10, 13),
+            (0, 13),
+            (3, 13),
+            (255, 13),
+            (1, 0),
+            (1, 3),
+            (1, 7),
+            (1, 255),
+        ] {
+            assert!(cicp_profile(primaries, transfer).is_none());
+        }
+        // A wider gamut or another tone curve does get a profile.
+        for (primaries, transfer) in [(12, 13), (12, 1), (9, 13), (11, 5), (1, 8), (1, 4)] {
+            assert!(cicp_profile(primaries, transfer).is_some());
+        }
+
+        let solid = |rgb: [u8; 3]| {
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 4, image::Rgb(rgb)))
+        };
+        let convert = |rgb: [u8; 3], primaries: u8, transfer: u8| {
+            let profile = ColorProfile::Cicp {
+                primaries,
+                transfer,
+            };
+            to_srgb(solid(rgb), Some(&profile))
+                .to_rgb8()
+                .get_pixel(0, 0)
+                .0
+        };
+        // Linear-light mid-gray is re-encoded much brighter, as with the linear ICC profile.
+        let [r, g, b] = convert([128, 128, 128], 1, 8);
+        assert!(r > 180 && r == g && g == b, "got {r},{g},{b}");
+        // The same numbers mean a more saturated red in Display P3 than in sRGB.
+        let [r, g, _] = convert([200, 60, 60], 12, 13);
+        assert!(r > 200 && g < 60, "got {r},{g}");
+        // sRGB code points leave the pixels alone.
+        assert_eq!(convert([200, 60, 60], 1, 13), [200, 60, 60]);
+    }
+
+    #[test]
+    #[cfg(feature = "jxl")]
+    fn test_jxl_profile_converted_to_srgb() {
+        use img_parts::{jpeg::Jpeg, Bytes, ImageICC};
+        let gray: crate::ImageInfo = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            16,
+            16,
+            image::Rgb([128, 128, 128]),
+        ))
+        .into();
+        // A JPEG tagged as linear light, recompressed to JXL: the profile travels with it and
+        // is applied on load, like for the JPEG itself.
+        let mut jpeg = Jpeg::from_bytes(gray.to_mozjpeg(95).unwrap().into()).unwrap();
+        jpeg.set_icc_profile(Some(Bytes::from(linear_rgb_icc())));
+        let jxl = crate::jpeg_to_jxl(&jpeg.encoder().bytes()).unwrap();
+        let tagged = ProcessImage::new(jxl, "jxl").unwrap();
+        let [r, g, b] = tagged.di.to_rgb8().get_pixel(8, 8).0;
+        assert!(
+            r > 180 && r == g && g == b,
+            "expected ~188 gray, got {r},{g},{b}"
+        );
+        // A plain sRGB JXL comes back as it went in.
+        let srgb = ProcessImage::new(gray.to_jxl(100).unwrap(), "jxl").unwrap();
+        assert_eq!(srgb.di.to_rgb8().get_pixel(8, 8).0, [128, 128, 128]);
     }
 
     #[test]

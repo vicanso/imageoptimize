@@ -192,10 +192,18 @@ pub fn avif_decode(data: &[u8]) -> Result<DynamicImage> {
     }
 }
 
-/// Decode data from JXL format using jpegxl-rs (libjxl FFI).
-#[cfg(feature = "jxl")]
+/// Decode data from JXL format using jpegxl-rs (libjxl FFI). The pixels are in the image's
+/// own color space; see `jxl_decode_with_profile` for the profile describing it.
 pub fn jxl_decode(data: &[u8]) -> Result<DynamicImage> {
+    jxl_decode_with_profile(data).map(|(di, _)| di)
+}
+
+/// Decode JXL data, returning the pixels along with the ICC profile that describes them
+/// (libjxl synthesizes one for images stored with an enumerated color space).
+#[cfg(feature = "jxl")]
+pub(crate) fn jxl_decode_with_profile(data: &[u8]) -> Result<(DynamicImage, Option<Vec<u8>>)> {
     let decoder = jpegxl_rs::decoder_builder()
+        .icc_profile(true)
         .build()
         .map_err(|_| ImageError::Unknown)?;
     let (info, pixels) = decoder
@@ -205,20 +213,17 @@ pub fn jxl_decode(data: &[u8]) -> Result<DynamicImage> {
     let h = info.height;
     // Determine channels from pixel buffer length rather than metadata field name
     // (jpegxl-rs Metadata doesn't expose num_channels directly in 0.11).
-    if pixels.len() == (w * h * 4) as usize {
-        image::RgbaImage::from_raw(w, h, pixels)
-            .ok_or(ImageError::Unknown)
-            .map(DynamicImage::ImageRgba8)
+    let image = if pixels.len() == (w * h * 4) as usize {
+        image::RgbaImage::from_raw(w, h, pixels).map(DynamicImage::ImageRgba8)
     } else {
-        image::RgbImage::from_raw(w, h, pixels)
-            .ok_or(ImageError::Unknown)
-            .map(DynamicImage::ImageRgb8)
-    }
+        image::RgbImage::from_raw(w, h, pixels).map(DynamicImage::ImageRgb8)
+    };
+    Ok((image.ok_or(ImageError::Unknown)?, info.icc_profile))
 }
 
 /// Stub used when the `jxl` feature is disabled: JXL inputs report a clear error.
 #[cfg(not(feature = "jxl"))]
-pub fn jxl_decode(_data: &[u8]) -> Result<DynamicImage> {
+pub(crate) fn jxl_decode_with_profile(_data: &[u8]) -> Result<(DynamicImage, Option<Vec<u8>>)> {
     Err(ImageError::Unsupported {
         message: "JXL decoding requires the `jxl` feature".to_string(),
     })
@@ -251,18 +256,19 @@ const JXL_CONTAINER_SIG: &[u8] = &[
     0, 0, 0, 0x0c, b'J', b'X', b'L', b' ', 0x0d, 0x0a, 0x87, 0x0a,
 ];
 
-/// One box of a JPEG XL container: its 4-byte type, payload, and the whole box as stored.
-struct JxlBox<'a> {
+/// One ISOBMFF box (the container format of JPEG XL and AVIF): its 4-byte type, payload,
+/// and the whole box as stored.
+struct IsoBox<'a> {
     kind: &'a [u8],
     payload: &'a [u8],
     raw: &'a [u8],
 }
 
-/// The boxes following the signature of a JPEG XL container, or `None` when `data` is not
-/// one (e.g. a bare codestream). A box running past the end of the data is clamped to it.
-fn jxl_boxes(data: &[u8]) -> Option<impl Iterator<Item = JxlBox<'_>>> {
-    let mut rest = data.strip_prefix(JXL_CONTAINER_SIG)?;
-    Some(std::iter::from_fn(move || {
+/// The sequence of ISOBMFF boxes laid out in `data`. A box running past the end of the data
+/// is clamped to it.
+fn iso_boxes(data: &[u8]) -> impl Iterator<Item = IsoBox<'_>> {
+    let mut rest = data;
+    std::iter::from_fn(move || {
         if rest.len() < 8 {
             return None;
         }
@@ -276,14 +282,60 @@ fn jxl_boxes(data: &[u8]) -> Option<impl Iterator<Item = JxlBox<'_>>> {
             n => (8, n),
         };
         let end = size.max(header).min(rest.len());
-        let jxl_box = JxlBox {
+        let iso_box = IsoBox {
             kind: &rest[4..8],
             payload: rest.get(header..end)?,
             raw: &rest[..end],
         };
         rest = &rest[end..];
-        Some(jxl_box)
-    }))
+        Some(iso_box)
+    })
+}
+
+/// The boxes following the signature of a JPEG XL container, or `None` when `data` is not
+/// one (e.g. a bare codestream).
+fn jxl_boxes(data: &[u8]) -> Option<impl Iterator<Item = IsoBox<'_>>> {
+    data.strip_prefix(JXL_CONTAINER_SIG).map(iso_boxes)
+}
+
+/// How an image says its pixels are to be interpreted.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ColorProfile {
+    /// An embedded ICC profile.
+    Icc(Vec<u8>),
+    /// CICP code points (ITU-T H.273): color primaries and transfer characteristics.
+    Cicp { primaries: u8, transfer: u8 },
+}
+
+/// The color information an AVIF carries in its `colr` property (`meta` → `iprp` → `ipco`):
+/// the ICC profile when one is embedded, otherwise the CICP code points. `None` when there is
+/// no `colr` box — the usual case for sRGB files, this crate's own output included.
+pub(crate) fn avif_color_profile(data: &[u8]) -> Option<ColorProfile> {
+    fn child<'a>(boxes: &'a [u8], kind: &[u8]) -> Option<&'a [u8]> {
+        iso_boxes(boxes).find(|b| b.kind == kind).map(|b| b.payload)
+    }
+    // `meta` is a FullBox: 4 bytes of version and flags precede its children.
+    let meta = child(data, b"meta")?.get(4..)?;
+    let ipco = child(child(meta, b"iprp")?, b"ipco")?;
+    let mut cicp = None;
+    for colr in iso_boxes(ipco).filter(|b| b.kind == b"colr") {
+        let Some((kind, body)) = colr.payload.split_at_checked(4) else {
+            continue;
+        };
+        match (kind, body) {
+            // An ICC profile wins over code points when a file carries both.
+            (b"prof" | b"rICC", icc) => return Some(ColorProfile::Icc(icc.to_vec())),
+            // Two 16-bit code points; every defined value fits the low byte.
+            (b"nclx", &[0, primaries, 0, transfer, ..]) if cicp.is_none() => {
+                cicp = Some(ColorProfile::Cicp {
+                    primaries,
+                    transfer,
+                });
+            }
+            _ => {}
+        }
+    }
+    cicp
 }
 
 /// Remove the metadata boxes of a JPEG XL container: `Exif`, `xml ` (XMP), their brotli-
@@ -293,7 +345,7 @@ fn jxl_boxes(data: &[u8]) -> Option<impl Iterator<Item = JxlBox<'_>>> {
 /// codestreams included).
 pub(crate) fn strip_jxl_metadata(data: &[u8]) -> Option<Vec<u8>> {
     const METADATA: [&[u8]; 3] = [b"Exif", b"xml ", b"jbrd"];
-    let is_metadata = |b: &JxlBox| {
+    let is_metadata = |b: &IsoBox| {
         METADATA.contains(&b.kind)
             || (b.kind == b"brob" && b.payload.get(..4).is_some_and(|t| METADATA.contains(&t)))
     };
@@ -760,6 +812,60 @@ mod tests {
         assert!(super::gif_to_animated_webp(Cursor::new(&still), 80)
             .unwrap()
             .is_none());
+    }
+    #[test]
+    fn test_avif_color_profile() {
+        use super::{avif_color_profile, ColorProfile};
+        let boxed = |kind: &[u8; 4], payload: &[u8]| {
+            let mut b = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+            b.extend(kind);
+            b.extend(payload);
+            b
+        };
+        // ftyp, meta (a FullBox) → iprp → ipco → the given properties, then mdat.
+        let avif = |properties: &[Vec<u8>]| {
+            let ipco = [boxed(b"ispe", &[0; 12]), properties.concat()].concat();
+            let iprp = boxed(b"ipco", &ipco);
+            let meta = [vec![0; 4], boxed(b"hdlr", b"pict"), boxed(b"iprp", &iprp)].concat();
+            [
+                boxed(b"ftyp", b"avif"),
+                boxed(b"meta", &meta),
+                boxed(b"mdat", &[1, 2, 3]),
+            ]
+            .concat()
+        };
+        let nclx = |primaries: u8, transfer: u8| {
+            let codes = [0, primaries, 0, transfer, 0, 6, 0x80];
+            boxed(b"colr", &[b"nclx".as_slice(), &codes].concat())
+        };
+        let icc = |kind: &[u8; 4]| boxed(b"colr", &[kind.as_slice(), b"ICC-BYTES"].concat());
+        let embedded = Some(ColorProfile::Icc(b"ICC-BYTES".to_vec()));
+
+        assert_eq!(avif_color_profile(&avif(&[])), None);
+        assert_eq!(
+            avif_color_profile(&avif(&[nclx(12, 13)])),
+            Some(ColorProfile::Cicp {
+                primaries: 12,
+                transfer: 13
+            })
+        );
+        assert_eq!(avif_color_profile(&avif(&[icc(b"prof")])), embedded);
+        assert_eq!(avif_color_profile(&avif(&[icc(b"rICC")])), embedded);
+        // An ICC profile wins over code points, whichever comes first.
+        assert_eq!(
+            avif_color_profile(&avif(&[nclx(1, 13), icc(b"prof")])),
+            embedded
+        );
+        // Truncated or foreign data is simply "no profile".
+        assert_eq!(avif_color_profile(&avif(&[boxed(b"colr", b"nc")])), None);
+        assert_eq!(
+            avif_color_profile(&avif(&[boxed(b"colr", b"nclx\0")])),
+            None
+        );
+        assert_eq!(avif_color_profile(b"not an avif file"), None);
+        // This crate's own AVIF output carries no colr box.
+        let own = load_image().to_avif(80, 10).unwrap();
+        assert_eq!(avif_color_profile(&own), None);
     }
     #[test]
     #[cfg(feature = "jxl")]

@@ -276,7 +276,7 @@ let result = run_with_options(ProcessImage::default(), tasks, &options).await?;
 
 `allow_private_hosts: false` keeps a user-supplied URL from reaching the internal network (SSRF): loopback, private, link-local (cloud metadata) and other non-public addresses are refused — for IP-literal hosts, for every address a hostname resolves to (the connection is made to the vetted addresses only, so DNS rebinding doesn't get around it) and on each redirect hop. Proxy settings from the environment are ignored in this mode, and behind a fake-IP DNS proxy (which resolves every name into `198.18.0.0/15`) all hostnames are refused.
 
-Decoding also refuses images whose pixel buffer would exceed 512 MB (checked from the header before allocating, including AVIF and JPEG XL), and images with an embedded ICC profile (e.g. Display P3 phone photos) are converted to sRGB on load so colors stay correct after re-encoding.
+Decoding also refuses images whose pixel buffer would exceed 512 MB (checked from the header before allocating, including AVIF and JPEG XL), and images with an embedded ICC profile (e.g. Display P3 phone photos) are converted to sRGB on load so colors stay correct after re-encoding. That covers JPEG, PNG, WebP, JPEG XL and AVIF — for AVIF also the CICP color description of its `colr` box (HDR transfer curves are left as they are).
 
 The processors are CPU-bound. On an async server, either enable the `tokio` feature — on a multi-threaded tokio runtime the decode / encode / diff steps then run through `block_in_place`, so awaiting a pipeline doesn't stall the worker's other tasks — or run the pipeline via your runtime's blocking facility (e.g. `tokio::task::spawn_blocking`).
 

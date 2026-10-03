@@ -271,7 +271,7 @@ let result = run_with_options(ProcessImage::default(), tasks, &options).await?;
 
 `allow_private_hosts: false` 可防止用户提交的 URL 访问内网（SSRF）：回环、私有、链路本地（云厂商元数据服务）等非公网地址都会被拒绝——包括 URL 中直接写的 IP、域名解析出的每一个地址（只连接校验过的地址，DNS rebinding 无法绕过），以及每一跳重定向。此模式下会忽略环境变量中的代理设置；若 DNS 前有 fake-IP 代理（把所有域名解析到 `198.18.0.0/15`），所有域名都会被拒绝。
 
-解码时会拒绝像素缓冲超过 512 MB 的图片（在分配内存前根据文件头判断，AVIF 与 JPEG XL 同样生效）；带嵌入 ICC 配置文件的图片（如手机拍摄的 Display P3 照片）会在加载时转换为 sRGB，重新编码后颜色保持正确。
+解码时会拒绝像素缓冲超过 512 MB 的图片（在分配内存前根据文件头判断，AVIF 与 JPEG XL 同样生效）；带嵌入 ICC 配置文件的图片（如手机拍摄的 Display P3 照片）会在加载时转换为 sRGB，重新编码后颜色保持正确。JPEG、PNG、WebP、JPEG XL 和 AVIF 均支持——AVIF 还会读取 `colr` box 中的 CICP 色彩描述（HDR 传递曲线保持原样，不做转换）。
 
 各处理器均为 CPU 密集型。在异步服务中，可以开启 `tokio` 特性——在 tokio 多线程运行时下，解码 / 编码 / diff 步骤会通过 `block_in_place` 执行，await 流水线时不会卡住该 worker 上的其他任务——或者通过运行时的阻塞接口（如 `tokio::task::spawn_blocking`）执行流水线。
 
