@@ -3769,7 +3769,9 @@ mod tests {
                 .unwrap();
         assert_eq!(result.ext, "webp");
         assert_ne!(result.buffer.len(), 0);
-        assert!(result.buffer.len() < lossless.buffer.len());
+        // A lossy VP8 bitstream. Sizes aren't compared: on this flat logo libwebp's lossless
+        // output is the smaller file.
+        assert!(result.buffer.windows(4).any(|w| w == b"VP8 "));
         assert!(result.get_diff() >= 0.0);
 
         let result =

@@ -1,7 +1,6 @@
 use avif_decode::Decoder;
 use image::codecs::avif;
 use image::codecs::gif;
-use image::codecs::webp::WebPEncoder;
 use image::{AnimationDecoder, DynamicImage, ImageEncoder, ImageFormat, RgbaImage};
 use lodepng::Bitmap;
 use rayon::prelude::*;
@@ -457,27 +456,28 @@ impl ImageInfo {
         let width = self.image.width();
         let height = self.image.height();
         // Opaque images encode as RGB so no useless alpha plane is written (smaller, faster).
-        let (bytes, color) = if self.opaque {
-            (self.rgb_bytes(), image::ColorType::Rgb8)
+        let bytes = if self.opaque {
+            self.rgb_bytes()
         } else {
-            (self.rgba_bytes(), image::ColorType::Rgba8)
+            self.rgba_bytes()
         };
-        if quality >= 100 {
-            let mut w = Vec::new();
-            WebPEncoder::new_lossless(&mut w)
-                .encode(bytes.as_ref(), width, height, color.into())
-                .context(ImageSnafu {
-                    category: "webp_encode",
-                })?;
-            Ok(w)
+        let encoder = if self.opaque {
+            Encoder::from_rgb(bytes.as_ref(), width, height)
         } else {
-            let encoder = if self.opaque {
-                Encoder::from_rgb(bytes.as_ref(), width, height)
-            } else {
-                Encoder::from_rgba(bytes.as_ref(), width, height)
-            };
-            Ok(encoder.encode(quality as f32).to_vec())
-        }
+            Encoder::from_rgba(bytes.as_ref(), width, height)
+        };
+        // Lossless also goes through libwebp: its encoder compresses 25–45% smaller than
+        // the pure-Rust image-webp one, at a higher CPU cost. For lossless, `quality` is the
+        // effort setting (75 = libwebp's default).
+        let lossless = quality >= 100;
+        let effort = if lossless { 75.0 } else { quality as f32 };
+        let data = encoder
+            .encode_simple(lossless, effort)
+            .map_err(|e| ImageError::Encode {
+                category: "webp_encode".to_string(),
+                message: format!("{e:?}"),
+            })?;
+        Ok(data.to_vec())
     }
 
     /// Optimize image to avif.
@@ -607,10 +607,14 @@ mod tests {
         let lossless = img.to_webp(100).unwrap();
         let decoded = assert_decodes(&lossless);
         assert_eq!(decoded.to_rgba8(), img.image.to_rgba8());
-        // lossy: smaller than lossless
+        // lossy: a VP8 (not VP8L) bitstream. Neither size nor pixels tell the two apart on
+        // this black-only logo: libwebp's lossless output is the smaller file, and lossy
+        // VP8 happens to reproduce it exactly.
         let lossy = img.to_webp(80).unwrap();
         assert_decodes(&lossy);
-        assert!(lossy.len() < lossless.len());
+        let has_chunk = |buf: &[u8], id: &[u8]| buf.windows(4).any(|w| w == id);
+        assert!(has_chunk(&lossless, b"VP8L") && !has_chunk(&lossless, b"VP8 "));
+        assert!(has_chunk(&lossy, b"VP8 ") && !has_chunk(&lossy, b"VP8L"));
     }
     #[test]
     fn test_to_jpeg() {
