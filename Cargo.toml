@@ -30,18 +30,23 @@ required-features = ["bin"]
 default = ["network", "jxl"]
 bin = [
     "clap",
+    "tokio",
     "tokio/fs",
     "tokio/macros",
-    "tokio/rt-multi-thread",
     "tokio/sync",
     "glob",
     "nu-ansi-term",
     "num_cpus",
 ]
+# Cooperate with a multi-threaded tokio runtime: the CPU-heavy decode / encode / diff steps
+# run through `block_in_place`, so awaiting a pipeline doesn't stall the worker's other
+# tasks. Off by default; the CLI turns it on.
+tokio = ["dep:tokio", "tokio/rt-multi-thread"]
 # HTTP/base64 image loading (pulls reqwest + a TLS stack, ~2MB). Opt out with
-# default-features = false to ship a file://-only build. tokio (already a reqwest
-# dependency) runs the DNS lookups of the public-hosts-only mode off the async threads.
-network = ["reqwest", "tokio"]
+# default-features = false to ship a file://-only build. The tokio dependency (already
+# pulled in by reqwest) runs the DNS lookups of the public-hosts-only mode off the async
+# threads; it does not enable the `tokio` feature above.
+network = ["reqwest", "dep:tokio"]
 # JPEG XL encode/decode via the vendored libjxl (~1MB). Opt out to drop it.
 jxl = ["jpegxl-rs"]
 

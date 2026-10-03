@@ -278,7 +278,7 @@ let result = run_with_options(ProcessImage::default(), tasks, &options).await?;
 
 Decoding also refuses images whose pixel buffer would exceed 512 MB (checked from the header before allocating, including AVIF and JPEG XL), and images with an embedded ICC profile (e.g. Display P3 phone photos) are converted to sRGB on load so colors stay correct after re-encoding.
 
-The processors are CPU-bound; on an async server, run the pipeline via your runtime's blocking facility (e.g. `tokio::task::spawn_blocking`) so encoding doesn't stall other tasks.
+The processors are CPU-bound. On an async server, either enable the `tokio` feature — on a multi-threaded tokio runtime the decode / encode / diff steps then run through `block_in_place`, so awaiting a pipeline doesn't stall the worker's other tasks — or run the pipeline via your runtime's blocking facility (e.g. `tokio::task::spawn_blocking`).
 
 ### Available tasks
 
@@ -331,7 +331,8 @@ Watermark positions: `leftTop`, `top`, `rightTop`, `left`, `center`, `right`, `l
 |---------|---------|----------|-------------|
 | `network` | ✅ | `reqwest` + a TLS stack | HTTP/base64 image loading (the `load` task's `http(s)://` URLs). |
 | `jxl` | ✅ | vendored libjxl | JPEG XL encode/decode. |
-| `bin` | — | clap, tokio, glob | Builds the CLI binary. |
+| `tokio` | — | tokio's multi-thread runtime | Runs the CPU-heavy decode / encode / diff steps through `block_in_place` when called on a multi-threaded tokio runtime. |
+| `bin` | — | clap, glob, the `tokio` feature | Builds the CLI binary. |
 
 `network` and `jxl` are each backed by a large C library, so they dominate the binary
 size. They are **on by default** (existing behaviour is unchanged), but dropping them with

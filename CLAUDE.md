@@ -59,8 +59,11 @@ Each format in `images.rs` converts an `ImageInfo` (normalized RGBA buffer) to b
 
 ```toml
 [features]
-default = []
-bin = ["clap", "tokio", "glob", "nu-ansi-term"]
+default = ["network", "jxl"]
+network = ["reqwest", "dep:tokio"]   # HTTP image loading
+jxl = ["jpegxl-rs"]                  # JPEG XL encode/decode (vendored libjxl)
+tokio = ["dep:tokio", "tokio/rt-multi-thread"]  # block_in_place for CPU-heavy steps
+bin = ["clap", "tokio", "tokio/fs", "tokio/macros", "tokio/sync", "glob", "nu-ansi-term", "num_cpus"]
 ```
 
-The library itself has no async runtime dependency; `tokio` is only pulled in for the CLI.
+The `tokio` feature makes the decode / encode / diff steps cooperate with a multi-threaded tokio runtime (`run_blocking`); the CLI enables it. Without it the library only uses tokio (under `network`) for DNS lookups in the public-hosts-only HTTP mode.

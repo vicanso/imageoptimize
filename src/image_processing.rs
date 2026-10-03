@@ -1056,7 +1056,7 @@ pub async fn run_tasks(
                     .await?
             }
             Task::Diff => {
-                image.diff = image.get_diff();
+                image.diff = run_blocking(|| image.get_diff());
                 image.original = None;
                 image
             }
@@ -1556,10 +1556,11 @@ fn decode_to_di(buffer: &[u8], ext: &str) -> Result<DynamicImage> {
     }
 }
 
-/// Run CPU-heavy work. Inside a multi-threaded Tokio runtime (the CLI) it goes through
-/// `block_in_place` so other async tasks keep progressing; anywhere else — no runtime, or a
-/// current-thread runtime, where `block_in_place` would panic — it simply runs inline.
-#[cfg(feature = "bin")]
+/// Run CPU-heavy work (decoding, encoding, scoring). With the `tokio` feature, inside a
+/// multi-threaded Tokio runtime it goes through `block_in_place` so the worker's other
+/// tasks keep progressing; anywhere else — no runtime, or a current-thread runtime, where
+/// `block_in_place` would panic — it simply runs inline.
+#[cfg(feature = "tokio")]
 fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
     use tokio::runtime::{Handle, RuntimeFlavor};
     match Handle::try_current() {
@@ -1570,15 +1571,15 @@ fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-#[cfg(not(feature = "bin"))]
+#[cfg(not(feature = "tokio"))]
 fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
 /// Pipeline step. The processors are CPU-bound; `async` only matters for loading over
-/// HTTP. Library users on an async server should run a pipeline through their runtime's
-/// blocking facility (e.g. `tokio::task::spawn_blocking` + `block_on`) so encoding doesn't
-/// stall other tasks.
+/// HTTP. Library users on an async server should either enable the `tokio` feature (see
+/// `run_blocking`) or run a pipeline through their runtime's blocking facility (e.g.
+/// `tokio::task::spawn_blocking` + `block_on`), so encoding doesn't stall other tasks.
 #[allow(async_fn_in_trait)]
 pub trait Process {
     async fn process(&self, pi: ProcessImage) -> Result<ProcessImage>;
@@ -1708,7 +1709,7 @@ impl LoaderProcess {
                 .decode(data.as_bytes())
                 .context(Base64DecodeSnafu {})?
         };
-        ProcessImage::new_impl(original_data, &ext, self.keep_original)
+        run_blocking(|| ProcessImage::new_impl(original_data, &ext, self.keep_original))
     }
 }
 
@@ -3012,7 +3013,7 @@ impl Process for OptimProcess {
             // lossy output. Skip when original is None (no diff task in pipeline) since
             // the round-trip — especially for AVIF — is expensive and serves no purpose.
             if img.support_dssim() && img.original.is_some() {
-                img.di = decode_to_di(&img.buffer, &img.ext).unwrap_or(info_image);
+                img.di = run_blocking(|| decode_to_di(&img.buffer, &img.ext)).unwrap_or(info_image);
             } else {
                 img.di = info_image;
             }
@@ -4572,6 +4573,39 @@ mod tests {
             let resized = tokio_test::block_on(ResizeProcess::new(72, 0).process(jxl)).unwrap();
             let buf = resized.get_buffer().unwrap();
             assert_eq!(super::jxl_dimensions(&buf), Some((72, 72)));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tokio")]
+    fn test_pipeline_on_tokio_runtimes() {
+        use super::{new_diff_task, new_optim_task, run};
+        let data = general_purpose::STANDARD.encode(include_bytes!("../assets/rust-logo.png"));
+        let tasks = || {
+            vec![
+                vec!["load".to_string(), data.clone(), "png".to_string()],
+                new_optim_task("webp", 80, 0),
+                new_diff_task(),
+            ]
+        };
+        // Multi-threaded runtime: decode / encode / diff go through block_in_place, both on
+        // a worker thread (a spawned task) and on the thread driving block_on.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let spawned = rt
+            .block_on(async { tokio::spawn(run(tasks())).await.unwrap() })
+            .unwrap();
+        let direct = rt.block_on(run(tasks())).unwrap();
+        // Current-thread runtime: block_in_place would panic there, so the work runs inline.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let inline = rt.block_on(run(tasks())).unwrap();
+        for result in [spawned, direct, inline] {
+            assert_eq!(result.ext, "webp");
+            assert!(result.diff >= 0.0);
         }
     }
 

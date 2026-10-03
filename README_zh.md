@@ -273,7 +273,7 @@ let result = run_with_options(ProcessImage::default(), tasks, &options).await?;
 
 解码时会拒绝像素缓冲超过 512 MB 的图片（在分配内存前根据文件头判断，AVIF 与 JPEG XL 同样生效）；带嵌入 ICC 配置文件的图片（如手机拍摄的 Display P3 照片）会在加载时转换为 sRGB，重新编码后颜色保持正确。
 
-各处理器均为 CPU 密集型；在异步服务中请通过运行时的阻塞接口（如 `tokio::task::spawn_blocking`）执行流水线，避免编码阻塞其他任务。
+各处理器均为 CPU 密集型。在异步服务中，可以开启 `tokio` 特性——在 tokio 多线程运行时下，解码 / 编码 / diff 步骤会通过 `block_in_place` 执行，await 流水线时不会卡住该 worker 上的其他任务——或者通过运行时的阻塞接口（如 `tokio::task::spawn_blocking`）执行流水线。
 
 ### 可用任务
 
@@ -326,7 +326,8 @@ let result = run_with_options(ProcessImage::default(), tasks, &options).await?;
 |---------|------|------|------|
 | `network` | ✅ | `reqwest` + 一套 TLS | HTTP/base64 图片加载（`load` 任务的 `http(s)://` URL）。 |
 | `jxl` | ✅ | vendored libjxl | JPEG XL 编解码。 |
-| `bin` | — | clap、tokio、glob | 构建 CLI 可执行文件。 |
+| `tokio` | — | tokio 多线程运行时 | 在 tokio 多线程运行时中调用时，通过 `block_in_place` 执行 CPU 密集的解码 / 编码 / diff 步骤。 |
+| `bin` | — | clap、glob、`tokio` 特性 | 构建 CLI 可执行文件。 |
 
 `network` 和 `jxl` 各自背后是一个大型 C 库，体积占比很高。二者**默认开启**（行为不变），
 但用 `default-features = false` 关掉后可得到仅 `file://`、无 JXL 的构建，**体积小约 42%**：
