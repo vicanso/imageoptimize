@@ -1181,16 +1181,24 @@ impl ProcessImage {
         })
     }
     pub fn get_buffer(&self) -> Result<Cow<'_, [u8]>> {
-        if self.buffer.is_empty() {
-            let mut bytes: Vec<u8> = Vec::new();
-            let format = ImageFormat::from_extension(&self.ext).unwrap_or(ImageFormat::Jpeg);
-            self.di
-                .write_to(&mut Cursor::new(&mut bytes), format)
-                .context(ImageSnafu {})?;
-            Ok(Cow::Owned(bytes))
-        } else {
-            Ok(Cow::Borrowed(&self.buffer))
+        if !self.buffer.is_empty() {
+            return Ok(Cow::Borrowed(&self.buffer));
         }
+        // The pixels changed since loading, so there are no encoded bytes: encode them in the
+        // image's own format with default settings.
+        if self.ext == IMAGE_TYPE_JXL {
+            // Not an `image` format: it would otherwise fall through to JPEG below.
+            const DEFAULT_JXL_QUALITY: u8 = 90;
+            let info: ImageInfo = self.di.clone().into();
+            let bytes = info.to_jxl(DEFAULT_JXL_QUALITY).context(ImagesSnafu {})?;
+            return Ok(Cow::Owned(bytes));
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        let format = ImageFormat::from_extension(&self.ext).unwrap_or(ImageFormat::Jpeg);
+        self.di
+            .write_to(&mut Cursor::new(&mut bytes), format)
+            .context(ImageSnafu {})?;
+        Ok(Cow::Owned(bytes))
     }
     pub fn get_size(&self) -> (u32, u32) {
         (self.di.width(), self.di.height())
@@ -4067,6 +4075,31 @@ mod tests {
                 .unwrap();
         assert!(result.diff >= 0.0, "diff was not computed: {}", result.diff);
         assert!(result.diff <= target);
+    }
+
+    #[test]
+    fn test_get_buffer_without_encoded_bytes() {
+        // After a pixel edit there is no encoded buffer: get_buffer encodes the pixels in the
+        // image's own format.
+        let info: crate::ImageInfo = new_process_image().di.into();
+
+        // A JPEG that gained transparency still encodes (JPEG has no alpha: it is flattened).
+        let jpeg = ProcessImage::new(info.to_mozjpeg(90).unwrap(), "jpeg").unwrap();
+        let padded = tokio_test::block_on(PaddingProcess::new(200, 200, "").process(jpeg)).unwrap();
+        assert!(padded.di.color().has_alpha());
+        let buf = padded.get_buffer().unwrap();
+        assert_eq!(image::guess_format(&buf).unwrap(), image::ImageFormat::Jpeg);
+        let decoded = image::load_from_memory(&buf).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (200, 200));
+
+        // A JXL stays a JXL (it used to come back as JPEG bytes under the "jxl" extension).
+        #[cfg(feature = "jxl")]
+        {
+            let jxl = ProcessImage::new(info.to_jxl(90).unwrap(), "jxl").unwrap();
+            let resized = tokio_test::block_on(ResizeProcess::new(72, 0).process(jxl)).unwrap();
+            let buf = resized.get_buffer().unwrap();
+            assert_eq!(super::jxl_dimensions(&buf), Some((72, 72)));
+        }
     }
 
     #[test]
