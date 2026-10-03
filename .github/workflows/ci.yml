@@ -16,5 +16,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/setup-nasm@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      # The CLI only builds with the `bin` feature, and the slim build drops the default
+      # `network` / `jxl` features: lint both so neither configuration rots.
+      - name: Lint
+        run: |
+          cargo clippy --all-targets --features bin -- -D warnings
+          cargo clippy --all-targets --no-default-features --features bin -- -D warnings
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --features bin --verbose
+      - name: Run tests without default features
+        run: cargo test --no-default-features
