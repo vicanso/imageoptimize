@@ -78,7 +78,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--strip-exif` | false | 从输出文件中移除 EXIF 与 XMP 元数据（含 GPS 定位），无需重新编码（JPEG、PNG、WebP、JPEG XL） |
 | `--avif-speed <N>` | 4 | AVIF 编码速度（0 = 最慢/最佳质量，10 = 最快/较低质量） |
 | `--incremental` | false | 跳过所有输出文件均比源文件新的图片（仅适用于 `--output` 模式）。支持 `--auto-format`（任一候选扩展名的输出均算数）和 `--widths` / `--densities`（所有应生成的变体都需是最新的） |
-| `--no-diff` | false | 跳过 DSSIM 评分；避免为算分而二次解码 AVIF/JXL（DIFF 列显示 `—`） |
+| `--no-diff` | false | 跳过 DSSIM 评分；避免为算分而二次解码 AVIF/JXL（DIFF 列显示 `—`）。同时省下评分的内存：每像素约 150 字节，CLI 会把同时进行的评分控制在 4 GB 预算内（超过 16 线程时按比例增加） |
 | `--widths <W1,W2,...>` | — | 按宽度生成响应式 `srcset` 的 `Nw` 描述符（流式图，如 `320,640,1280`）。宽度 ≥ 源宽的会被跳过（不放大）；设置后忽略 `--resize`。与 `--densities` 互斥 |
 | `--densities <D1,D2,...>` | — | 按像素密度生成 `srcset` 的 `Nx` 描述符（固定尺寸图，如 `1,2,3`）。需配合 `--base-width`，每份输出为 base-width × 倍率 像素；宽度 ≥ 源宽的倍率会被跳过。与 `--widths` 互斥 |
 | `--base-width <W>` | — | `--densities` 的 1× 显示宽度（CSS px），输出尺寸 = base-width × 倍率 |

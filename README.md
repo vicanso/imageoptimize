@@ -79,7 +79,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--strip-exif` | false | Strip EXIF and XMP metadata (including GPS) from output files without re-encoding (JPEG, PNG, WebP, JPEG XL) |
 | `--avif-speed <N>` | 4 | AVIF encoder speed (0 = slowest/best quality, 10 = fastest/lower quality) |
 | `--incremental` | false | Skip images whose every output file is already newer than the source; only applies with `--output`. Understands `--auto-format` (any candidate extension counts) and `--widths` / `--densities` (every expected variant must be fresh) |
-| `--no-diff` | false | Skip the DSSIM diff metric; avoids re-decoding AVIF/JXL output just to score it (DIFF column shows `—`) |
+| `--no-diff` | false | Skip the DSSIM diff metric; avoids re-decoding AVIF/JXL output just to score it (DIFF column shows `—`). Also saves its memory: scoring takes about 150 bytes per pixel, which the CLI keeps within a 4 GB budget across concurrent images (more beyond 16 threads) |
 | `--widths <W1,W2,...>` | — | Generate one output per width for responsive `srcset` `Nw` descriptors (fluid images), e.g. `320,640,1280`. Widths ≥ the source width are skipped (no upscaling); `--resize` is ignored when set. Mutually exclusive with `--densities` |
 | `--densities <D1,D2,...>` | — | Generate one output per pixel density for `srcset` `Nx` descriptors (fixed-size images), e.g. `1,2,3`. Requires `--base-width`; each output is base-width × density pixels. Densities whose width ≥ the source are skipped. Mutually exclusive with `--widths` |
 | `--base-width <W>` | — | The 1× display width (CSS px) for `--densities`; outputs are base-width × density |
