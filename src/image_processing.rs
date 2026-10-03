@@ -11,7 +11,6 @@ use fast_image_resize::{FilterType as FirFilter, PixelType, ResizeAlg, ResizeOpt
 use image::imageops::overlay;
 use image::metadata::Orientation;
 use image::{load, DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbImage, RgbaImage};
-use img_parts::ImageEXIF;
 use rayon::prelude::*;
 use rgb::FromSlice;
 use snafu::{ensure, ResultExt, Snafu};
@@ -232,44 +231,105 @@ pub fn new_blur_task(sigma: f32) -> Vec<String> {
     vec![PROCESS_BLUR.to_string(), sigma.to_string()]
 }
 
-/// Strip EXIF metadata (including GPS) from the encoded buffer without re-encoding.
+/// Strip EXIF and XMP metadata (including GPS) from the encoded buffer without re-encoding.
 /// Supports JPEG, PNG, WebP and JPEG XL. Other formats are returned unchanged.
 pub fn new_strip_task() -> Vec<String> {
     vec![PROCESS_STRIP.to_string()]
 }
 
-/// Strip EXIF metadata from raw image bytes without re-encoding.
-/// `ext` is the format extension (`"jpeg"`, `"jpg"`, `"png"`, `"webp"`, `"jxl"`).
-/// For JPEG XL, XMP and the JPEG reconstruction data go too (see `strip_jxl_metadata`).
-/// Formats that are not supported are returned unchanged.
+/// Strip EXIF and XMP metadata — either can carry GPS coordinates — from raw image bytes
+/// without re-encoding. `ext` is the format extension (`"jpeg"`, `"jpg"`, `"png"`, `"webp"`,
+/// `"jxl"`). For JPEG XL the JPEG reconstruction data goes too (see `strip_jxl_metadata`).
+/// Unsupported formats, and files carrying no such metadata, are returned unchanged.
 pub fn strip_exif_bytes(data: Vec<u8>, ext: &str) -> Vec<u8> {
     let b = Bytes::from(data);
     let stripped: Option<Bytes> = match ext {
-        "jpeg" | "jpg" => img_parts::jpeg::Jpeg::from_bytes(b.clone())
-            .ok()
-            .and_then(|mut img| {
-                img.exif()?;
-                img.set_exif(None);
-                Some(img.encoder().bytes())
-            }),
-        "png" => img_parts::png::Png::from_bytes(b.clone())
-            .ok()
-            .and_then(|mut img| {
-                img.exif()?;
-                img.set_exif(None);
-                Some(img.encoder().bytes())
-            }),
-        "webp" => img_parts::webp::WebP::from_bytes(b.clone())
-            .ok()
-            .and_then(|mut img| {
-                img.exif()?;
-                img.set_exif(None);
-                Some(img.encoder().bytes())
-            }),
+        "jpeg" | "jpg" => strip_jpeg_metadata(b.clone()),
+        "png" => strip_png_metadata(b.clone()),
+        "webp" => strip_webp_metadata(&b).map(Bytes::from),
         "jxl" => strip_jxl_metadata(&b).map(Bytes::from),
         _ => None,
     };
-    stripped.unwrap_or(b).to_vec()
+    stripped.unwrap_or(b).into()
+}
+
+/// Drop the APP1 segments holding EXIF, XMP or extended XMP. `None` when there are none.
+fn strip_jpeg_metadata(data: Bytes) -> Option<Bytes> {
+    use img_parts::jpeg::{markers, Jpeg};
+    const PREFIXES: [&[u8]; 3] = [
+        b"Exif\0\0",
+        b"http://ns.adobe.com/xap/1.0/\0",
+        b"http://ns.adobe.com/xmp/extension/\0",
+    ];
+    let mut img = Jpeg::from_bytes(data).ok()?;
+    let count = img.segments().len();
+    img.segments_mut().retain(|s| {
+        s.marker() != markers::APP1 || !PREFIXES.iter().any(|p| s.contents().starts_with(p))
+    });
+    (img.segments().len() < count).then(|| img.encoder().bytes())
+}
+
+/// Drop the `eXIf` chunk and the text chunks holding XMP, or EXIF / XMP in ImageMagick's
+/// "raw profile" form. Other text chunks are kept. `None` when there are none.
+fn strip_png_metadata(data: Bytes) -> Option<Bytes> {
+    const KEYWORDS: [&[u8]; 4] = [
+        b"XML:com.adobe.xmp",
+        b"Raw profile type exif",
+        b"Raw profile type APP1",
+        b"Raw profile type xmp",
+    ];
+    let mut img = img_parts::png::Png::from_bytes(data).ok()?;
+    let count = img.chunks().len();
+    img.chunks_mut().retain(|c| match &c.kind() {
+        b"eXIf" => false,
+        b"iTXt" | b"tEXt" | b"zTXt" => {
+            // A text chunk starts with its NUL-terminated keyword.
+            let keyword = c.contents().split(|&b| b == 0).next().unwrap_or_default();
+            !KEYWORDS.contains(&keyword)
+        }
+        _ => true,
+    });
+    (img.chunks().len() < count).then(|| img.encoder().bytes())
+}
+
+/// Drop the `EXIF` and `XMP ` chunks of a WebP and clear their flags in the `VP8X` header.
+/// The header itself stays: the alpha plane and animation frames of an extended file depend
+/// on it. `None` when there are none.
+fn strip_webp_metadata(data: &[u8]) -> Option<Vec<u8>> {
+    const EXIF_FLAG: u8 = 0x08;
+    const XMP_FLAG: u8 = 0x04;
+    if data.len() < 12 || &data[..4] != b"RIFF" || &data[8..12] != b"WEBP" {
+        return None;
+    }
+    let mut out = data[..12].to_vec();
+    let mut rest = &data[12..];
+    let mut removed = false;
+    while rest.len() >= 8 {
+        let size = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
+        // Chunks are padded to an even length.
+        let end = 8usize
+            .saturating_add(size)
+            .saturating_add(size & 1)
+            .min(rest.len());
+        match &rest[..4] {
+            b"EXIF" | b"XMP " => removed = true,
+            id => {
+                let start = out.len();
+                out.extend_from_slice(&rest[..end]);
+                if id == b"VP8X" && end > 8 {
+                    out[start + 8] &= !(EXIF_FLAG | XMP_FLAG);
+                }
+            }
+        }
+        rest = &rest[end..];
+    }
+    if !removed {
+        return None;
+    }
+    out.extend_from_slice(rest);
+    let riff_size = u32::try_from(out.len() - 8).ok()?;
+    out[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    Some(out)
 }
 
 /// Resize to fit within `max_width × max_height`, preserving aspect ratio.
@@ -3549,6 +3609,110 @@ mod tests {
         empty.buffer.clear();
         let result = tokio_test::block_on(StripProcess::new().process(empty)).unwrap();
         assert!(result.buffer.is_empty());
+    }
+
+    /// A minimal EXIF payload: little-endian TIFF header with an empty IFD.
+    const TEST_EXIF: &[u8] = b"II*\0\x08\0\0\0\0\0\0\0\0\0";
+    const TEST_XMP: &[u8] = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>";
+
+    #[test]
+    fn test_strip_jpeg_exif_and_xmp() {
+        use crate::image_processing::strip_exif_bytes;
+        use img_parts::jpeg::{markers, Jpeg, JpegSegment};
+        use img_parts::{Bytes, ImageEXIF};
+
+        let info: crate::ImageInfo = new_process_image().di.into();
+        let mut jpeg = Jpeg::from_bytes(info.to_mozjpeg(90).unwrap().into()).unwrap();
+        jpeg.set_exif(Some(Bytes::from_static(TEST_EXIF)));
+        let xmp = [b"http://ns.adobe.com/xap/1.0/\0".as_slice(), TEST_XMP].concat();
+        jpeg.segments_mut()
+            .insert(1, JpegSegment::new_with_contents(markers::APP1, xmp.into()));
+        let tagged = jpeg.encoder().bytes().to_vec();
+
+        let stripped = strip_exif_bytes(tagged.clone(), "jpeg");
+        assert!(stripped.len() < tagged.len());
+        let parts = Jpeg::from_bytes(stripped.clone().into()).unwrap();
+        assert!(parts.exif().is_none());
+        assert!(parts.segments().iter().all(|s| s.marker() != markers::APP1));
+        let decoded = image::load_from_memory(&stripped).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (144, 144));
+        // Nothing left to strip: the bytes come back untouched.
+        assert_eq!(strip_exif_bytes(stripped.clone(), "jpg"), stripped);
+    }
+
+    #[test]
+    fn test_strip_png_exif_and_xmp() {
+        use crate::image_processing::strip_exif_bytes;
+        use img_parts::png::{Png, PngChunk};
+        use img_parts::Bytes;
+
+        let data = include_bytes!("../assets/rust-logo.png");
+        let mut png = Png::from_bytes(Bytes::from_static(data)).unwrap();
+        let text = |keyword: &str, body: &[u8]| [keyword.as_bytes(), b"\0", body].concat();
+        for (kind, contents) in [
+            (*b"eXIf", TEST_EXIF.to_vec()),
+            // iTXt: keyword, NUL, compression flag + method, empty language and translation.
+            (
+                *b"iTXt",
+                text("XML:com.adobe.xmp", &[b"\0\0\0\0", TEST_XMP].concat()),
+            ),
+            // ImageMagick's hex-dump form of an EXIF block.
+            (
+                *b"tEXt",
+                text("Raw profile type exif", b"\nexif\n       0\n"),
+            ),
+            (*b"tEXt", text("Comment", b"kept")),
+        ] {
+            png.chunks_mut()
+                .insert(1, PngChunk::new(kind, contents.into()));
+        }
+        let tagged = png.encoder().bytes().to_vec();
+
+        let stripped = strip_exif_bytes(tagged.clone(), "png");
+        assert!(stripped.len() < tagged.len());
+        let parts = Png::from_bytes(stripped.clone().into()).unwrap();
+        assert!(parts.chunk_by_type(*b"eXIf").is_none());
+        assert!(parts.chunk_by_type(*b"iTXt").is_none());
+        // Only the unrelated text chunk survives.
+        let texts: Vec<_> = parts.chunks_by_type(*b"tEXt").collect();
+        assert_eq!(texts.len(), 1);
+        assert!(texts[0].contents().starts_with(b"Comment\0"));
+        assert_eq!(
+            image::load_from_memory(&stripped).unwrap().to_rgba8(),
+            image::load_from_memory(data).unwrap().to_rgba8()
+        );
+    }
+
+    #[test]
+    fn test_strip_webp_keeps_alpha() {
+        use crate::image_processing::strip_exif_bytes;
+        use img_parts::riff::{RiffChunk, RiffContent};
+        use img_parts::webp::WebP;
+        use img_parts::Bytes;
+
+        // Lossy WebP with alpha: an extended (VP8X) file with ALPH + VP8 chunks.
+        let info: crate::ImageInfo = new_process_image().di.into();
+        let plain = info.to_webp(80).unwrap();
+        let mut webp = WebP::from_bytes(plain.clone().into()).unwrap();
+        assert!(webp.has_chunk(*b"VP8X") && webp.has_chunk(*b"ALPH"));
+        for (id, data) in [(*b"EXIF", TEST_EXIF), (*b"XMP ", TEST_XMP)] {
+            webp.chunks_mut().push(RiffChunk::new(
+                id,
+                RiffContent::Data(Bytes::from_static(data)),
+            ));
+        }
+        let tagged = webp.encoder().bytes().to_vec();
+
+        let stripped = strip_exif_bytes(tagged.clone(), "webp");
+        assert!(stripped.len() < tagged.len());
+        let parts = WebP::from_bytes(stripped.clone().into()).unwrap();
+        assert!(!parts.has_chunk(*b"EXIF") && !parts.has_chunk(*b"XMP "));
+        // The extended header stays — the alpha plane depends on it — and the image is
+        // pixel-for-pixel what it was before the metadata was added.
+        assert!(parts.has_chunk(*b"VP8X") && parts.has_chunk(*b"ALPH"));
+        let decoded = image::load_from_memory(&stripped).unwrap().to_rgba8();
+        assert!(decoded.pixels().any(|p| p.0[3] < 255), "alpha was lost");
+        assert_eq!(decoded, image::load_from_memory(&plain).unwrap().to_rgba8());
     }
 
     #[test]

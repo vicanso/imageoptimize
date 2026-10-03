@@ -347,7 +347,8 @@ struct Args {
     #[arg(long, value_name = "WxH", value_parser = parse_resize)]
     resize: Option<(u32, u32)>,
 
-    /// Strip EXIF metadata (including GPS location) from output files without re-encoding
+    /// Strip EXIF and XMP metadata (including GPS location) from output files without
+    /// re-encoding
     #[arg(long)]
     strip_exif: bool,
 

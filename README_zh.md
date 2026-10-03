@@ -75,7 +75,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--exclude <GLOB>` | — | 排除匹配该 glob 模式的文件（可重复使用） |
 | `-q, --quiet` | false | 仅输出最终汇总，不打印每个文件的处理结果 |
 | `--resize <WxH>` | — | 编码前将超出尺寸的图片缩放至指定范围内，小图不受影响（如 `1920x1080`、`1920x0`） |
-| `--strip-exif` | false | 从输出文件中移除 EXIF 元数据（含 GPS 定位），无需重新编码（JPEG、PNG、WebP、JPEG XL） |
+| `--strip-exif` | false | 从输出文件中移除 EXIF 与 XMP 元数据（含 GPS 定位），无需重新编码（JPEG、PNG、WebP、JPEG XL） |
 | `--avif-speed <N>` | 4 | AVIF 编码速度（0 = 最慢/最佳质量，10 = 最快/较低质量） |
 | `--incremental` | false | 跳过所有输出文件均比源文件新的图片（仅适用于 `--output` 模式）。支持 `--auto-format`（任一候选扩展名的输出均算数）和 `--widths` / `--densities`（所有应生成的变体都需是最新的） |
 | `--no-diff` | false | 跳过 DSSIM 评分；避免为算分而二次解码 AVIF/JXL（DIFF 列显示 `—`） |
@@ -293,7 +293,7 @@ let result = run_with_options(ProcessImage::default(), tasks, &options).await?;
 | `background` | `new_background_task(color)` | 十六进制颜色（`#rrggbb` / `#rrggbbaa`，留空 = 不透明白色） | 将图片叠加到纯色背景上以拍平透明度；在编码为 JPEG/JXL 前使用，避免透明区域变黑 |
 | `normalize` | `new_normalize_task(per_channel)` | 布尔值（`true` = 每通道 RGB，`false` = 亮度通道） | 自动对比度：将直方图拉伸至完整的 0–255 范围 |
 | `trim` | `new_trim_task(tolerance)` | 容差 0–255（与左上角参考色的最大单通道 RGBA 差值） | 自动裁剪四周纯色边框 |
-| `strip` | `new_strip_task()` | — | 从编码后的缓冲区移除 EXIF 元数据，无需重新编码（支持 JPEG、PNG、WebP） |
+| `strip` | `new_strip_task()` | — | 从编码后的缓冲区移除 EXIF 与 XMP 元数据，无需重新编码（支持 JPEG、PNG、WebP、JPEG XL） |
 | `padding` | `new_padding_task(w, h, color)` | 宽度、高度、十六进制颜色（`#rrggbb` / `#rrggbbaa`，默认透明） | 扩展画布并居中图片 |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url、位置、左边距、上边距 | 叠加水印 |
 | `optim` | `new_optim_task(fmt, quality, speed)` | 格式（`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`）、质量 0–100、速度 | 编码并压缩。未经变换的动态 GIF 输出为 `gif` 或 `webp` 时保持动画；经过变换（缩放、裁剪等）或由其他格式转换时，`gif` 输出为单帧。未经变换的 JPEG 以质量 ≥100 输出为 `jxl` 时做无损转码 |
