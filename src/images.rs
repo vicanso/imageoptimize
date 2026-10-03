@@ -232,6 +232,15 @@ pub fn load<R: BufRead + Seek>(r: R, ext: &str) -> Result<ImageInfo> {
     Ok(result.into())
 }
 
+/// The rav1e speed `to_avif` encodes at: 0 selects the default (3), 1–10 are used as given.
+pub(crate) fn avif_speed(speed: u8) -> u8 {
+    if speed == 0 {
+        3
+    } else {
+        speed
+    }
+}
+
 /// The GIF encoder panics outside 1..=30, so map any `speed` (0 included) into range.
 fn gif_speed(speed: u8) -> i32 {
     speed.clamp(1, 30) as i32
@@ -549,7 +558,7 @@ impl ImageInfo {
     /// `quality` accepts a value in the range 0-100, where 0 is the worst and 100 is the best.
     pub fn to_avif(&self, quality: u8, speed: u8) -> Result<Vec<u8>> {
         let mut w = Vec::new();
-        let sp = if speed == 0 { 3 } else { speed };
+        let sp = avif_speed(speed);
         let width = self.image.width();
         let height = self.image.height();
         // Opaque images skip the alpha plane (smaller output, faster encode).

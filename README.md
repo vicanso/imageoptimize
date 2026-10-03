@@ -87,7 +87,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--emit-html` | false | Print a ready-to-paste `<source srcset>` snippet per source (with `--widths` or `--densities`) |
 | `--lqip` | false | Emit a tiny base64 Low-Quality Image Placeholder (`data:` URI) per source for blur-up / progressive loading. Printed as a list, or embedded as an HTML comment under each `--emit-html` snippet. Pairs with `--widths` / `--densities` |
 | `--lqip-width <N>` | 32 | Placeholder width in pixels for `--lqip` (height follows the aspect ratio) |
-| `--auto-quality` | false | Auto-tune quality per output: binary-search the lowest quality whose perceptual diff stays within `--target-diff`. Overrides the per-format quality flags |
+| `--auto-quality` | false | Auto-tune quality per output: binary-search the lowest quality whose perceptual diff stays within `--target-diff`. Overrides the per-format quality flags. AVIF is searched with fast-preset probes and the boundary confirmed at `--avif-speed`, so the result is the same, found faster |
 | `--auto-format` | false | Auto-pick the output format: encode each source once as the smallest of webp/avif plus a lossless fallback (png if it has transparency, else jpeg), each quality-tuned to `--target-diff`. One output per source; ignores `--convert`, and is ignored under `--widths` |
 | `--target-diff <N>` | 1.0 | Perceptual-diff target (DSSIM ×1000) for `--auto-quality` / `--auto-format`; lower = higher fidelity, `1.0` ≈ visually lossless |
 
@@ -302,7 +302,7 @@ The processors are CPU-bound; on an async server, run the pipeline via your runt
 | `padding` | `new_padding_task(w, h, color)` | width, height, hex color (`#rrggbb` / `#rrggbbaa`, default transparent) | Extend canvas, center image |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url, position, margin-left, margin-top | Overlay watermark |
 | `optim` | `new_optim_task(fmt, quality, speed)` | format (`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`), quality 0–100, speed | Encode & compress. An untouched animated GIF stays animated as `gif` or `webp`; after a transform (resize, crop, …) or from another format, `gif` output is a single frame. An untouched JPEG encoded as `jxl` at quality ≥100 is recompressed losslessly |
-| `optim` (auto-quality) | `new_auto_quality_task(fmt, speed, target)` | format, speed, target DSSIM ×1000 | Binary-search the lowest quality whose perceptual diff stays within `target` |
+| `optim` (auto-quality) | `new_auto_quality_task(fmt, speed, target)` | format, speed, target DSSIM ×1000 | Binary-search the lowest quality whose perceptual diff stays within `target` (AVIF: fast-preset probes, boundary confirmed at `speed`) |
 | `optim` (auto-format) | `new_auto_format_task(quality, speed, target)` | quality 0–100, speed, target DSSIM ×1000 | Encode candidate formats (alpha-aware: webp/avif/png or webp/avif/jpeg) and keep the smallest within `target` |
 | `optim` (full auto) | `new_auto_task(speed, target)` | speed, target DSSIM ×1000 | Search both format and quality for the smallest output within `target` |
 | `diff` | `new_diff_task()` | — | Compute DSSIM × 1000 score vs original; stored in `ProcessImage::diff` |

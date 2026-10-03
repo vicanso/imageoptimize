@@ -86,7 +86,7 @@ imageoptimize [OPTIONS] <SOURCE>
 | `--emit-html` | false | 为每个源图打印可直接粘贴的 `<source srcset>` 片段（需配合 `--widths` 或 `--densities`） |
 | `--lqip` | false | 为每个源图输出一个极小的 base64 低质量占位图（LQIP，`data:` URI），用于 blur-up / 渐进加载。以列表形式打印，或作为 HTML 注释嵌入每个 `--emit-html` 片段。可配合 `--widths` / `--densities` |
 | `--lqip-width <N>` | 32 | `--lqip` 占位图的像素宽度（高度按宽高比自动计算） |
-| `--auto-quality` | false | 按输出自动调质量：二分搜索使感知差异保持在 `--target-diff` 内的最低质量；会覆盖各格式的质量参数 |
+| `--auto-quality` | false | 按输出自动调质量：二分搜索使感知差异保持在 `--target-diff` 内的最低质量；会覆盖各格式的质量参数。AVIF 先用最快档位探测，再在 `--avif-speed` 下确认边界，结果不变、速度更快 |
 | `--auto-format` | false | 自动选格式：每个源图只输出一份，取 webp/avif 与无损兜底（含透明用 png，否则 jpeg）中体积最小者，各候选按 `--target-diff` 调质量；忽略 `--convert`，在 `--widths` 下不生效 |
 | `--target-diff <N>` | 1.0 | `--auto-quality` / `--auto-format` 的感知差异目标（DSSIM ×1000），越小保真度越高，`1.0` 约为视觉无损 |
 
@@ -297,7 +297,7 @@ let result = run_with_options(ProcessImage::default(), tasks, &options).await?;
 | `padding` | `new_padding_task(w, h, color)` | 宽度、高度、十六进制颜色（`#rrggbb` / `#rrggbbaa`，默认透明） | 扩展画布并居中图片 |
 | `watermark` | `new_watermark_task(url, pos, ml, mt)` | url、位置、左边距、上边距 | 叠加水印 |
 | `optim` | `new_optim_task(fmt, quality, speed)` | 格式（`jpeg`/`png`/`avif`/`webp`/`gif`/`jxl`）、质量 0–100、速度 | 编码并压缩。未经变换的动态 GIF 输出为 `gif` 或 `webp` 时保持动画；经过变换（缩放、裁剪等）或由其他格式转换时，`gif` 输出为单帧。未经变换的 JPEG 以质量 ≥100 输出为 `jxl` 时做无损转码 |
-| `optim`（自动质量） | `new_auto_quality_task(fmt, speed, target)` | 格式、速度、目标 DSSIM ×1000 | 二分搜索使感知差异保持在 `target` 内的最低质量 |
+| `optim`（自动质量） | `new_auto_quality_task(fmt, speed, target)` | 格式、速度、目标 DSSIM ×1000 | 二分搜索使感知差异保持在 `target` 内的最低质量（AVIF：先用最快档位探测，再在 `speed` 下确认边界） |
 | `optim`（自动格式） | `new_auto_format_task(quality, speed, target)` | 质量 0–100、速度、目标 DSSIM ×1000 | 编码多个候选格式（按是否含透明：webp/avif/png 或 webp/avif/jpeg），保留满足 `target` 的最小者 |
 | `optim`（全自动） | `new_auto_task(speed, target)` | 速度、目标 DSSIM ×1000 | 同时搜索格式与质量，取满足 `target` 的最小输出 |
 | `diff` | `new_diff_task()` | — | 计算 DSSIM × 1000 评分并存入 `ProcessImage::diff` |

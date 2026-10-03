@@ -1,6 +1,6 @@
 use super::images::{
-    avif_decode, gif_to_animated_webp, jpeg_to_jxl, jxl_decode, jxl_dimensions, strip_jxl_metadata,
-    to_gif, ImageError, ImageInfo,
+    avif_decode, avif_speed, gif_to_animated_webp, jpeg_to_jxl, jxl_decode, jxl_dimensions,
+    strip_jxl_metadata, to_gif, ImageError, ImageInfo,
 };
 use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
@@ -62,6 +62,11 @@ const AUTO_TARGET_DIFF: f64 = 1.0;
 /// Quality search bounds for auto-quality tuning.
 const AUTO_MIN_QUALITY: u8 = 30;
 const AUTO_MAX_QUALITY: u8 = 95;
+/// AVIF speed for quality-search probes. rav1e's fastest setting encodes ~5× faster than the
+/// default yet scores within a few hundredths of DSSIM×1000 of slower settings at the same
+/// quality, so it locates the target quality cheaply; the requested speed then only has to
+/// confirm the boundary.
+const AVIF_SEARCH_SPEED: u8 = 10;
 
 #[cfg(feature = "network")]
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -2773,6 +2778,7 @@ impl Process for OptimProcess {
 /// One encoded candidate produced during auto optimisation.
 struct Candidate {
     ext: String,
+    quality: u8,
     buffer: Vec<u8>,
     di: DynamicImage,
     diff: f64,
@@ -2828,53 +2834,38 @@ impl AutoOptimProcess {
         scorer: &DiffScorer,
         ext: &str,
         quality: u8,
+        speed: u8,
     ) -> Result<Candidate> {
-        let buffer = encode_info(info, ext, quality, self.speed)?;
+        let buffer = encode_info(info, ext, quality, speed)?;
         let di = decode_to_di(&buffer, ext)?;
         let diff = scorer.score(&di);
         Ok(Candidate {
             ext: ext.to_string(),
+            quality,
             buffer,
             di,
             diff,
         })
     }
 
-    /// Binary-search the lowest quality whose diff is within the target; falls back to the
-    /// maximum quality when even that cannot meet it.
+    /// Search the lowest quality whose diff is within the target; falls back to the maximum
+    /// quality when even that cannot meet it.
     fn search_quality(
         &self,
         info: &ImageInfo,
         scorer: &DiffScorer,
         ext: &str,
     ) -> Result<Candidate> {
-        let mut lo = AUTO_MIN_QUALITY;
-        let mut hi = AUTO_MAX_QUALITY;
-        let mut best: Option<Candidate> = None;
-        let mut max_probe: Option<Candidate> = None;
-        while lo <= hi {
-            let mid = lo + (hi - lo) / 2;
-            let cand = self.encode_candidate(info, scorer, ext, mid)?;
-            if cand.diff >= 0.0 && cand.diff <= self.target_diff {
-                // Meets the target — record it and try an even lower quality for a smaller file.
-                best = Some(cand);
-                if mid == AUTO_MIN_QUALITY {
-                    break;
-                }
-                hi = mid - 1;
-            } else {
-                if mid == AUTO_MAX_QUALITY {
-                    max_probe = Some(cand);
-                }
-                lo = mid + 1;
-            }
+        let target = self.target_diff;
+        let mut probe = |q| self.encode_candidate(info, scorer, ext, q, self.speed);
+        // Slow AVIF encodes dominate the search: locate the quality with fast-preset probes,
+        // then pin down the exact boundary at the requested speed starting from there.
+        if ext == IMAGE_TYPE_AVIF && avif_speed(self.speed) < AVIF_SEARCH_SPEED {
+            let mut fast = |q| self.encode_candidate(info, scorer, ext, q, AVIF_SEARCH_SPEED);
+            let guess = bisect_quality(&mut fast, target, AUTO_MIN_QUALITY - 1, None)?;
+            return gallop_quality(&mut probe, target, guess.quality);
         }
-        // When nothing meets the target the search climbs all the way to the maximum
-        // quality, so reuse that probe instead of encoding it a second time.
-        match best.or(max_probe) {
-            Some(c) => Ok(c),
-            None => self.encode_candidate(info, scorer, ext, AUTO_MAX_QUALITY),
-        }
+        bisect_quality(&mut probe, target, AUTO_MIN_QUALITY - 1, None)
     }
 
     fn best_candidate(&self, info: &ImageInfo) -> Result<Candidate> {
@@ -2887,10 +2878,88 @@ impl AutoOptimProcess {
             .par_iter()
             .map(|ext| match self.quality {
                 None => self.search_quality(info, &scorer, ext),
-                Some(q) => self.encode_candidate(info, &scorer, ext, q),
+                Some(q) => self.encode_candidate(info, &scorer, ext, q, self.speed),
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(pick_candidate(candidates, self.target_diff))
+    }
+}
+
+fn meets_target(candidate: &Candidate, target: f64) -> bool {
+    candidate.diff >= 0.0 && candidate.diff <= target
+}
+
+/// Bisect for the lowest quality meeting `target`, between `fail` (a quality known to miss
+/// it, or `AUTO_MIN_QUALITY - 1` when untested) and `pass` (a candidate known to meet it, or
+/// `None` for the untested top of the range). Assumes the diff falls as quality rises. When
+/// nothing meets the target, the `AUTO_MAX_QUALITY` probe is returned.
+fn bisect_quality(
+    probe: &mut impl FnMut(u8) -> Result<Candidate>,
+    target: f64,
+    mut fail: u8,
+    mut pass: Option<Candidate>,
+) -> Result<Candidate> {
+    // Climbing all the way up probes the maximum quality; keep it rather than encode it twice.
+    let mut max_probe = None;
+    loop {
+        let hi = pass.as_ref().map_or(AUTO_MAX_QUALITY + 1, |c| c.quality);
+        if hi - fail <= 1 {
+            break;
+        }
+        let mid = fail + (hi - fail) / 2;
+        let cand = probe(mid)?;
+        if meets_target(&cand, target) {
+            pass = Some(cand);
+        } else {
+            if mid == AUTO_MAX_QUALITY {
+                max_probe = Some(cand);
+            }
+            fail = mid;
+        }
+    }
+    match pass.or(max_probe) {
+        Some(c) => Ok(c),
+        None => probe(AUTO_MAX_QUALITY),
+    }
+}
+
+/// Like [`bisect_quality`] over the whole range, but starting from a predicted quality: probe
+/// it, stride away in doubling steps until the target boundary is bracketed, then bisect the
+/// bracket. An accurate prediction settles in two or three probes instead of ~7.
+fn gallop_quality(
+    probe: &mut impl FnMut(u8) -> Result<Candidate>,
+    target: f64,
+    start: u8,
+) -> Result<Candidate> {
+    let first = probe(start.clamp(AUTO_MIN_QUALITY, AUTO_MAX_QUALITY))?;
+    let mut stride = 1u8;
+    if meets_target(&first, target) {
+        // Step down until a quality misses the target.
+        let mut pass = first;
+        while pass.quality > AUTO_MIN_QUALITY {
+            let q = pass.quality.saturating_sub(stride).max(AUTO_MIN_QUALITY);
+            let cand = probe(q)?;
+            if !meets_target(&cand, target) {
+                return bisect_quality(probe, target, q, Some(pass));
+            }
+            pass = cand;
+            stride = stride.saturating_mul(2);
+        }
+        Ok(pass)
+    } else {
+        // Step up until one meets it.
+        let mut fail = first;
+        while fail.quality < AUTO_MAX_QUALITY {
+            let q = fail.quality.saturating_add(stride).min(AUTO_MAX_QUALITY);
+            let cand = probe(q)?;
+            if meets_target(&cand, target) {
+                return bisect_quality(probe, target, fail.quality, Some(cand));
+            }
+            fail = cand;
+            stride = stride.saturating_mul(2);
+        }
+        // Even the maximum quality misses the target: keep that probe.
+        Ok(fail)
     }
 }
 
@@ -2900,7 +2969,7 @@ fn pick_candidate(mut candidates: Vec<Candidate>, target: f64) -> Candidate {
     let within: Vec<usize> = candidates
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.diff >= 0.0 && c.diff <= target)
+        .filter(|(_, c)| meets_target(c, target))
         .map(|(i, _)| i)
         .collect();
     let idx = if let Some(&i) = within.iter().min_by_key(|&&i| candidates[i].buffer.len()) {
@@ -3904,10 +3973,75 @@ mod tests {
     }
 
     #[test]
+    fn test_quality_search() {
+        use super::{
+            bisect_quality, gallop_quality, Candidate, AUTO_MAX_QUALITY, AUTO_MIN_QUALITY,
+        };
+        // Synthetic monotone curve: diff = (100 - q) / 10, so a target of 3.0 is first met
+        // at quality 70. Returns the quality found and the qualities probed.
+        let search = |target: f64, start: Option<u8>| {
+            let mut probes = Vec::new();
+            let mut probe = |q: u8| -> super::Result<Candidate> {
+                probes.push(q);
+                Ok(Candidate {
+                    ext: String::new(),
+                    quality: q,
+                    buffer: Vec::new(),
+                    di: image::DynamicImage::default(),
+                    diff: f64::from(100 - q) / 10.0,
+                })
+            };
+            let found = match start {
+                None => bisect_quality(&mut probe, target, AUTO_MIN_QUALITY - 1, None),
+                Some(s) => gallop_quality(&mut probe, target, s),
+            };
+            (found.unwrap().quality, probes)
+        };
+
+        // Whole-range bisection: the plain binary search over 30..=95.
+        let (q, probes) = search(3.0, None);
+        assert_eq!(q, 70);
+        assert_eq!(probes[..2], [62, 79]);
+        assert!(probes.len() <= 7, "{probes:?}");
+        // From an exact prediction two probes settle it: 70 meets the target, 69 misses.
+        assert_eq!(search(3.0, Some(70)), (70, vec![70, 69]));
+        // Predictions off in either direction still land on the boundary.
+        for start in [30, 50, 68, 69, 71, 72, 90, 95] {
+            assert_eq!(search(3.0, Some(start)).0, 70, "start {start}");
+        }
+        // Unreachable target: the maximum quality's probe, encoded once.
+        let (q, probes) = search(0.1, None);
+        assert_eq!(q, AUTO_MAX_QUALITY);
+        assert_eq!(probes.iter().filter(|&&p| p == AUTO_MAX_QUALITY).count(), 1);
+        assert_eq!(search(0.1, Some(60)).0, AUTO_MAX_QUALITY);
+        // A target every quality meets: the minimum.
+        assert_eq!(search(100.0, None).0, AUTO_MIN_QUALITY);
+        assert_eq!(search(100.0, Some(80)).0, AUTO_MIN_QUALITY);
+    }
+
+    #[test]
+    fn test_auto_quality_avif() {
+        // AVIF at a slow speed searches with fast probes, then confirms at the given speed:
+        // the result must still honour the target.
+        let target = 10.0;
+        let result = tokio_test::block_on(
+            AutoOptimProcess::new("avif", None, 4, target).process(new_process_image()),
+        )
+        .unwrap();
+        assert_eq!(result.ext, "avif");
+        assert!(
+            result.diff >= 0.0 && result.diff <= target,
+            "{}",
+            result.diff
+        );
+    }
+
+    #[test]
     fn test_pick_candidate() {
         use super::{pick_candidate, Candidate};
         let mk = |ext: &str, size: usize, diff: f64| Candidate {
             ext: ext.to_string(),
+            quality: 80,
             buffer: vec![0u8; size],
             di: image::DynamicImage::default(),
             diff,
